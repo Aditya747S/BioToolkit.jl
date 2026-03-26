@@ -1,24 +1,26 @@
 # https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
 version: 2
 updates:
+  # 1. GitHub Actions 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    # To group all GitHub Actions updates into a single PR, uncomment the following:
-    # groups:
-    #   github-actions:
-    #     patterns:
-    #       - "*"
+
+  # 2. Root project (Main Project.toml)
   - package-ecosystem: "julia"
-    directories:
-      - "/"
-      - "/docs"
-      - "/test"
+    directory: "/"
     schedule:
       interval: "weekly"
-    # To group all Julia dependency updates into a single PR, uncomment the following:
-    # groups:
-    #   julia-dependencies:
-    #     patterns:
-    #       - "*"
+
+  # 3. Docs (docs/Project.toml)
+  - package-ecosystem: "julia"
+    directory: "/docs"
+    schedule:
+      interval: "weekly"
+
+  # 4. Test (test/Project.toml)
+  - package-ecosystem: "julia"
+    directory: "/test"
+    schedule:
+      interval: "weekly"
