@@ -19,6 +19,8 @@ jobs:
     permissions: # needed to allow julia-actions/cache to proactively delete old caches that it has created
       actions: write
       contents: read
+    env:
+      COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_TOKEN }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,5 +48,6 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
       - uses: julia-actions/julia-uploadcoveralls@v1
+        if: ${{ env.COVERALLS_REPO_TOKEN != '' }}
         env:
-          COVERALLS_TOKEN: ${{ secrets.COVERALLS_TOKEN }}
+          COVERALLS_REPO_TOKEN: ${{ env.COVERALLS_REPO_TOKEN }}

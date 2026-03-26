@@ -27,8 +27,10 @@ after_success:
       using Coverage
       Codecov.submit(process_folder())'
   - |
-    julia -e '
-      using Pkg
-      Pkg.add("Coverage")
-      using Coverage
-      Coveralls.submit(process_folder())'
+    if [ -n "$COVERALLS_REPO_TOKEN" ] || [ -n "$COVERALLS_TOKEN" ]; then
+      julia -e '
+        using Pkg
+        Pkg.add("Coverage")
+        using Coverage
+        Coveralls.submit(process_folder())'
+    fi
