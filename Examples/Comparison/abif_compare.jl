@@ -51,7 +51,7 @@ function main()
 
         write_mock_abif_v3(abif_path)
 
-        julia_ms, trace = repeat_elapsed_ms(() -> read_abif(abif_path), repetitions)
+        julia_ms, trace = repeat_elapsed_ms(() -> BioToolkit.read_abif(abif_path), repetitions)
 
         println("Julia ABIF benchmark")
         println("  repetitions=", repetitions)

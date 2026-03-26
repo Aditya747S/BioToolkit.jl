@@ -7,7 +7,7 @@ function verify_all()
     # 1. Global alignment
     seq1 = "ACGTGCCG"
     seq2 = "ACGTGCG"
-    align_result = pairwise_align(seq1, seq2, match=2, mismatch=-1, gap_open=-2, gap_extend=-0) # linear gap penalty by setting gap_open to same as gap penalty? Or just use defaults.
+    align_result = BioToolkit.pairwise_align(seq1, seq2, match=2, mismatch=-1, gap_open=-2, gap_extend=-0) # linear gap penalty by setting gap_open to same as gap penalty? Or just use defaults.
     println("1. Global Alignment (Needleman-Wunsch):")
     println("   Score: ", align_result.score)
     println("   Seq1:  ", align_result.left)
@@ -15,16 +15,16 @@ function verify_all()
     println()
 
     # 2. Dotplots
-    dotplot = dotmatrix(seq1, seq1)
+    dotplot = BioToolkit.dotmatrix(seq1, seq1)
     println("2. Dotplot (first row): ", dotplot[1, :])
     println()
 
     # 3. Transcription, Reverse Complement, Translation, ORFs
     dna = "ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG"
-    rna = transcribe_dna(dna)
-    rev_comp = reverse_complement(dna)
-    protein = translate_dna(dna)
-    orfs = find_orfs(dna)
+    rna = BioToolkit.transcribe_dna(dna)
+    rev_comp = BioToolkit.reverse_complement(dna)
+    protein = BioToolkit.translate_dna(dna)
+    orfs = BioToolkit.find_orfs(dna)
     println("3. Sequence Operations:")
     println("   DNA:      ", dna)
     println("   RNA:      ", rna)
@@ -34,8 +34,8 @@ function verify_all()
     println()
 
     # 4. GC-content, minimum skew
-    gc = gc_content(dna)
-    skew_min = minimum_skew(dna)
+    gc = BioToolkit.gc_content(dna)
+    skew_min = BioToolkit.minimum_skew(dna)
     println("4. Sequence Stats:")
     println("   GC-content:   ", round(gc, digits=4))
     println("   Minimum skew: ", skew_min)
@@ -43,11 +43,11 @@ function verify_all()
 
     # 5. Protein statistics
     prot_seq = "ACDEFGHIKLMNPQRSTVWY"
-    pmass = protein_mass(prot_seq)
-    ec = extinction_coefficient(prot_seq)
-    ii = instability_index(prot_seq)
-    pi = isoelectric_point(prot_seq)
-    gravy_val = gravy(prot_seq)
+    pmass = BioToolkit.protein_mass(prot_seq)
+    ec = BioToolkit.extinction_coefficient(prot_seq)
+    ii = BioToolkit.instability_index(prot_seq)
+    pi = BioToolkit.isoelectric_point(prot_seq)
+    gravy_val = BioToolkit.gravy(prot_seq)
     println("5. Protein Statistics (for sequence $prot_seq):")
     println("   Protein mass:           ", round(pmass, digits=2), " Da")
     println("   Extinction coefficient: ", ec, " M⁻¹ cm⁻¹")

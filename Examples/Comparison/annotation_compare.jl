@@ -55,24 +55,24 @@ function main()
         @assert annotated.annotations[:locus] == "ANN00001"
         @assert length(annotated.features) == python_feature_count
         @assert annotated.features[1].feature_type == python_source_type
-        @assert feature_sequence(annotated, annotated.features[1]) == python_source_extract
+        @assert BioToolkit.feature_sequence(annotated, annotated.features[1]) == python_source_extract
         @assert annotated.features[2].feature_type == python_feature1_type
         @assert Int(annotated.features[2].location.strand) == python_feature1_strand
-        @assert feature_sequence(annotated, annotated.features[2]) == python_feature1_extract
+        @assert BioToolkit.feature_sequence(annotated, annotated.features[2]) == python_feature1_extract
         @assert annotated.features[3].feature_type == python_feature2_type
         @assert Int(annotated.features[3].location.strand) == python_feature2_strand
-        @assert feature_sequence(annotated, annotated.features[3]) == python_feature2_extract
+        @assert BioToolkit.feature_sequence(annotated, annotated.features[3]) == python_feature2_extract
         @assert annotated.features[2].id == python_gene
 
         println("Sequence annotation benchmark")
         println("  parse_ms=", round(parse_ms, digits=4))
         println("  feature_count=", length(annotated.features))
         println("  source_type=", annotated.features[1].feature_type)
-        println("  source_extract=", feature_sequence(annotated, annotated.features[1]))
+        println("  source_extract=", BioToolkit.feature_sequence(annotated, annotated.features[1]))
         println("  feature1_type=", annotated.features[2].feature_type)
-        println("  feature1_extract=", feature_sequence(annotated, annotated.features[2]))
+        println("  feature1_extract=", BioToolkit.feature_sequence(annotated, annotated.features[2]))
         println("  feature2_type=", annotated.features[3].feature_type)
-        println("  feature2_extract=", feature_sequence(annotated, annotated.features[3]))
+        println("  feature2_extract=", BioToolkit.feature_sequence(annotated, annotated.features[3]))
         print(python_output)
     end
 end

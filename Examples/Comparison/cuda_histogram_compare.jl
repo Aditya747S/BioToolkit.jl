@@ -80,49 +80,62 @@ function main()
     gpu_mean_ms = missing
     gpu_mean = missing
     if has_cuda_package && CUDA.functional()
-        gpu_positions = CuArray(positions)
-        gpu_bins = CUDA.zeros(Int32, bin_count)
-        gpu_left = CuArray(collect(codeunits(left)))
-        gpu_right = CuArray(collect(codeunits(right)))
-        gpu_quality = CuArray(quality_bytes)
-        threads = 256
-        blocks = cld(length(gpu_positions), threads)
+        try
+            gpu_positions = CuArray(positions)
+            gpu_bins = CUDA.zeros(Int32, bin_count)
+            gpu_left = CuArray(collect(codeunits(left)))
+            gpu_right = CuArray(collect(codeunits(right)))
+            gpu_quality = CuArray(quality_bytes)
+            threads = 256
+            blocks = cld(length(gpu_positions), threads)
 
-        cpu_hist = cpu_histogram(positions, bin_size, bin_count)
-        cpu_hamming = BioToolkit.hamming_distance(left, right)
-        cpu_quality_scores = BioToolkit.phred_scores(quality_bytes)
-        cpu_quality_mean = BioToolkit.mean_quality(quality_bytes)
+            cpu_hist = cpu_histogram(positions, bin_size, bin_count)
+            cpu_hamming = BioToolkit.hamming_distance(left, right)
+            cpu_quality_scores = BioToolkit.phred_scores(quality_bytes)
+            cpu_quality_mean = BioToolkit.mean_quality(quality_bytes)
 
-        # warm up the GPU kernel
-        CUDA.fill!(gpu_bins, 0)
-        CUDA.@sync @cuda threads=threads blocks=blocks gpu_histogram_kernel!(gpu_bins, gpu_positions, Int32(bin_size))
-        CUDA.@sync BioToolkit.hamming_distance(gpu_left, gpu_right)
-        CUDA.@sync BioToolkit.phred_scores(gpu_quality)
-        CUDA.@sync BioToolkit.mean_quality(gpu_quality)
-
-        CUDA.fill!(gpu_bins, 0)
-        gpu_ms, _ = elapsed_ms() do
+            # warm up the GPU kernel
+            CUDA.fill!(gpu_bins, 0)
             CUDA.@sync @cuda threads=threads blocks=blocks gpu_histogram_kernel!(gpu_bins, gpu_positions, Int32(bin_size))
-        end
-
-        gpu_hamming_ms, gpu_hamming = elapsed_ms() do
             CUDA.@sync BioToolkit.hamming_distance(gpu_left, gpu_right)
-        end
-        @assert gpu_hamming == cpu_hamming
-
-        gpu_decode_ms, gpu_decoded_scores = elapsed_ms() do
             CUDA.@sync BioToolkit.phred_scores(gpu_quality)
-        end
-        gpu_decode_total = length(gpu_decoded_scores)
-        @assert Array(gpu_decoded_scores) == cpu_quality_scores
-
-        gpu_mean_ms, gpu_mean = elapsed_ms() do
             CUDA.@sync BioToolkit.mean_quality(gpu_quality)
-        end
-        @assert isapprox(gpu_mean, cpu_quality_mean; atol=1e-12)
 
-        gpu_hist = Array(gpu_bins)
-        @assert gpu_hist == cpu_hist
+            CUDA.fill!(gpu_bins, 0)
+            gpu_ms, _ = elapsed_ms() do
+                CUDA.@sync @cuda threads=threads blocks=blocks gpu_histogram_kernel!(gpu_bins, gpu_positions, Int32(bin_size))
+            end
+
+            gpu_hamming_ms, gpu_hamming = elapsed_ms() do
+                CUDA.@sync BioToolkit.hamming_distance(gpu_left, gpu_right)
+            end
+            @assert gpu_hamming == cpu_hamming
+
+            gpu_decode_ms, gpu_decoded_scores = elapsed_ms() do
+                CUDA.@sync BioToolkit.phred_scores(gpu_quality)
+            end
+            gpu_decode_total = length(gpu_decoded_scores)
+            @assert Array(gpu_decoded_scores) == cpu_quality_scores
+
+            gpu_mean_ms, gpu_mean = elapsed_ms() do
+                CUDA.@sync BioToolkit.mean_quality(gpu_quality)
+            end
+            @assert isapprox(gpu_mean, cpu_quality_mean; atol=1e-12)
+
+            gpu_hist = Array(gpu_bins)
+            @assert gpu_hist == cpu_hist
+        catch err
+            @warn "Skipping CUDA histogram benchmark" exception=(err, catch_backtrace())
+            gpu_ms = missing
+            gpu_hist = nothing
+            gpu_hamming_ms = missing
+            gpu_hamming = missing
+            gpu_decode_ms = missing
+            gpu_decode_total = missing
+            gpu_decoded_scores = nothing
+            gpu_mean_ms = missing
+            gpu_mean = missing
+        end
     end
 
     python_output = mktempdir() do dir

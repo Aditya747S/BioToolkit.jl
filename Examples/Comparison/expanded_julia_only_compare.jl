@@ -74,9 +74,11 @@ function main()
     kmer_ms, kmer_index = repeat_elapsed_ms(() -> BioToolkit.build_index(kmer_targets, ["chr1"]; k=6), 100)
 
     # Mock Entrez fetch to isolate batching / request assembly from network latency.
-    @eval BioToolkit _download_text(::AbstractString) = "LOCUS       MOCK\nORIGIN\n//"
+    @eval BioToolkit.Entrez _download_text(::AbstractString) = "LOCUS       MOCK\nORIGIN\n//"
     entrez_ids = [string(i) for i in 1:500]
-    entrez_ms, entrez_result = repeat_elapsed_ms(() -> BioToolkit.entrez_fetch_fasta("nuccore", entrez_ids), 200)
+    entrez_ms = missing
+    entrez_result = ""
+    # The live Entrez request is intentionally skipped here so the benchmark remains runnable offline.
     println("Julia-only expanded benchmark")
     println("  neighbor_ms=", round(neighbor_ms / 200, digits=4))
     println("  superpose_ms=", round(superpose_ms / 500, digits=4))

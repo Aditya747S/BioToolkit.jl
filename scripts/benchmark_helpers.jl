@@ -1,3 +1,5 @@
+using BioToolkit: SeqRecordLite, FastqRecord, MultipleSequenceAlignment, read_abif, read_embl, read_genepop, write_genepop, linkage_disequilibrium, population_pca, feature_sequence, get_alignment_length, motif_consensus
+
 function elapsed_ms(f)
     GC.gc()
     start_time = time_ns()

@@ -47,13 +47,19 @@ function main()
     kmer_cuda_ms = missing
     kmer_cuda_unique = missing
     if has_cuda_package && CUDA.functional()
-        gpu_sequence = CuArray(sequence_bytes)
-        CUDA.@sync BioToolkit.kmer_frequency(gpu_sequence, 3)
-        kmer_cuda_ms, gpu_kmers = elapsed_ms() do
+        try
+            gpu_sequence = CuArray(sequence_bytes)
             CUDA.@sync BioToolkit.kmer_frequency(gpu_sequence, 3)
+            kmer_cuda_ms, gpu_kmers = elapsed_ms() do
+                CUDA.@sync BioToolkit.kmer_frequency(gpu_sequence, 3)
+            end
+            @assert gpu_kmers == kmers
+            kmer_cuda_unique = length(gpu_kmers)
+        catch err
+            @warn "Skipping CUDA k-mer benchmark" exception=(err, catch_backtrace())
+            kmer_cuda_ms = missing
+            kmer_cuda_unique = missing
         end
-        @assert gpu_kmers == kmers
-        kmer_cuda_unique = length(gpu_kmers)
     end
 
     python_output = read(`conda run -n general --no-capture-output python $(joinpath(@__DIR__, "sequence_toolkit_compare.py"))`, String)

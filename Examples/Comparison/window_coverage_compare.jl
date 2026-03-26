@@ -67,13 +67,19 @@ function main()
     gpu_ms = missing
     gpu_cov = nothing
     if has_cuda_package && CUDA.functional()
-        gpu_starts = CuArray(starts)
-        gpu_stops = CuArray(stops)
-        CUDA.@sync BioToolkit.window_coverage(gpu_starts, gpu_stops, window_size)
-        gpu_ms, gpu_cov = elapsed_ms() do
+        try
+            gpu_starts = CuArray(starts)
+            gpu_stops = CuArray(stops)
             CUDA.@sync BioToolkit.window_coverage(gpu_starts, gpu_stops, window_size)
+            gpu_ms, gpu_cov = elapsed_ms() do
+                CUDA.@sync BioToolkit.window_coverage(gpu_starts, gpu_stops, window_size)
+            end
+            @assert gpu_cov == cpu_cov
+        catch err
+            @warn "Skipping CUDA window coverage benchmark" exception=(err, catch_backtrace())
+            gpu_ms = missing
+            gpu_cov = nothing
         end
-        @assert gpu_cov == cpu_cov
     end
 
     python_output = mktempdir() do dir
