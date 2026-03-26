@@ -1,0 +1,44 @@
+┌ Warning: CUDA runtime library `libcublasLt.so.13` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libcublasLt.so.13`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+┌ Warning: CUDA runtime library `libnvJitLink.so.13` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libnvJitLink.so.13`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+┌ Warning: CUDA runtime library `libcusparse.so.12` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libcusparse.so.12`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+CUDA histogram benchmark
+  items: 2000000
+  bin_size: 128
+  julia_cpu_ms=3.8378
+  julia_cpu_bins=15625
+  julia_cpu_total=2000000
+  julia_gpu_ms=0.0965
+  julia_gpu_bins=15625
+  julia_gpu_total=2000000
+  julia_gpu_hamming_ms=0.157
+  julia_gpu_hamming=5
+  julia_gpu_decode_ms=0.2164
+  julia_gpu_decode_total=2000000
+  julia_gpu_mean_ms=0.1996
+  julia_gpu_mean=73.0
+python_hist_ms=179.4819
+python_bins=15625

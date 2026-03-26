@@ -1,0 +1,48 @@
+        - #!/usr/bin/env julia
+        - 
+        - using Pkg
+        - Pkg.activate(joinpath(@__DIR__, ".."))
+        - Pkg.instantiate()
+        - 
+        - using BioToolkit
+        - 
+        - function write_dummy_fastq(path::AbstractString, record_count::Integer; sequence::AbstractString="ACGTACGTACGTACGT", quality::AbstractString="IIIIIIIIIIIIIIII")
+        -     open(path, "w") do io
+        0         for index in 1:record_count
+    64000             write(io, "@seq$(index)\n")
+        0             write(io, sequence, "\n")
+        0             write(io, "+\n")
+        0             write(io, quality, "\n")
+        0         end
+        -     end
+        -     return path
+        - end
+        - 
+        - function count_fastq_records(path::AbstractString)
+        -     total = 0
+      512     stream = BioToolkit.each_fastq_record(path)
+        -     try
+        0         for record in stream
+        0             total += 1
+        -             _ = record.sequence
+        0         end
+        -     finally
+        0         close(stream)
+        -     end
+        0     return total
+        - end
+        - 
+        - function main()
+        0     output_path = length(ARGS) >= 1 ? ARGS[1] : joinpath(pwd(), "dummy_10m.fastq")
+        0     record_count = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 10_000_000
+        - 
+        0     println("writing=", output_path)
+        0     println("records=", record_count)
+       32     write_dummy_fastq(output_path, record_count)
+        0     GC.gc()
+        0     counted = count_fastq_records(output_path)
+        0     println("counted=", counted)
+        0     return nothing
+        - end
+        - 
+        - main()

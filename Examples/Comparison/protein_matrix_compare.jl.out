@@ -1,0 +1,62 @@
+┌ Warning: CUDA runtime library `libcublasLt.so.13` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libcublasLt.so.13`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+┌ Warning: CUDA runtime library `libnvJitLink.so.13` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libnvJitLink.so.13`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+┌ Warning: CUDA runtime library `libcusparse.so.12` was loaded from a system path, `/usr/local/cuda-13.1/lib64/libcusparse.so.12`.
+│ This may cause errors.
+│ 
+│ If you're running under a profiler, this situation is expected. Otherwise,
+│ ensure that your library path environment variable (e.g., `PATH` on Windows
+│ or `LD_LIBRARY_PATH` on Linux) does not include CUDA library paths.
+│ 
+│ In any other case, please file an issue.
+└ @ CUDA ~/.julia/packages/CUDA/Il00B/src/initialization.jl:198
+Named substitution matrix protein benchmark
+  matrix_count=30
+  alignable_matrix_count=27
+  julia_named_matrix_load_ms=1.2134
+  julia_blosum62_global_ms=0.8331
+  julia_blosum62_local_ms=1.281
+  julia_pam250_global_ms=0.8201
+  julia_pam250_local_ms=1.2622
+  julia_blosum62_global_score=2100
+  julia_blosum62_global_identity=0.916667
+  julia_blosum62_local_score=2100
+  julia_blosum62_local_identity=0.916667
+  julia_pam250_global_score=1980
+  julia_pam250_global_identity=0.916667
+  julia_pam250_local_score=1980
+  julia_pam250_local_identity=0.916667
+python_named_matrix_inventory=BENNER22,BENNER6,BENNER74,BLASTN,BLASTP,BLOSUM45,BLOSUM50,BLOSUM62,BLOSUM80,BLOSUM90,DAYHOFF,FENG,GENETIC,GONNET1992,HOXD70,JOHNSON,JONES,LEVIN,MCLACHLAN,MDM78,MEGABLAST,NUC.4.4,PAM250,PAM30,PAM70,RAO,RISLER,SCHNEIDER,STR,TRANS
+python_alignable_matrix_count=27
+python_named_matrix_load_ms=6.9609
+python_blosum62_global_ms=4.5152
+python_blosum62_global_score=2100.0
+python_blosum62_global_identity=0.916667
+python_blosum62_global_length=432
+python_blosum62_local_ms=3.4287
+python_blosum62_local_score=2100.0
+python_blosum62_local_identity=0.916667
+python_blosum62_local_length=432
+python_pam250_global_ms=2.0456
+python_pam250_global_score=1980.0
+python_pam250_global_identity=0.916667
+python_pam250_global_length=432
+python_pam250_local_ms=3.3841
+python_pam250_local_score=1980.0
+python_pam250_local_identity=0.916667
+python_pam250_local_length=432
