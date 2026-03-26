@@ -1,3 +1,6 @@
 [deps]
 BioToolkit = "8d416cdb-fa09-4bc7-9bc8-0748090d39ac"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+
+[compat]
+Documenter = "1.17.0"
