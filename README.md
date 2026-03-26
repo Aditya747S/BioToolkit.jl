@@ -53,46 +53,45 @@ using BioToolkit
 seq = "ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG"
 
 # Basic analytics
-gc_content(seq)               # => 0.58
-translate_dna(seq)            # => "MAIVMGR*KGAR*"
-reverse_complement(seq)       # => "CTATCGGGCACCCTTTCAGCGGCCCATTACAATGGCCAT"
+BioToolkit.gc_content(seq)               # => 0.58
+BioToolkit.translate_dna(seq)            # => "MAIVMGR*KGAR*"
 
 # Fast k-mer counting
-kmer_frequency(seq, 3)
+BioToolkit.kmer_frequency(seq, 3)
 ```
 
 ### Genomic Intervals & I/O
 ```julia
 # High-performance file parsing
-records = read_fasta("genome.fasta")
+records = BioToolkit.read_fasta("genome.fasta")
 
 # Interval algebra (1-based closed intervals)
-table = load_arrow_table("variants.arrow")
-subset = filter_region(table, "chr1", 1_000_000, 1_100_000)
+table = BioToolkit.load_arrow_table("variants.arrow")
+subset = BioToolkit.filter_region(table, "chr1", 1_000_000, 1_100_000)
 
 # Coverage & BigWig export
-hist = coverage_histogram(table, "chr1", 1000)
-write_bigwig(hist, "coverage.bw")
+hist = BioToolkit.coverage_histogram(table, "chr1", 1000)
+BioToolkit.write_bigwig(hist, "coverage.bw")
 ```
 
 ### Structural Biology
 ```julia
 # Parsing and Geometry
-structure = read_pdb("1a1a.pdb")
-coords = coordinate_matrix(structure)
+structure = BioToolkit.read_pdb("1a1a.pdb")
+coords = BioToolkit.coordinate_matrix(structure)
 
 # Superposition & RMSD (Kabsch algorithm)
-ref_struct = read_pdb("reference.pdb")
-result = superpose(structure, ref_struct)
-rmsd(result)  # => 1.234 (Å)
+ref_struct = BioToolkit.read_pdb("reference.pdb")
+result = BioToolkit.superpose(structure, ref_struct)
+BioToolkit.rmsd(result)  # => 1.234 (Å)
 ```
 
 ### Population Genetics
 ```julia
 # GenePop workflows
-gp = read_genepop("data.gen")
-freqs = allele_frequencies(gp)
-hw_results = hardy_weinberg_test(gp)
+gp = BioToolkit.read_genepop("data.gen")
+freqs = BioToolkit.allele_frequencies(gp)
+hw_results = BioToolkit.hardy_weinberg_test(gp)
 ```
 
 ## Optional Backends
