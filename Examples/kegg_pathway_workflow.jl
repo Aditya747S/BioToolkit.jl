@@ -5,7 +5,7 @@ ENTRY       map00010                      Pathway
 NAME        Glycolysis / Gluconeogenesis
 ENZYME      1.1.1.1 2.7.1.1
 COMPOUND    C00031 C00022
-GENE        b0001  gapA
+GENE        b0001  gene1
 ///
 """
 
