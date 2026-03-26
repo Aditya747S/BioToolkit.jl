@@ -14,7 +14,7 @@ furnished to do so, subject to the following conditions:
 
 2. **Publication Restriction**: You may NOT publish scientific papers, articles, 
    or technical reports that primarily describe the Software itself (e.g., 
-   "meet the new BioToolkit.jl" or similar "software notes") without prior 
+   "meet the new BioToolkit.jl" or performance comparisons or similar "software notes") without prior 
    written permission from the copyright holder. 
 
    You ARE permitted to publish scientific papers that use the Software to 
