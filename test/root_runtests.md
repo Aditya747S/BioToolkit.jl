@@ -18,6 +18,8 @@ The root test file is the file `Pkg.test()` uses from the repository root. Keepi
 - it keeps the package test path easy to follow
 - it lets the actual test cases live in one place
 
+The CI workflow resolves the package from `Project.toml` compat instead of a committed root `Manifest.toml`, which keeps the test job portable across Julia releases.
+
 ## Relationship to the nested test file
 
 The real assertions remain in the nested `BioToolkit.jl/test/runtests.jl` file. This root file just acts as the bridge so the repository-level package can run the same tests.
