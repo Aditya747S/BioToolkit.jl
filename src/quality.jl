@@ -1,12 +1,19 @@
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+
+@inline function _register_quality_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
+
 """
     phred_score(byte; offset=33)
 
 Convert a single ASCII-encoded quality byte into a Phred score.
 """
-@inline function phred_score(byte::UInt8; offset::Integer=33)
+@inline function phred_score(byte::UInt8; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     score = Int(byte) - Int(offset)
     score < 0 && throw(ArgumentError("quality score below offset"))
-    return UInt8(score)
+    result = UInt8(score)
+    return _register_quality_result!(_ctx, result, "phred_score"; parameters=(offset=Int(offset), score=result))
 end
 
 """
@@ -14,8 +21,10 @@ end
 
 Convert a FASTQ quality string into numeric Phred scores.
 """
-function phred_scores(quality::AbstractString; offset::Integer=33)
-    return phred_scores(codeunits(quality); offset=offset)
+function phred_scores(quality::String; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return phred_scores(codeunits(quality); offset=offset, _ctx=_ctx)
 end
 
 """
@@ -23,15 +32,16 @@ end
 
 Convert a byte vector of encoded qualities into numeric Phred scores.
 """
-function phred_scores(bytes::AbstractVector{UInt8}; offset::Integer=33)
+function phred_scores(bytes::AbstractVector{UInt8}; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     length_scores = length(bytes)
     scores = Vector{UInt8}(undef, length_scores)
 
     @inbounds for index in 1:length_scores
-        scores[index] = phred_score(bytes[index]; offset=offset)
+        scores[index] = phred_score(bytes[index]; offset=offset, _ctx=_ctx)
     end
 
-    return scores
+
+    return _register_quality_result!(_ctx, scores, "phred_scores"; parents=provenance_parent_ids(bytes), parameters=(offset=Int(offset), score_count=length(scores)))
 end
 
 """
@@ -39,8 +49,10 @@ end
 
 Convert the quality string stored in a FASTQ record into Phred scores.
 """
-function phred_scores(record::FastqRecord; offset::Integer=33)
-    return phred_scores(record.quality; offset=offset)
+function phred_scores(record::FastqRecord; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return phred_scores(record.quality; offset=offset, _ctx=_ctx)
 end
 
 """
@@ -48,11 +60,14 @@ end
 
 Convert a quality annotation stored on a lightweight record into Phred scores.
 """
-function phred_scores(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33)
+function phred_scores(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     quality = get(record.letter_annotations, quality_key, nothing)
     quality === nothing && throw(ArgumentError("missing $(quality_key) letter annotation"))
-    quality isa AbstractString || throw(ArgumentError("FASTQ quality annotation must be a string"))
-    return phred_scores(quality; offset=offset)
+    quality isa String || throw(ArgumentError("FASTQ quality annotation must be a string"))
+    length(quality) == length(record.sequence) || throw(ArgumentError("quality annotation length must match record sequence length"))
+
+
+    return phred_scores(quality; offset=offset, _ctx=_ctx)
 end
 
 """
@@ -60,7 +75,7 @@ end
 
 Convert numeric Phred scores back into an ASCII quality string.
 """
-function phred_string(scores::AbstractVector{<:Integer}; offset::Integer=33)
+function phred_string(scores::AbstractVector{<:Integer}; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     length_scores = length(scores)
     bytes = Vector{UInt8}(undef, length_scores)
     base_offset = UInt8(offset)
@@ -71,7 +86,10 @@ function phred_string(scores::AbstractVector{<:Integer}; offset::Integer=33)
         bytes[index] = base_offset + UInt8(score)
     end
 
-    return String(bytes)
+    result = String(bytes)
+
+
+    return _register_quality_result!(_ctx, result, "phred_string"; parents=provenance_parent_ids(scores), parameters=(offset=Int(offset), length=length_scores))
 end
 
 """
@@ -79,7 +97,7 @@ end
 
 Return the average Phred score for a numeric score vector.
 """
-function mean_quality(scores::AbstractVector{<:Integer}; offset::Integer=33)
+function mean_quality(scores::AbstractVector{<:Integer}; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     isempty(scores) && return 0.0
 
     total = 0
@@ -87,7 +105,10 @@ function mean_quality(scores::AbstractVector{<:Integer}; offset::Integer=33)
         total += Int(score)
     end
 
-    return total / length(scores)
+    result = total / length(scores)
+
+
+    return _register_quality_result!(_ctx, result, "mean_quality"; parents=provenance_parent_ids(scores), parameters=(offset=Int(offset), score=result))
 end
 
 """
@@ -95,8 +116,10 @@ end
 
 Return the average Phred score for a quality string.
 """
-function mean_quality(quality::AbstractString; offset::Integer=33)
-    return mean_quality(phred_scores(quality; offset=offset); offset=offset)
+function mean_quality(quality::String; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return mean_quality(phred_scores(quality; offset=offset, _ctx=_ctx); offset=offset, _ctx=_ctx)
 end
 
 """
@@ -104,8 +127,10 @@ end
 
 Return the average Phred score for a FASTQ record.
 """
-function mean_quality(record::FastqRecord; offset::Integer=33)
-    return mean_quality(record.quality; offset=offset)
+function mean_quality(record::FastqRecord; offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return mean_quality(record.quality; offset=offset, _ctx=_ctx)
 end
 
 """
@@ -113,11 +138,13 @@ end
 
 Return the average Phred score for a lightweight record's quality annotation.
 """
-function mean_quality(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33)
+function mean_quality(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     quality = get(record.letter_annotations, quality_key, nothing)
     quality === nothing && throw(ArgumentError("missing $(quality_key) letter annotation"))
-    quality isa AbstractString || throw(ArgumentError("FASTQ quality annotation must be a string"))
-    return mean_quality(quality; offset=offset)
+    quality isa String || throw(ArgumentError("FASTQ quality annotation must be a string"))
+
+
+    return mean_quality(quality; offset=offset, _ctx=_ctx)
 end
 
 """
@@ -125,8 +152,8 @@ end
 
 Internal helper that extracts numeric quality scores from a FASTQ record.
 """
-function _quality_scores(record::FastqRecord; offset::Integer=33)
-    return phred_scores(record.quality; offset=offset)
+function _quality_scores(record::FastqRecord; offset::Integer=33, _ctx=active_provenance_context())
+    return phred_scores(record.quality; offset=offset, _ctx=_ctx)
 end
 
 """
@@ -134,8 +161,8 @@ end
 
 Internal helper that extracts numeric quality scores from a lightweight record.
 """
-function _quality_scores(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33)
-    return phred_scores(record; quality_key=quality_key, offset=offset)
+function _quality_scores(record::SeqRecordLite; quality_key::Symbol=:quality, offset::Integer=33, _ctx=active_provenance_context())
+    return phred_scores(record; quality_key=quality_key, offset=offset, _ctx=_ctx)
 end
 
 """
@@ -150,19 +177,23 @@ function quality_filter(
     max_low_quality_fraction::Real=1.0,
     quality_key::Symbol=:quality,
     offset::Integer=33,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     0 <= max_low_quality_fraction <= 1 || throw(ArgumentError("max_low_quality_fraction must be between 0 and 1"))
-    scores = record isa FastqRecord ? _quality_scores(record; offset=offset) : _quality_scores(record; quality_key=quality_key, offset=offset)
-    isempty(scores) && return false
+    scores = record isa FastqRecord ? _quality_scores(record; offset=offset, _ctx=_ctx) : _quality_scores(record; quality_key=quality_key, offset=offset, _ctx=_ctx)
+    isempty(scores) && return _register_quality_result!(_ctx, false, "quality_filter"; parents=provenance_parent_ids(record), parameters=(min_mean_quality=Float64(min_mean_quality), min_base_quality=Float64(min_base_quality), max_low_quality_fraction=Float64(max_low_quality_fraction), result=false))
 
-    mean_quality(scores) >= min_mean_quality || return false
+    mean_quality(scores; _ctx=_ctx) >= min_mean_quality || return false
 
     low_quality_count = 0
     @inbounds for score in scores
         Int(score) < min_base_quality && (low_quality_count += 1)
     end
 
-    return low_quality_count / length(scores) <= max_low_quality_fraction
+    result = low_quality_count / length(scores) <= max_low_quality_fraction
+
+
+    return _register_quality_result!(_ctx, result, "quality_filter"; parents=provenance_parent_ids(record), parameters=(min_mean_quality=Float64(min_mean_quality), min_base_quality=Float64(min_base_quality), max_low_quality_fraction=Float64(max_low_quality_fraction), result=result))
 end
 
 """
@@ -170,9 +201,13 @@ end
 
 Find the span to keep after adapter trimming.
 """
-function _adapter_trim_span(sequence::AbstractString, adapter::AbstractString; min_overlap::Int=8, max_mismatches::Int=1, from_end::Symbol=:three_prime)
-    sequence_length = ncodeunits(sequence)
-    adapter_length = ncodeunits(adapter)
+@inline function _quality_upper_ascii(byte::UInt8)
+    return byte >= 0x61 && byte <= 0x7a ? byte - 0x20 : byte
+end
+
+function _adapter_trim_span_bytes(sequence_bytes::AbstractVector{UInt8}, adapter_bytes::AbstractVector{UInt8}; min_overlap::Int=8, max_mismatches::Int=1, from_end::Symbol=:three_prime)
+    sequence_length = length(sequence_bytes)
+    adapter_length = length(adapter_bytes)
     min_overlap > 0 || throw(ArgumentError("min_overlap must be positive"))
     max_mismatches >= 0 || throw(ArgumentError("max_mismatches must be nonnegative"))
     sequence_length >= min_overlap || return nothing
@@ -181,10 +216,11 @@ function _adapter_trim_span(sequence::AbstractString, adapter::AbstractString; m
     max_overlap = min(sequence_length, adapter_length)
     if from_end === :three_prime
         for overlap in max_overlap:-1:min_overlap
-            sequence_window = sequence[sequence_length - overlap + 1:sequence_length]
-            adapter_window = adapter[1:overlap]
             mismatches = 0
-            @inbounds for (left_byte, right_byte) in zip(codeunits(sequence_window), codeunits(adapter_window))
+            seq_start = sequence_length - overlap
+            @inbounds for j in 1:overlap
+                left_byte = _quality_upper_ascii(sequence_bytes[seq_start + j])
+                right_byte = _quality_upper_ascii(adapter_bytes[j])
                 left_byte == right_byte && continue
                 mismatches += 1
                 mismatches > max_mismatches && break
@@ -193,10 +229,11 @@ function _adapter_trim_span(sequence::AbstractString, adapter::AbstractString; m
         end
     elseif from_end === :five_prime
         for overlap in max_overlap:-1:min_overlap
-            sequence_window = sequence[1:overlap]
-            adapter_window = adapter[adapter_length - overlap + 1:adapter_length]
             mismatches = 0
-            @inbounds for (left_byte, right_byte) in zip(codeunits(sequence_window), codeunits(adapter_window))
+            adapter_start = adapter_length - overlap
+            @inbounds for j in 1:overlap
+                left_byte = _quality_upper_ascii(sequence_bytes[j])
+                right_byte = _quality_upper_ascii(adapter_bytes[adapter_start + j])
                 left_byte == right_byte && continue
                 mismatches += 1
                 mismatches > max_mismatches && break
@@ -210,6 +247,10 @@ function _adapter_trim_span(sequence::AbstractString, adapter::AbstractString; m
     return nothing
 end
 
+_adapter_trim_span(sequence::BioSequence, adapter::BioSequence; kwargs...) = _adapter_trim_span_bytes(sequence.data, adapter.data; kwargs...)
+
+@inline _quality_adapter_sequence(adapter::AbstractString) = DNASeq(String(adapter))
+
 """
     adapter_trim(record; kwargs...)
 
@@ -217,17 +258,22 @@ Trim adapter contamination from a FASTQ record.
 """
 function adapter_trim(
     record::FastqRecord;
-    adapter::AbstractString,
+    adapter::Union{BioSequence,AbstractString},
     min_overlap::Int=8,
     max_mismatches::Int=1,
     from_end::Symbol=:three_prime,
     quality_key::Symbol=:quality,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+    adapter = adapter isa AbstractString ? _quality_adapter_sequence(adapter) : adapter
     trim_span = _adapter_trim_span(record.sequence, adapter; min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end)
-    trim_span === nothing && return record
+    trim_span === nothing && return _register_quality_result!(_ctx, record, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=false))
     start_index, stop_index = trim_span
-    start_index > stop_index && return nothing
-    return FastqRecord(record.identifier, record.description, record.sequence[start_index:stop_index], record.quality[start_index:stop_index])
+    start_index > stop_index && return _register_quality_result!(_ctx, nothing, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=true, kept=false))
+    result = FastqRecord(record.identifier, record.description, record.sequence[start_index:stop_index], record.quality[start_index:stop_index])
+
+
+    return _register_quality_result!(_ctx, result, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=true))
 end
 
 """
@@ -237,32 +283,36 @@ Trim adapter contamination from a lightweight record.
 """
 function adapter_trim(
     record::SeqRecordLite;
-    adapter::AbstractString,
+    adapter::Union{BioSequence,AbstractString},
     min_overlap::Int=8,
     max_mismatches::Int=1,
     from_end::Symbol=:three_prime,
     quality_key::Symbol=:quality,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+    adapter = adapter isa AbstractString ? _quality_adapter_sequence(adapter) : adapter
     trim_span = _adapter_trim_span(record.sequence, adapter; min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end)
-    trim_span === nothing && return record
+    trim_span === nothing && return _register_quality_result!(_ctx, record, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=false))
     start_index, stop_index = trim_span
-    start_index > stop_index && return nothing
+    start_index > stop_index && return _register_quality_result!(_ctx, nothing, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=true, kept=false))
 
     trimmed_annotations = copy(record.annotations)
     trimmed_letter_annotations = copy(record.letter_annotations)
     if haskey(trimmed_letter_annotations, quality_key)
         quality = trimmed_letter_annotations[quality_key]
-        quality isa AbstractString && (trimmed_letter_annotations[quality_key] = quality[start_index:stop_index])
+        quality isa String && (trimmed_letter_annotations[quality_key] = quality[start_index:stop_index])
     end
 
-    return SeqRecordLite(
+    result = SeqRecordLite(
         record.sequence[start_index:stop_index];
         identifier=record.identifier,
         name=record.name,
         description=record.description,
         annotations=trimmed_annotations,
-        letter_annotations=trimmed_letter_annotations,
-    )
+        letter_annotations=trimmed_letter_annotations)
+
+
+    return _register_quality_result!(_ctx, result, "adapter_trim"; parents=provenance_parent_ids(record), parameters=(min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, trimmed=true))
 end
 
 """
@@ -272,7 +322,7 @@ Run adapter trimming, low-quality trimming, length checks, and quality filters.
 """
 function process_sequencing_record(
     record::Union{FastqRecord,SeqRecordLite};
-    adapter::Union{Nothing,AbstractString}=nothing,
+    adapter::Union{Nothing,BioSequence,AbstractString}=nothing,
     min_mean_quality::Real=20,
     min_base_quality::Real=0,
     max_low_quality_fraction::Real=1.0,
@@ -284,18 +334,20 @@ function process_sequencing_record(
     from_end::Symbol=:three_prime,
     quality_key::Symbol=:quality,
     offset::Integer=33,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     processed = record
     if adapter !== nothing
-        processed = adapter_trim(processed; adapter=adapter, min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, quality_key=quality_key)
+        processed = adapter_trim(processed; adapter=adapter, min_overlap=min_overlap, max_mismatches=max_mismatches, from_end=from_end, quality_key=quality_key, _ctx=_ctx)
         processed === nothing && return nothing
     end
 
-    processed = trim_low_quality(processed; window=window, threshold=threshold, quality_key=quality_key, offset=offset)
+    processed = trim_low_quality(processed; window=window, threshold=threshold, quality_key=quality_key, offset=offset, _ctx=_ctx)
     processed === nothing && return nothing
     ncodeunits(processed.sequence) >= min_length || return nothing
-    quality_filter(processed; min_mean_quality=min_mean_quality, min_base_quality=min_base_quality, max_low_quality_fraction=max_low_quality_fraction, quality_key=quality_key, offset=offset) || return nothing
-    return processed
+    quality_filter(processed; min_mean_quality=min_mean_quality, min_base_quality=min_base_quality, max_low_quality_fraction=max_low_quality_fraction, quality_key=quality_key, offset=offset, _ctx=_ctx) || return nothing
+    return _register_quality_result!(_ctx, processed, "process_sequencing_record"; parents=provenance_parent_ids(record), parameters=(min_mean_quality=Float64(min_mean_quality), min_base_quality=Float64(min_base_quality), max_low_quality_fraction=Float64(max_low_quality_fraction), min_length=min_length))
 end
 
 """
@@ -305,7 +357,7 @@ Apply sequencing cleanup to a batch of FASTQ or lightweight records.
 """
 function sequencing_pipeline(
     records::AbstractVector{T};
-    adapter::Union{Nothing,AbstractString}=nothing,
+    adapter::Union{Nothing,BioSequence,AbstractString}=nothing,
     min_mean_quality::Real=20,
     min_base_quality::Real=0,
     max_low_quality_fraction::Real=1.0,
@@ -317,7 +369,8 @@ function sequencing_pipeline(
     from_end::Symbol=:three_prime,
     quality_key::Symbol=:quality,
     offset::Integer=33,
-) where {T<:Union{FastqRecord,SeqRecordLite}}
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx)) where {T<:Union{FastqRecord,SeqRecordLite}}
     processed = T[]
     for record in records
         filtered = process_sequencing_record(
@@ -334,11 +387,13 @@ function sequencing_pipeline(
             from_end=from_end,
             quality_key=quality_key,
             offset=offset,
-        )
+            _ctx=_ctx)
         filtered === nothing && continue
         push!(processed, filtered)
     end
-    return processed
+
+
+    return _register_quality_result!(_ctx, processed, "sequencing_pipeline"; parents=provenance_parent_ids(records), parameters=(input_count=length(records), output_count=length(processed), min_length=min_length))
 end
 
 """
@@ -377,18 +432,20 @@ end
 
 Trim low-quality ends from a FASTQ record.
 """
-function trim_low_quality(record::FastqRecord; window::Int=4, threshold::Real=20, quality_key::Symbol=:quality, offset::Integer=33)
-    scores = phred_scores(record.quality; offset=offset)
+function trim_low_quality(record::FastqRecord; window::Int=4, threshold::Real=20, quality_key::Symbol=:quality, offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    scores = phred_scores(record.quality; offset=offset, _ctx=_ctx)
     trimmed = _trim_window(scores, window, threshold)
-    trimmed === nothing && return nothing
+    trimmed === nothing && return _register_quality_result!(_ctx, nothing, "trim_low_quality"; parents=provenance_parent_ids(record), parameters=(window=window, threshold=Float64(threshold), trimmed=false))
 
     start_index, stop_index = trimmed
-    return FastqRecord(
+    result = FastqRecord(
         record.identifier,
         record.description,
         record.sequence[start_index:stop_index],
-        record.quality[start_index:stop_index],
-    )
+        record.quality[start_index:stop_index])
+
+
+    return _register_quality_result!(_ctx, result, "trim_low_quality"; parents=provenance_parent_ids(record), parameters=(window=window, threshold=Float64(threshold), trimmed=true))
 end
 
 """
@@ -396,26 +453,28 @@ end
 
 Trim low-quality ends from a lightweight record.
 """
-function trim_low_quality(record::SeqRecordLite; quality_key::Symbol=:quality, window::Int=4, threshold::Real=20, offset::Integer=33)
+function trim_low_quality(record::SeqRecordLite; quality_key::Symbol=:quality, window::Int=4, threshold::Real=20, offset::Integer=33, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     quality = get(record.letter_annotations, quality_key, nothing)
     quality === nothing && throw(ArgumentError("missing $(quality_key) letter annotation"))
-    quality isa AbstractString || throw(ArgumentError("FASTQ quality annotation must be a string"))
+    quality isa String || throw(ArgumentError("FASTQ quality annotation must be a string"))
 
-    scores = phred_scores(quality; offset=offset)
+    scores = phred_scores(quality; offset=offset, _ctx=_ctx)
     trimmed = _trim_window(scores, window, threshold)
-    trimmed === nothing && return nothing
+    trimmed === nothing && return _register_quality_result!(_ctx, nothing, "trim_low_quality"; parents=provenance_parent_ids(record), parameters=(window=window, threshold=Float64(threshold), trimmed=false))
 
     start_index, stop_index = trimmed
     trimmed_annotations = copy(record.annotations)
     trimmed_letter_annotations = copy(record.letter_annotations)
     trimmed_letter_annotations[quality_key] = quality[start_index:stop_index]
 
-    return SeqRecordLite(
+    result = SeqRecordLite(
         record.sequence[start_index:stop_index];
         identifier=record.identifier,
         name=record.name,
         description=record.description,
         annotations=trimmed_annotations,
-        letter_annotations=trimmed_letter_annotations,
-    )
+        letter_annotations=trimmed_letter_annotations)
+
+
+    return _register_quality_result!(_ctx, result, "trim_low_quality"; parents=provenance_parent_ids(record), parameters=(window=window, threshold=Float64(threshold), trimmed=true))
 end

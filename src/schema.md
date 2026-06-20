@@ -1,36 +1,355 @@
-# schema.jl
+# `schema.jl` - Variant Records and Compact Schema Helpers
 
-## Purpose
-This file defines the compact variant schema used for efficient storage and transport of genomic variant events. It is designed for workflows that need to convert text-based VCF-like records into a smaller, Arrow-friendly representation.
+## Overview
 
-## Main structs
-- VariantEvent: a compact encoded variant record containing chromosome code, position, hashed ID, encoded ref/alt bases, quality, and a quality-present flag.
-- VariantTextRecord: the text-level variant representation used as the intermediate conversion format.
+`schema.jl` defines lightweight variant-record containers and compact encoding helpers used by BioToolkit's VCF and Arrow-style genomics workflows.
 
-## Public functions
-- arrow_schema(::Type{VariantEvent}): expose the Arrow/Tables schema for VariantEvent.
-- encode_chromosome(chrom): map chromosome labels such as chr1, X, Y, and MT into compact integer codes.
-- encode_base(base): encode nucleotide bases into small integer codes.
-- encode_identifier(identifier): hash a string identifier into a compact UInt32.
-- compact_variant_event(record): convert a VariantTextRecord into a compact VariantEvent.
+### Purpose
 
-## What the module does
-The module compresses a text variant record into a small fixed-width structure that is easier to store in memory and easier to pass through Arrow-compatible pipelines. It keeps the important coordinates and identity information, but replaces the textual fields with numeric codes where possible.
+Variant data often moves between text formats, such as VCF, and columnar or binary representations, such as Arrow tables. `schema.jl` provides both sides of that bridge:
 
-## How the structs work together
-VariantTextRecord is the human-readable or parser-facing representation. VariantEvent is the compact representation used after encoding. The conversion function bridges the two, while the encoding helpers keep chromosome labels, bases, and identifiers standardized.
+- `VariantTextRecord` preserves VCF-like textual fields.
+- `VariantEvent` stores compact numeric fields suitable for Arrow schemas.
+- `VcfHeader` and `VcfDocument` represent structured VCF documents.
+- Encoding helpers convert chromosomes, alleles, and identifiers into compact values.
 
-## Typical usage
-1. Parse or construct VariantTextRecord objects from VCF-like input.
-2. Call compact_variant_event to convert them to VariantEvent.
-3. Use the VariantEvent array in Arrow-compatible storage or high-throughput processing.
-4. Decode or reformat as needed through the text-based pathway in io.jl.
+All user-facing constructors participate in BioToolkit provenance when a context is active.
 
-## Important implementation details
-- encode_chromosome handles standard autosomes plus X, Y, and mitochondrial labels.
-- encode_base maps bases to compact codes and falls back to 0 for unknown values.
-- encode_identifier uses an FNV-style hash to create stable compact IDs.
-- compact_variant_event stores both the numeric quality and a Boolean indicating whether quality was present in the source.
+---
 
-## Why this file matters
-This module is the space-efficient variant representation layer of BioToolkit. It makes large-scale variant data easier to store, move, and analyze without losing the ability to round-trip from text records.
+## Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Separate text and compact records** | VCF parsing needs full textual fidelity, while Arrow storage benefits from fixed-width numeric fields. |
+| **Small concrete structs** | Fixed fields make records easy to store, compare, print, and convert. |
+| **Metadata dictionaries carry provenance** | `VariantTextRecord` and `VcfDocument` include metadata dictionaries so provenance ids can attach to parsed objects. |
+| **Equality ignores provenance metadata** | Biological equality should not fail just because two otherwise identical records have different provenance ids. |
+| **Chromosome and base encoding are explicit** | Compact encodings are readable and deterministic rather than hidden inside table-writing code. |
+
+---
+
+## Table of Contents
+
+1. [VariantEvent](#1-variantevent)
+2. [VariantTextRecord](#2-varianttextrecord)
+3. [VcfHeader](#3-vcfheader)
+4. [VcfDocument](#4-vcfdocument)
+5. [Encoding Helpers](#5-encoding-helpers)
+6. [Arrow Schema](#6-arrow-schema)
+7. [Display and Equality](#7-display-and-equality)
+8. [Quick Reference](#8-quick-reference)
+
+---
+
+## 1. `VariantEvent`
+
+```julia
+struct VariantEvent
+    chrom::UInt16
+    pos::Int32
+    id::UInt32
+    ref::UInt8
+    alt::UInt8
+    qual::Float32
+    hasqual::Bool
+end
+```
+
+**Kind:** Concrete struct
+
+**Description:** Compact Arrow-friendly representation of a variant. It stores fixed-width numeric fields rather than full VCF strings.
+
+**Fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `chrom` | `UInt16` | Encoded chromosome. |
+| `pos` | `Int32` | One-based variant position. |
+| `id` | `UInt32` | Hashed identifier. |
+| `ref` | `UInt8` | Encoded reference base. |
+| `alt` | `UInt8` | Encoded alternate base. |
+| `qual` | `Float32` | Quality score, or `NaN` when absent. |
+| `hasqual` | `Bool` | Whether a quality value was present. |
+
+**Use case:** Generated by `compact_variant_event(record)` after parsing a textual variant.
+
+---
+
+## 2. `VariantTextRecord`
+
+```julia
+struct VariantTextRecord
+    chrom::String
+    pos::Int32
+    id::String
+    ref::String
+    alt::String
+    qual::Union{Missing,Float32}
+    filter::String
+    info::String
+    format::String
+    samples::Vector{String}
+    metadata::Dict{Symbol,Any}
+end
+```
+
+**Kind:** Concrete struct
+
+**Description:** Text-oriented variant record used as a parsing front end before compact encoding. It preserves VCF-like fields including `FILTER`, `INFO`, `FORMAT`, and sample columns.
+
+### Constructor
+
+```julia
+VariantTextRecord(
+    chrom,
+    pos,
+    id,
+    ref,
+    alt,
+    qual;
+    filter="PASS",
+    info=".",
+    format="",
+    samples=String[],
+    metadata=Dict{Symbol,Any}(),
+    prov_ctx=nothing
+)
+```
+
+**Behavior:**
+
+- converts `pos` to `Int32`;
+- converts non-missing `qual` to `Float32`;
+- copies string-like fields to `String`;
+- copies sample values to `Vector{String}`;
+- copies metadata to `Dict{Symbol,Any}`;
+- ensures a provenance id in metadata;
+- registers a provenance result when a context is active.
+
+**Example:**
+
+```julia
+record = VariantTextRecord(
+    "chr1", 12345, "rs1", "A", "G", 99.5;
+    filter="PASS",
+    info="DP=20")
+```
+
+---
+
+## 3. `VcfHeader`
+
+```julia
+struct VcfHeader
+    meta_lines::Vector{String}
+    columns::Vector{String}
+    sample_names::Vector{String}
+end
+```
+
+**Kind:** Concrete struct
+
+**Description:** Structured VCF header metadata, including raw meta-lines, column names, and sample names.
+
+### Constructors
+
+```julia
+VcfHeader()
+VcfHeader(meta_lines, columns, sample_names=String[])
+```
+
+**Default header columns:**
+
+```julia
+["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
+```
+
+**Example:**
+
+```julia
+header = VcfHeader(
+    ["##fileformat=VCFv4.3"],
+    ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"],
+    String[])
+```
+
+---
+
+## 4. `VcfDocument`
+
+```julia
+struct VcfDocument
+    header::VcfHeader
+    records::Vector{VariantTextRecord}
+    metadata::Dict{Symbol,Any}
+end
+```
+
+**Kind:** Concrete struct
+
+**Description:** Full parsed VCF document containing a header, variant records, and document-level metadata.
+
+### Constructors
+
+```julia
+VcfDocument(records; prov_ctx=nothing)
+VcfDocument(header::VcfHeader, records; prov_ctx=nothing)
+```
+
+**Behavior:**
+
+- stores records as `Vector{VariantTextRecord}`;
+- creates and stamps document metadata;
+- uses a default `VcfHeader()` when one is not supplied;
+- registers provenance with record count and sample count.
+
+**Interface:**
+
+```julia
+length(doc::VcfDocument)
+iterate(doc::VcfDocument)
+```
+
+`VcfDocument` iterates over its `records`.
+
+**Example:**
+
+```julia
+doc = VcfDocument([record])
+length(doc)        # 1
+first(doc.records) # record
+```
+
+---
+
+## 5. Encoding Helpers
+
+### `encode_chromosome(chrom)`
+
+```julia
+encode_chromosome(chrom::String) -> UInt16
+```
+
+**Description:** Encodes a chromosome label into a compact numeric id.
+
+**Mapping:**
+
+| Input | Output |
+|---|---|
+| `"1"` or `"chr1"` | `0x0001` |
+| `"X"` or `"chrX"` | `0x0017` (23) |
+| `"Y"` or `"chrY"` | `0x0018` (24) |
+| `"M"`, `"MT"`, `"chrM"`, `"chrMT"` | `0x0019` (25) |
+| unknown non-numeric labels | `0x0000` |
+
+Numeric chromosomes are clamped into the `UInt16` range.
+
+### `encode_base(base)`
+
+```julia
+encode_base(base::String) -> UInt8
+```
+
+**Description:** Encodes single nucleotide strings into compact numeric values.
+
+| Base | Code |
+|---|---|
+| `A` | `1` |
+| `C` | `2` |
+| `G` | `3` |
+| `T` | `4` |
+| `N` | `5` |
+
+**Errors:** Throws `ArgumentError` for unsupported base sequences. This compact encoder is for simple single-base alleles, not arbitrary indels or symbolic alleles.
+
+### `encode_identifier(identifier)`
+
+```julia
+encode_identifier(identifier::String) -> UInt32
+```
+
+**Description:** Hashes a variant id into a compact 32-bit value using an FNV-1a-style update.
+
+---
+
+## 6. Arrow Schema
+
+### `arrow_schema(::Type{VariantEvent})`
+
+```julia
+arrow_schema(::Type{VariantEvent}; prov_ctx=nothing) -> Tables.Schema
+```
+
+**Description:** Returns the Tables.jl schema for `VariantEvent` using its field names and field types.
+
+**Provenance behavior:** If a context is active, registers an `"arrow_schema"` node with the number of fields.
+
+**Example:**
+
+```julia
+schema = arrow_schema(VariantEvent)
+```
+
+---
+
+## 7. Display and Equality
+
+### Equality
+
+```julia
+==(left::VariantTextRecord, right::VariantTextRecord)
+==(left::VcfHeader, right::VcfHeader)
+==(left::VcfDocument, right::VcfDocument)
+```
+
+**Description:** Structural equality for VCF-related records. Metadata comparison strips provenance keys before comparison.
+
+### Display
+
+```julia
+show(record::VariantTextRecord)
+show(document::VcfDocument)
+```
+
+**Examples:**
+
+```text
+VariantTextRecord(chr1:12345, A->G, provenance=id=...)
+VcfDocument(10 records, provenance=id=...)
+```
+
+---
+
+## 8. Quick Reference
+
+| API | Purpose |
+|---|---|
+| `VariantEvent` | Compact fixed-width variant record. |
+| `VariantTextRecord` | Text-preserving VCF-style variant record. |
+| `VcfHeader` | VCF header metadata. |
+| `VcfDocument` | Header plus variant records. |
+| `arrow_schema(VariantEvent)` | Tables schema for compact variants. |
+| `encode_chromosome` | Chromosome label to `UInt16`. |
+| `encode_base` | Single base to compact code. |
+| `encode_identifier` | Variant id to `UInt32` hash. |
+| `compact_variant_event` | Convert text record to compact record. |
+
+---
+
+## Complete Usage Example
+
+```julia
+record = VariantTextRecord(
+    "chr1", 12345, "rs123", "A", "G", 60.0;
+    filter="PASS",
+    info="DP=35")
+
+compact = compact_variant_event(record)
+schema = arrow_schema(VariantEvent)
+doc = VcfDocument([record])
+
+length(doc)
+encode_chromosome("chrX")
+encode_base("N")
+```

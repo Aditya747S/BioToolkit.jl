@@ -1,35 +1,93 @@
-# microbiome.jl
+# `microbiome.jl` - Microbiome Community Analysis
 
-## Purpose
-This file implements microbial community analysis on top of count matrices, phylogenetic trees, and sample metadata. It covers compositional transforms, beta-diversity, ordination, differential abundance, source tracking, and network construction.
+## Overview
 
-## Main types
-- `CommunityProfile` is the central container combining counts, taxonomy, a phylogenetic tree, and metadata.
-- `PCoAResult` stores ordination coordinates, eigenvalues, and explained variance.
-- `NMDSResult` stores ordination coordinates, stress, iterations, and convergence state.
-- `ANCOMResult` stores taxon IDs, W statistics, p-values, q-values, and significance flags.
-- `SongbirdResult` stores regression coefficients and fit metadata for rank-based differential abundance.
-- `SourceTrackingResult` stores posterior summaries from a source tracking model.
-- `MicrobiomeNetwork` stores a graph, edge weights, taxon labels, and coordinates.
+`microbiome.jl` provides community-profile containers, compositional transforms, alpha/beta diversity, UniFrac-style distances, ordination, differential abundance, co-occurrence networks, source tracking, taxonomic classification, MAG binning, strain profiling, and pathway summaries.
 
-## Key functions
-- Compositional transforms: `clr_transform` and `ilr_transform`.
-- Distance and diversity metrics: `bray_curtis`, `pairwise_bray_curtis`, `unifrac`, `pairwise_unifrac`, `weighted_unifrac`, `shannon_entropy`, `simpson_index`, and `faith_pd`.
-- Ordination: `pcoa`, `pcoa_plot`, and `nmds`.
-- Differential abundance: `ancom` and `songbird`.
-- Source tracking: `source_tracking_model`, `source_tracking`, and `source_tracking_posterior_summary`.
-- Networks: `cooccurrence_network` and `network_plot`.
+### Purpose
 
-## How it is used
-The normal workflow is to build a `CommunityProfile`, transform counts with `clr_transform` or `ilr_transform`, compute distances with `bray_curtis` or `unifrac`, and then reduce the result with `pcoa` or `nmds`.
+This page documents the public API in `microbiome.jl`, grouped by the biological workflow it supports. Each entry describes the role of the function or type in practical BioToolkit analyses.
 
-For hypothesis testing, `ancom` and `songbird` provide two different differential-abundance style approaches. For source attribution, the source tracking helpers run a Bayesian model and summarize the posterior chain. Network functions turn taxa associations into graph objects that can be plotted or inspected downstream.
+---
 
-## Implementation notes
-- The module validates that taxonomy and metadata line up with the count matrix and phylogeny before constructing a `CommunityProfile`.
-- `pairwise_unifrac` supports both weighted and unweighted workflows.
-- `pcoa_plot` expects at least two coordinates and can annotate points with labels.
-- `integrate_batches`, `detect_doublets`, and clustering support are implemented in the downstream single-cell module, not here.
+## Design Decisions
 
-## Why it matters
-Microbiome analysis is not just counting taxa; it is compositional, phylogenetic, and often posterior-driven. This file pulls those pieces into one coherent API so community analysis is reusable instead of being reimplemented in ad hoc scripts.
+| Decision | Rationale |
+|---|---|
+| **Domain-specific names** | Public functions match familiar analysis concepts. |
+| **Compact result containers** | Typed results preserve the fields needed for downstream inspection. |
+| **Composable tables and matrices** | APIs accept common Julia data structures and BioToolkit containers. |
+| **Deterministic summaries** | Statistical summaries are reproducible unless stochastic behavior is explicitly requested. |
+| **Workflow interoperability** | Outputs can feed plotting, enrichment, clinical, or systems biology modules. |
+
+---
+
+## 1. Types
+
+Result types preserve ordination, differential abundance, network, and source-tracking metadata.
+
+| API | Description |
+|---|---|
+| `CommunityProfile` | Taxa/features by samples abundance table with taxonomy/sample metadata. |
+| `PCoAResult` | Principal coordinates result. |
+| `NMDSResult` | NMDS ordination result. |
+| `ANCOMResult` | ANCOM-style differential abundance result. |
+| `SongbirdResult` | Songbird-style multinomial differential ranking result. |
+| `MicrobiomeNetwork` | Co-occurrence network with taxa nodes and weighted edges. |
+| `SourceTrackingResult` | Source contribution estimates for sink samples. |
+
+## 2. Transforms and Diversity
+
+Core functions compute compositional transforms and ecological distances/diversity.
+
+| API | Description |
+|---|---|
+| `clr_transform` | Centered log-ratio transform. |
+| `ilr_transform` | Isometric log-ratio transform. |
+| `bray_curtis` | Bray-Curtis dissimilarity between samples. |
+| `unifrac` | Unweighted UniFrac-style distance. |
+| `weighted_unifrac` | Weighted UniFrac-style distance. |
+| `pairwise_bray_curtis` | Pairwise Bray-Curtis distance matrix. |
+| `pairwise_unifrac` | Pairwise UniFrac-style matrix. |
+| `shannon_entropy` | Shannon alpha diversity. |
+| `simpson_index` | Simpson diversity index. |
+| `faith_pd` | Faith phylogenetic diversity. |
+
+## 3. Ordination, Testing, and Networks
+
+Higher-level functions support ordination plots, differential abundance, networks, and source tracking.
+
+| API | Description |
+|---|---|
+| `pcoa` | Principal coordinates analysis. |
+| `pcoa_plot` | Plot-ready PCoA payload. |
+| `nmds` | Nonmetric multidimensional scaling. |
+| `ancom` | ANCOM-style differential abundance. |
+| `songbird` | Songbird-style differential ranking. |
+| `cooccurrence_network` | Builds taxa co-occurrence network. |
+| `network_plot` | Plot-ready network payload. |
+| `source_tracking_model` | Fits a source-tracking model. |
+| `source_tracking` | Estimates source contributions. |
+| `source_tracking_posterior_summary` | Summarizes source-tracking posteriors. |
+| `mag_bin_contigs` | Bins contigs into MAG-like groups. |
+| `kraken_like_classify` | Classifies reads/contigs by k-mer votes. |
+| `viral_contig_scores` | Scores contigs for viral signal. |
+| `humann_like_pathways` | Aggregates taxa/gene families into pathway-like summaries. |
+| `strainge_like_variants` | Profiles strain variants. |
+| `lca_taxonomy_from_votes` | Computes lowest-common-ancestor taxonomy from votes. |
+| `strain_haplotype_profile` | Builds strain haplotype profiles. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+profile = CommunityProfile(counts, taxa, samples)
+dist = pairwise_bray_curtis(profile)
+ord = pcoa(dist)
+da = ancom(profile, group_labels)
+net = cooccurrence_network(profile)
+```
+

@@ -1,6 +1,9 @@
 export build_index, local_search, run_blast, qblast, parse_blast_xml, read_blast_xml, KmerIndex, HighScoringPair, BlastXMLRecord, BlastXMLHit, BlastXMLHSP
 export BlastTabularRecord, BlastTabularHit, BlastTabularHSP, parse_blast_tabular, read_blast_tabular
 
+using SHA
+using ..BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, register_provenance!
+
 struct KmerIndex
     k::Int
     database::Dict{UInt64, Vector{Tuple{Int, Int}}}
@@ -16,18 +19,26 @@ end
     return val
 end
 
+@inline _search_as_biosequence(sequence::BioSequence) = sequence
+
+function _search_as_biosequence(sequence)
+    sequence_text = String(sequence)
+    inferred_alphabet = _infer_sequence_alphabet(sequence_text)
+    return BioSequence{inferred_alphabet}(sequence_text)
+end
+
 # --- BLAST+ Local Wrapper ---
 
 """
-    run_blast(program::String, query::String, database::String; options::String="", outfmt::Int=6)
+    run_blast(program::String, query::BioSequence, database::String; options::String="", outfmt::Int=6)
 
 Run a local BLAST+ search. Requires the `blast+` suite to be installed in the system PATH.
 Returns a Vector of `HighScoringPair`.
 """
-function run_blast(program::AbstractString, query_seq::AbstractString, database::AbstractString; options::AbstractString="", outfmt::Int=6)
+function run_blast(program::String, query_seq::BioSequence, database::String; options::String="", outfmt::Int=6, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     # Temporary files for query and output
     q_file, q_io = mktemp()
-    write(q_io, ">query\n", query_seq)
+    write(q_io, ">query\n", String(query_seq))
     close(q_io)
     
     r_file, r_io = mktemp()
@@ -64,6 +75,9 @@ function run_blast(program::AbstractString, query_seq::AbstractString, database:
                 push!(hsps, hsp)
             end
         end
+        if _ctx !== nothing
+            register_provenance!(_ctx, "run_blast"; parents=String[], parameters=(program=String(program), database=String(database), query_length=length(query_seq), options=String(options), outfmt=outfmt, hit_count=length(hsps)))
+        end
         return hsps
     finally
         rm(q_file, force=true)
@@ -71,21 +85,28 @@ function run_blast(program::AbstractString, query_seq::AbstractString, database:
     end
 end
 
-"""
-    qblast(program::String, database::String, query::String; options::Dict=Dict())
-
-Placeholder for remote BLAST search. Implementation requires `HTTP` and `EzXML` dependencies.
-"""
-function qblast(program::AbstractString, database::AbstractString, query::AbstractString; options::AbstractDict=Dict())
-    error("qblast requires optional dependencies HTTP and EzXML. Please install them and use a wrapper.")
+function run_blast(program::String, query_seq, database::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
+    return run_blast(program, _search_as_biosequence(query_seq), database; _ctx=_ctx, kwargs...)
 end
 
 """
-    build_index(targets::Vector{<:AbstractString}, names::Vector{<:AbstractString}=String[]; k::Int=4)
+    qblast(program::String, database::String, query::BioSequence; options::Dict=Dict())
+
+Placeholder for remote BLAST search. Implementation requires `HTTP` and `EzXML` dependencies.
+"""
+function qblast(program::String, database::String, query::BioSequence; options::AbstractDict=Dict())
+    error("qblast requires optional dependencies HTTP and EzXML. Please install them and use a wrapper.")
+end
+
+qblast(program::String, database::String, query; options::AbstractDict=Dict()) =
+    qblast(program, database, _search_as_biosequence(query); options=options)
+
+"""
+    build_index(targets::Vector{<:BioSequence}, names::Vector{<:String}=String[]; k::Int=4)
 
 Builds a k-mer index for a database of target sequences (optimized for proteins, k <= 8).
 """
-function build_index(targets::Vector{<:AbstractString}, names::Vector{<:AbstractString}=String[]; k::Int=4)
+function build_index(targets::AbstractVector{<:BioSequence}, names::Vector{<:String}=String[]; k::Int=4, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     if k > 8
         throw(ArgumentError("k must be <= 8 for efficient UInt64 packing in this implementation"))
     end
@@ -98,7 +119,7 @@ function build_index(targets::Vector{<:AbstractString}, names::Vector{<:Abstract
     target_bytes = Vector{Vector{UInt8}}(undef, length(targets))
     
     for (t_idx, target) in enumerate(targets)
-        bytes = Vector{UInt8}(codeunits(target))
+        bytes = copy(target.data)
         target_bytes[t_idx] = bytes
         
         len = length(bytes)
@@ -111,7 +132,13 @@ function build_index(targets::Vector{<:AbstractString}, names::Vector{<:Abstract
         end
     end
     
-    return KmerIndex(k, database, names, target_bytes)
+    index = KmerIndex(k, database, names, target_bytes)
+    _ctx !== nothing && register_provenance!(_ctx, "build_index"; parents=provenance_parent_ids(targets), parameters=(k=k, target_count=length(targets), name_count=length(names), seed_count=length(database)))
+    return index
+end
+
+function build_index(targets::AbstractVector, names::Vector{<:String}=String[]; k::Int=4, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    return build_index([_search_as_biosequence(target) for target in targets], names; k=k, _ctx=_ctx)
 end
 
 struct HighScoringPair
@@ -128,7 +155,7 @@ struct HighScoringPair
     alignment_length::Int
 end
 
-struct BlastXMLHSP
+struct BlastXMLHSP{A <: BioAlphabet, B <: BioAlphabet}
     bit_score::Float64
     evalue::Float64
     identities::Int
@@ -138,9 +165,41 @@ struct BlastXMLHSP
     query_end::Int
     hit_start::Int
     hit_end::Int
-    query_sequence::String
-    hit_sequence::String
+    query_sequence::BioSequence{A}
+    hit_sequence::BioSequence{B}
     midline::String
+end
+
+function BlastXMLHSP(
+    bit_score::Real,
+    evalue::Real,
+    identities::Integer,
+    positives::Integer,
+    align_length::Integer,
+    query_start::Integer,
+    query_end::Integer,
+    hit_start::Integer,
+    hit_end::Integer,
+    query_sequence,
+    hit_sequence,
+    midline::String)
+    query_bioseq = _search_as_biosequence(query_sequence)
+    hit_bioseq = _search_as_biosequence(hit_sequence)
+    query_alphabet = alphabet(query_bioseq)
+    hit_alphabet = alphabet(hit_bioseq)
+    return BlastXMLHSP{query_alphabet, hit_alphabet}(
+        Float64(bit_score),
+        Float64(evalue),
+        Int(identities),
+        Int(positives),
+        Int(align_length),
+        Int(query_start),
+        Int(query_end),
+        Int(hit_start),
+        Int(hit_end),
+        query_bioseq,
+        hit_bioseq,
+        String(midline))
 end
 
 struct BlastXMLHit
@@ -187,22 +246,22 @@ end
     replace(String(text), "&lt;" => "<", "&gt;" => ">", "&amp;" => "&", "&quot;" => "\"", "&apos;" => "'")
 end
 
-function _xml_blocks(text::AbstractString, tag::AbstractString)
-    pattern = Regex("<$(tag)>(.*?)</$(tag)>", "s")
-    return [match.captures[1] for match in eachmatch(pattern, text)]
+function _xml_blocks(text::AbstractString, tag::String)
+    pattern = Regex("<$(tag)\\b[^>]*>(.*?)</$(tag)>", "s")
+    return [String(match.captures[1]) for match in eachmatch(pattern, String(text))]
 end
 
-function _xml_first(text::AbstractString, tag::AbstractString; default::AbstractString="")
-    pattern = Regex("<$(tag)>(.*?)</$(tag)>", "s")
-    found = match(pattern, text)
+function _xml_first(text::AbstractString, tag::String; default::AbstractString="")
+    pattern = Regex("<$(tag)\\b[^>]*>(.*?)</$(tag)>", "s")
+    found = match(pattern, String(text))
     found === nothing && return String(default)
-    return _blast_xml_unescape(found.captures[1])
+    return String(strip(_blast_xml_unescape(found.captures[1])))
 end
 
 _xml_parse_int(text::AbstractString; default::Int=0) = isempty(strip(text)) ? default : parse(Int, strip(text))
 _xml_parse_float(text::AbstractString; default::Float64=0.0) = isempty(strip(text)) ? default : parse(Float64, strip(text))
 
-function parse_blast_xml(xml::AbstractString)
+function parse_blast_xml(xml::String, provenance_source::AbstractString="parse_blast_xml", provenance_hash::Union{Nothing,AbstractString}=nothing; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = BlastXMLRecord[]
     xml_text = String(xml)
 
@@ -248,20 +307,26 @@ function parse_blast_xml(xml::AbstractString)
         push!(records, BlastXMLRecord(program, version, database, query_id, query_def, query_length, hits))
     end
 
+    _ctx !== nothing && register_provenance!(_ctx, "parse_blast_xml"; parents=String[], parameters=(source=provenance_source, record_count=length(records), hash=provenance_hash, program=program, database=database))
     return records
 end
 
-function parse_blast_xml(io::IO)
-    return parse_blast_xml(read(io, String))
+function parse_blast_xml(io::IO, provenance_source::AbstractString="parse_blast_xml", provenance_hash::Union{Nothing,AbstractString}=nothing; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    return parse_blast_xml(read(io, String), provenance_source, provenance_hash; _ctx=_ctx)
 end
 
-function read_blast_xml(path::AbstractString)
-    open(path, "r") do io
-        return parse_blast_xml(io)
+function read_blast_xml(path::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(path, "r") do io
+            return parse_blast_xml(io)
+        end
     end
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return parse_blast_xml(IOBuffer(raw_bytes), path, provenance_hash; _ctx=_ctx)
 end
 
-function parse_blast_tabular(lines::AbstractString)
+function parse_blast_tabular(lines::String, provenance_source::AbstractString="parse_blast_tabular", provenance_hash::Union{Nothing,AbstractString}=nothing; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = Dict{String,Dict{String,Vector{BlastTabularHSP}}}()
     for raw_line in eachline(IOBuffer(lines))
         line = strip(raw_line)
@@ -282,8 +347,7 @@ function parse_blast_tabular(lines::AbstractString)
             parse(Int, parts[5]),
             parse(Int, parts[6]),
             parse(Float64, parts[11]),
-            parse(Float64, parts[12]),
-        )
+            parse(Float64, parts[12]))
         query_hits = get!(records, query_id, Dict{String,Vector{BlastTabularHSP}}())
         push!(get!(query_hits, target_id, BlastTabularHSP[]), hsp)
     end
@@ -298,17 +362,23 @@ function parse_blast_tabular(lines::AbstractString)
     end
 
     sort!(parsed; by = record -> record.query_id)
+    _ctx !== nothing && register_provenance!(_ctx, "parse_blast_tabular"; parents=String[], parameters=(source=provenance_source, record_count=length(parsed), hash=provenance_hash))
     return parsed
 end
 
-function parse_blast_tabular(io::IO)
-    return parse_blast_tabular(read(io, String))
+function parse_blast_tabular(io::IO, provenance_source::AbstractString="parse_blast_tabular", provenance_hash::Union{Nothing,AbstractString}=nothing; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    return parse_blast_tabular(read(io, String), provenance_source, provenance_hash; _ctx=_ctx)
 end
 
-function read_blast_tabular(path::AbstractString)
-    open(path, "r") do io
-        return parse_blast_tabular(io)
+function read_blast_tabular(path::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(path, "r") do io
+            return parse_blast_tabular(io)
+        end
     end
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return parse_blast_tabular(IOBuffer(raw_bytes), path, provenance_hash; _ctx=_ctx)
 end
 
 # Legacy constructor for backward compatibility
@@ -316,11 +386,11 @@ function HighScoringPair(q_start::Int, q_end::Int, t_idx::Int, t_start::Int, t_e
     return HighScoringPair("query", "target_$t_idx", t_idx, q_start, q_end, t_start, t_end, Float64(score), 0.0, 0.0, 0)
 end
 
-function HighScoringPair(query_id::AbstractString, target_id::AbstractString, target_idx::Integer, query_start::Integer, query_end::Integer, target_start::Integer, target_end::Integer, score::Real, evalue::Real, identity::Real, alignment_length::Integer)
+function HighScoringPair(query_id::String, target_id::String, target_idx::Integer, query_start::Integer, query_end::Integer, target_start::Integer, target_end::Integer, score::Real, evalue::Real, identity::Real, alignment_length::Integer)
     return HighScoringPair(String(query_id), String(target_id), Int(target_idx), Int(query_start), Int(query_end), Int(target_start), Int(target_end), Float64(score), Float64(evalue), Float64(identity), Int(alignment_length))
 end
 
-function _parse_target_index(target_id::AbstractString)
+function _parse_target_index(target_id::String)
     found = Base.match(r"(\d+)$", target_id)
     found === nothing && return 0
     return parse(Int, found.captures[1])
@@ -381,12 +451,12 @@ function _extend_ungapped(query_bytes::Vector{UInt8}, target_bytes::Vector{UInt8
 end
 
 """
-    local_search(query::AbstractString, index::KmerIndex; scoring::AbstractPairwiseScoring, x_drop::Int=10, min_score::Int=20)
+    local_search(query::BioSequence, index::KmerIndex; scoring::AbstractPairwiseScoring, x_drop::Int=10, min_score::Int=20)
 
 Performs a BLOSUM/SubstitutionMatrix-scored BLAST-like seed-and-extend local search.
 """
 function local_search(
-    query::AbstractString, 
+    query::BioSequence,
     index::KmerIndex; 
     scoring::AbstractPairwiseScoring, 
     x_drop::Int=15, 
@@ -395,9 +465,10 @@ function local_search(
     gap_extend::Int=-1,
     envelope::Int=20,
     use_threads::Bool=true,
-    use_cuda::Bool=false
-)
-    query_bytes = Vector{UInt8}(codeunits(query))
+    use_cuda::Bool=false,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+    query_bytes = copy(query.data)
     q_len = length(query_bytes)
     k = index.k
     
@@ -461,7 +532,7 @@ function local_search(
         end
     end
 
-    if use_threads || use_cuda
+    if (use_threads || use_cuda) && length(seeds) > 1 && Threads.nthreads() > 1
         Threads.@threads for seed in seeds
             process_seed(seed)
         end
@@ -506,5 +577,10 @@ function local_search(
         end
     end
     
+    _ctx !== nothing && register_provenance!(_ctx, "local_search"; parents=String[], parameters=(query_length=q_len, k=k, hit_count=length(filtered_hsps), x_drop=x_drop, min_score=min_score, gap_open=gap_open, gap_extend=gap_extend, envelope=envelope, use_threads=use_threads, use_cuda=use_cuda))
     return filtered_hsps
+end
+
+function local_search(query, index::KmerIndex; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
+    return local_search(_search_as_biosequence(query), index; _ctx=_ctx, kwargs...)
 end

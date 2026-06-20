@@ -1,34 +1,172 @@
-# quality.jl
+# `quality.jl` - Sequencing Quality Utilities
 
-## Purpose
-This file handles FASTQ quality-score conversion, read trimming, and basic quality control. It is the small preprocessing layer that sits between raw sequencing input and downstream analysis.
+## Overview
 
-## Main functions
-- `phred_score(byte; offset=33)` converts a single encoded quality byte to a Phred score.
-- `phred_scores(quality; offset=33)` converts a string or byte vector into numeric scores.
-- `phred_scores(record; offset=33)` supports both `FastqRecord` and `SeqRecordLite` inputs.
-- `phred_string(scores; offset=33)` converts numeric scores back into an ASCII quality string.
-- `mean_quality(scores; offset=33)` computes the average Phred score.
-- `quality_filter(record; min_mean_quality, min_base_quality, max_low_quality_fraction, quality_key, offset)` applies a read-level filter.
-- `trim_low_quality(record; window, threshold, quality_key, offset)` trims low-quality ends from a record.
-- `adapter_trim(record; adapter, min_overlap, max_mismatches, from_end, quality_key)` removes adapter contamination from either end.
-- `process_sequencing_record(record; ...)` combines adapter trimming, end trimming, length filtering, and quality filtering.
-- `sequencing_pipeline(records; ...)` applies the same processing logic to a vector of records.
+`quality.jl` provides FASTQ quality-score conversion, quality filtering, adapter trimming, low-quality trimming, and simple sequencing-record processing pipelines.
 
-## Internal helpers
-- `_quality_scores` normalizes the record-specific quality extraction path.
-- `_trim_window` identifies the longest retained high-quality span.
-- `_adapter_trim_span` finds the adapter overlap to trim from either the 3' or 5' end.
+### Purpose
 
-## How it is used
-The normal usage pattern is to take a raw FASTQ-like record, convert or inspect the quality encoding with `phred_scores` or `mean_quality`, then remove low-quality sequence with `trim_low_quality` or `process_sequencing_record`. When many reads need the same treatment, `sequencing_pipeline` applies the same rules to a batch.
+FASTQ workflows require consistent handling of Phred quality strings, quality thresholds, adapter removal, and minimum-length filtering. This file centralizes those operations for `FastqRecord` and `SeqRecordLite` while preserving provenance support.
 
-The functions are written to work with both `FastqRecord` and `SeqRecordLite`, so the module can sit on top of either the FASTQ-specific path or the more general record abstraction.
+---
 
-## Implementation notes
-- Quality values are assumed to use a configurable ASCII offset, with 33 as the default.
-- Adapter trimming searches for a best overlap within the allowed mismatch budget and only trims when a valid match is found.
-- `quality_filter` rejects empty reads and can enforce mean-quality, base-quality, and low-quality-fraction constraints together.
+## Design Decisions
 
-## Why it matters
-Quality handling is one of the first gates in a sequencing workflow. This file centralizes the common cleanup logic so later alignment, variant, or assembly steps do not need to duplicate it.
+| Decision | Rationale |
+|---|---|
+| **Phred offset is explicit** | `offset=33` is the default, but callers can use other encodings. |
+| **FASTQ and lightweight records both supported** | `FastqRecord` stores `quality`; `SeqRecordLite` stores quality in `letter_annotations`. |
+| **Filtering returns booleans or records** | `quality_filter` answers pass/fail, while trimming/pipeline functions return new records or `nothing`. |
+| **Adapter trimming supports both ends** | `_adapter_trim_span` can search from `:three_prime` or `:five_prime`. |
+| **Provenance-aware helpers** | Public functions route through `active_provenance_context`. |
+
+---
+
+## 1. Phred Conversion
+
+### `phred_scores`
+
+```julia
+phred_scores(quality::String; offset=33)
+phred_scores(bytes::AbstractVector{UInt8}; offset=33)
+phred_scores(record::FastqRecord; offset=33)
+phred_scores(record::SeqRecordLite; quality_key=:quality, offset=33)
+```
+
+**Description:** Converts ASCII quality characters to integer Phred scores by subtracting `offset`.
+
+**Example:**
+
+```julia
+phred_scores("IIII")  # [40, 40, 40, 40]
+```
+
+### `phred_string`
+
+```julia
+phred_string(scores::AbstractVector{<:Integer}; offset=33)
+```
+
+**Description:** Converts integer Phred scores back into an ASCII quality string.
+
+---
+
+## 2. Quality Summaries
+
+### `mean_quality`
+
+```julia
+mean_quality(scores::AbstractVector{<:Integer}; offset=33)
+mean_quality(quality::String; offset=33)
+mean_quality(record::FastqRecord; offset=33)
+mean_quality(record::SeqRecordLite; quality_key=:quality, offset=33)
+```
+
+**Description:** Computes mean Phred quality. Empty score vectors return `0.0`.
+
+---
+
+## 3. Filtering
+
+### `quality_filter`
+
+```julia
+quality_filter(record; min_mean_quality=..., min_base_quality=..., max_low_quality_fraction=..., offset=33)
+```
+
+**Description:** Returns `true` when a record satisfies mean-quality and low-quality-base thresholds.
+
+**Checks:**
+
+- mean quality must be at least `min_mean_quality`;
+- bases below `min_base_quality` are counted;
+- low-quality fraction must be at most `max_low_quality_fraction`.
+
+---
+
+## 4. Adapter Trimming
+
+### `_adapter_trim_span`
+
+```julia
+_adapter_trim_span(sequence, adapter; min_overlap=8, max_mismatches=1, from_end=:three_prime)
+```
+
+**Kind:** Internal helper
+
+**Description:** Finds a trim span where an adapter overlaps either the three-prime or five-prime end. Mismatch tolerance is controlled by `max_mismatches`.
+
+### `adapter_trim`
+
+```julia
+adapter_trim(record; adapter, min_overlap=8, max_mismatches=1, from_end=:three_prime)
+```
+
+**Description:** Trims adapter sequence from `FastqRecord` or `SeqRecordLite`, preserving quality/letter annotations consistently with the trimmed sequence.
+
+---
+
+## 5. Low-Quality Trimming
+
+### `trim_low_quality`
+
+```julia
+trim_low_quality(record::FastqRecord; window=4, threshold=20, offset=33)
+trim_low_quality(record::SeqRecordLite; quality_key=:quality, window=4, threshold=20, offset=33)
+```
+
+**Description:** Trims records using a sliding quality window. The helper `_trim_window` identifies retained sequence bounds.
+
+---
+
+## 6. Pipeline Helpers
+
+### `process_sequencing_record`
+
+```julia
+process_sequencing_record(record; kwargs...) -> Union{record,Nothing}
+```
+
+**Description:** Applies adapter trimming, low-quality trimming, minimum-length filtering, and quality filtering to one record.
+
+### `sequencing_pipeline`
+
+```julia
+sequencing_pipeline(records; kwargs...) -> Vector
+```
+
+**Description:** Processes a collection of sequencing records and returns records that pass all filters.
+
+---
+
+## Quick Reference
+
+| API | Purpose |
+|---|---|
+| `phred_scores` | Quality string/record to integer scores. |
+| `phred_string` | Integer scores to quality string. |
+| `mean_quality` | Mean Phred quality. |
+| `quality_filter` | Pass/fail quality thresholds. |
+| `adapter_trim` | Trim adapter sequence. |
+| `trim_low_quality` | Sliding-window quality trimming. |
+| `process_sequencing_record` | Process one record. |
+| `sequencing_pipeline` | Process a record collection. |
+
+---
+
+## Complete Usage Example
+
+```julia
+record = FastqRecord(DNASeq("ACGTACGT"), "IIII####"; identifier="read1")
+
+scores = phred_scores(record)
+mean_quality(record)
+
+passes = quality_filter(record;
+    min_mean_quality=20,
+    min_base_quality=10,
+    max_low_quality_fraction=0.5)
+
+trimmed = trim_low_quality(record; window=4, threshold=20)
+processed = process_sequencing_record(record; min_length=4)
+```

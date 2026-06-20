@@ -1,40 +1,88 @@
-# structure.jl
+# `structure.jl` - Macromolecular Structure Utilities
 
-## Purpose
-This file handles protein structure representation and geometry-heavy analysis. It combines atom-level records, chain/model hierarchy, distance calculations, structural superposition, contact analysis, residue properties, and multiple visualization helpers.
+## Overview
 
-## Main types
-- `Atom`, `Residue`, `Chain`, `Model`, and `Structure` model the structural hierarchy.
-- `AtomSelectionPolicy` controls altloc and occupancy selection behavior.
-- `SuperpositionResult` stores a rotation, translation, and RMSD value.
-- `AtomKDTree` and its internal node type support spatial lookup.
-- `DSSPEntry` stores secondary-structure annotations.
-- `HydrogenBond` stores donor/acceptor geometry.
+`structure.jl` provides atom/residue/chain/model/structure containers, PDB/mmCIF parsing and writing, coordinate extraction, Kabsch superposition, RMSD, ensemble statistics, torsion angles, KD-tree radius search, geometry payloads, point clouds, and wrappers for DSSP/PDB2PQR-style tools.
 
-## Public functions
-- Reading and writing: `read_pdb`, `read_mmcif`, `write_pdb`, and `write_mmcif`.
-- Hierarchy and coordinate access: `structure_models`, `structure_chains`, `structure_residues`, `structure_atoms`, `atom_coordinates`, and `coordinate_matrix`.
-- Geometry and superposition: `torsion_angle`, `phi_psi`, `backbone_torsions`, `kabsch`, `rmsd`, `superpose`, and `superpose!`.
-- Spatial search: `build_atom_kdtree` and `atoms_within_radius`.
-- Sequence and residue helpers: `residue_one_letter`, `sequence_from_structure`, `structure_sequences`, `residue_bfactor`, `residue_bfactors`, `flexible_residues`, `residue_property`, `select_residues`, `select_atoms`, and `collapse_altlocs`.
-- Contacts and surface metrics: `residue_contacts`, `contact_map`, `interface_residues`, `residue_free_sasa`, `buried_surface_area`, `interface_profile`, `calculate_interface_residues`, and `residues_within_radius`.
-- Annotation and external tools: `read_dssp`, `annotate_dssp!`, `run_dssp`, and `run_pdb2pqr`.
-- Hydrogen bonds and rotamers: `hydrogen_bonds`, `ramachandran_region`, `ramachandran_profile`, `chi_angles`, `rotamer_label`, `rotamer_state`, and `rotamer_statistics`.
-- Graphs, plots, and summaries: `structure_contact_graph`, `structure_contact_mermaid`, `write_structure_mermaid`, `contact_map_svg`, `write_contact_map_svg`, `plot_contact_graph`, `plot_contact_graph!`, `plot_contact_map`, `plot_contact_map!`, `plot_structure_atoms`, `plot_structure_atoms!`, `plot_backbone_trace`, `plot_backbone_trace!`, `plot_chain_ribbon`, `plot_chain_ribbon!`, `residue_pick_hooks`, `connect_residue_picking!`, `plot_structure_viewer`, `atomic_mass`, `center_of_mass`, `bounding_box`, `radius_of_gyration`, `atom_distance_matrix`, `residue_distance_matrix`, `chain_contact_matrix`, `structure_summary`, `chain_summary`, `superpose_models!`, `ensemble_rmsd_matrix`, and `trajectory_statistics`.
+### Purpose
 
-## Threading notes
-- `atom_distance_matrix` and `residue_distance_matrix` now default to threaded CPU execution and still accept a `threaded` keyword for compatibility.
-- The pairwise matrix fill is shared so the atom-level and residue-level distance helpers use the same symmetric threaded pattern.
+This documentation covers the public API implemented in `structure.jl`, with concrete descriptions for the result types and workflow functions exposed by BioToolkit.
 
-## How it is used
-The standard workflow is to read a structure, inspect its hierarchy, extract sequences or coordinates, and then use the geometry helpers to compare conformations or locate contacts. The plotting and Mermaid helpers make it easier to inspect the result without hand-building visualization code.
+---
 
-`AtomSelectionPolicy` exists to manage alternate locations and occupancy decisions consistently, while `AtomKDTree` supports repeated neighborhood searches over large structures.
+## Design Decisions
 
-## Implementation notes
-- The hierarchy is mutable, which makes it easier to attach annotations and build up parsed structures incrementally.
-- Residues and atoms carry enough metadata to support both sequence-centric and geometry-centric workflows.
-- The file exposes a wide surface area because structural biology often requires both analysis and visualization utilities in the same module.
+| Decision | Rationale |
+|---|---|
+| **Concrete workflow coverage** | Each section maps to a real analysis task implemented by the module. |
+| **Typed results** | Important model outputs and summaries are represented with explicit structs. |
+| **Downstream compatibility** | Results are shaped for plotting, tabulation, or reuse in other BioToolkit modules. |
+| **Source-aligned API names** | Entries use implemented/exported names rather than speculative aliases. |
+| **Readable defaults** | Examples show the minimal flow without hiding required biological inputs. |
 
-## Why it matters
-Structure analysis only works well when the coordinate geometry and the biological hierarchy are both first-class. This file provides that combined representation and the common geometric operations that downstream structural workflows depend on.
+---
+
+## 1. Structure Types and I/O
+
+Structure objects preserve hierarchy from atoms up to models and files.
+
+| API | Description |
+|---|---|
+| `Atom` | Atomic coordinate, element, occupancy/B-factor, charge, and identifiers. |
+| `Residue` | Residue with name, sequence number, insertion code, and atoms. |
+| `Chain` | Chain containing residues. |
+| `Model` | One structural model containing chains. |
+| `Structure` | Full structure with id, models, metadata, and provenance. |
+| `read_pdb` | Parses PDB text or file data. |
+| `write_pdb` | Writes PDB text. |
+| `read_mmcif` | Parses mmCIF text or file data. |
+| `write_mmcif` | Writes mmCIF text. |
+
+## 2. Coordinates and Alignment
+
+Coordinate helpers support superposition, RMSD, and ensemble analysis.
+
+| API | Description |
+|---|---|
+| `structure_atoms` | Returns all atoms from a structure/model/chain. |
+| `atom_coordinates` | Returns `(x, y, z)` for an atom. |
+| `coordinate_matrix` | Builds an `N x 3` coordinate matrix. |
+| `kabsch` | Computes optimal rotation/translation between point sets. |
+| `rmsd` | Computes RMSD with optional superposition. |
+| `superpose` | Returns transformed mobile structure/coordinates. |
+| `superpose!` | Applies superposition in place. |
+| `superpose_models!` | Aligns models in an ensemble to a reference model. |
+| `ensemble_rmsd_matrix` | Computes pairwise model RMSDs. |
+| `trajectory_statistics` | Summarizes per-model RMSD and trajectory-like variation. |
+
+## 3. Geometry and External Tools
+
+Geometry functions derive bonds, torsions, point clouds, and nearby atoms.
+
+| API | Description |
+|---|---|
+| `torsion_angle` | Computes dihedral angle from four points. |
+| `phi_psi` | Computes backbone phi/psi for a residue in a chain. |
+| `backbone_torsions` | Computes backbone torsions for a chain. |
+| `KDTreeNode` | KD-tree node for atom spatial indexing. |
+| `AtomKDTree` | KD-tree wrapper for atom searches. |
+| `build_atom_kdtree` | Builds atom KD-tree. |
+| `atoms_within_radius` | Finds atoms near a point or atom. |
+| `structure_geometry` | Builds plot-ready atom/bond geometry. |
+| `structure_pointcloud` | Builds point-cloud coordinates and annotations. |
+| `run_dssp` | Runs DSSP/mkdssp on a path or temporary PDB from a structure. |
+| `run_pdb2pqr` | Runs PDB2PQR-style conversion. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+structure = read_pdb("model.pdb")
+atoms = structure_atoms(structure)
+coords = coordinate_matrix(atoms)
+nearby = atoms_within_radius(structure, atom_coordinates(first(atoms)); radius=5.0)
+```
+

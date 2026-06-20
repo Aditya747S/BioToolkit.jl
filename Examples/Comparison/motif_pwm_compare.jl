@@ -18,7 +18,7 @@ function build_sequences(count::Integer, motif_length::Integer)
             buffer[9] = bases[mod(index + 1, length(bases)) + 1]
         end
         sequence = String(buffer)
-        push!(records, SeqRecordLite(sequence; identifier="motif$(index)"))
+        push!(records, SeqRecordLite(DNASeq(sequence); identifier="motif$(index)"))
     end
 
     return records

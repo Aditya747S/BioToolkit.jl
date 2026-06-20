@@ -1,48 +1,90 @@
-# gene_prediction.jl
+# `gene_prediction.jl` - Ab Initio Gene Prediction
 
-## Purpose
-This file implements a compact hidden Markov model gene predictor. It is a lightweight ab initio gene-finding utility that scans a nucleotide sequence, classifies bases into coding and non-coding states, and returns the likely gene intervals.
+## Overview
 
-## Main function
-- predict_genes_hmm(sequence; p_coding=0.01): run a two-state HMM over a DNA sequence and return an array of (start_index, end_index) tuples for predicted genes.
+`gene_prediction.jl` implements lightweight gene-structure analysis for DNA sequences: HMM coding-region detection, start/stop codon discovery, Kozak scoring, splice-site detection, coding-potential metrics, GFF3 export, and prediction summaries.
 
-## What the function does
-The function builds a small HMM with two states: non-coding background and coding sequence. It uses a simple nucleotide alphabet, fixed initial probabilities, a transition matrix that favors long coding segments, and emission probabilities that prefer GC-rich coding regions. The sequence is decoded with Viterbi, then contiguous coding runs are extracted as candidate genes.
+### Purpose
 
-## Internal workflow
-1. Encode the DNA sequence as bytes.
-2. Define the HMM states, alphabet, priors, transitions, and emissions.
-3. Run Viterbi to obtain the most likely state path.
-4. Convert stretches of coding-state positions into genomic intervals.
-5. Filter out short, low-confidence segments below the minimum length threshold.
+Use this module when a sequence needs first-pass gene prediction without an external annotation pipeline. It favors inspectable heuristics and simple data structures over opaque model files.
 
-## Output
-The function returns a vector of tuples, each tuple containing the start and end coordinates of a predicted gene. The coordinates are one-based sequence positions, making them easy to feed into downstream annotation, visualization, or export steps.
+---
 
-## How it is used
-This module is most useful when a user has raw sequence and wants a quick, model-based pass before deeper annotation. It can be used to suggest candidate ORFs or to provide rough coding-region boundaries that can later be refined by other tools.
+## Design Decisions
 
-## Why this file matters
-This file demonstrates how BioToolkit uses its generic HMM machinery for a concrete biological task. It is intentionally small, but it gives the package a simple gene-prediction capability that does not require an external pipeline.
-# Gene Prediction API (gene_prediction.jl)
+| Decision | Rationale |
+|---|---|
+| **Domain-specific containers** | Results use explicit structs where the workflow has stable fields or needs provenance metadata. |
+| **Workflow APIs** | Functions expose complete analysis steps, not only internal numeric kernels. |
+| **Table-compatible outputs** | Outputs are designed to work with Julia arrays, dictionaries, named tuples, and DataFrames. |
+| **Pure-Julia core** | External tools are optional wrappers; core summaries remain usable inside Julia. |
+| **Provenance hooks** | Many public functions accept provenance context keywords or return result containers with provenance records. |
 
-The native applied gene parsing module ties directly into our robust CPU Profile HMM `viterbi` framework to solve genomic overlap and naive false-positive constraints common to greedy `find_orfs` heuristic sweeps.
+---
 
-### Predict Genes (HMM Abstract)
-The `predict_genes_hmm(sequence; p_coding=0.01)` constructs a mathematical 2-State (Coding vs NonCoding) boundary model isolating elevated genomic GC content spikes bounded strictly by transitional density probabilities.
+## 1. Core Types
+
+Prediction outputs are represented with interval-level containers that can be exported or attached to annotated records.
+
+| API | Description |
+|---|---|
+| `GeneInterval` | Minimal `(start, stop)` interval returned by the HMM coding-region detector. |
+| `ExonInterval` | Predicted exon span with strand, frame phase, end phase, and score. |
+| `IntronInterval` | Predicted intron span with donor and acceptor splice-site scores. |
+| `SpliceSite` | Detected donor or acceptor motif with position, strand, score, and matched consensus. |
+| `GenePrediction` | Complete gene model with gene id, chromosome, strand, exons, introns, CDS/protein length, score, and source. |
+
+## 2. Signals and Coding Scores
+
+These functions identify sequence signals that feed gene models or quality-control reports.
+
+| API | Description |
+|---|---|
+| `find_start_codons` | Finds ATG start codons on both strands and annotates them with Kozak scores. |
+| `find_stop_codons` | Finds TAA/TAG/TGA stop codons across all reading frames on both strands. |
+| `score_kozak_context` | Scores the nucleotide context around an ATG using a Kozak-style position-weight table. |
+| `detect_splice_sites` | Detects donor and acceptor splice motifs with score filtering. |
+| `calculate_testcode` | Computes Fickett/TestCode-style coding potential in sliding windows. |
+| `codon_bias_index` | Scores codon-bias support against an optional reference codon table. |
+
+## 3. Prediction and Reporting
+
+High-level functions assemble, filter, summarize, and export predictions.
+
+| API | Description |
+|---|---|
+| `predict_genes_hmm` | Uses a two-state noncoding/coding HMM and Viterbi decoding to return `GeneInterval`s. |
+| `predict_gene_structure` | Combines ORF, splice-site, and coding-potential evidence into `GenePrediction`s. |
+| `predict_utr_regions` | Adds approximate UTR regions around predicted coding models. |
+| `gene_density` | Computes gene density over a total sequence/genome length. |
+| `gff3_export` | Exports predictions in GFF3-style feature text. |
+| `cds_statistics` | Summarizes CDS and protein lengths across predictions. |
+| `filter_gene_predictions` | Filters predictions by score, length, exon count, and related criteria. |
+| `gene_prediction_summary` | Builds a compact aggregate summary of prediction counts and lengths. |
+| `annotate_orf_features` | Adds predicted ORF/gene features to annotated sequence records. |
+
+---
+
+## Quick Reference
+
+| Area | Main APIs |
+|---|---|
+| Core Types | `GeneInterval`, `ExonInterval`, `IntronInterval`, `SpliceSite`, `GenePrediction` |
+| Signals and Coding Scores | `find_start_codons`, `find_stop_codons`, `score_kozak_context`, `detect_splice_sites`, `calculate_testcode`, `codon_bias_index` |
+| Prediction and Reporting | `predict_genes_hmm`, `predict_gene_structure`, `predict_utr_regions`, `gene_density`, `gff3_export`, `cds_statistics`, ... |
+
+---
+
+## Complete Usage Example
 
 ```julia
 using BioToolkit
 
-# Pass raw raw sequence fragments (it inherently blocks meaningless chunks ≤ 30bp)
-genes = predict_genes_hmm("ATATAAATTTTAAATATATATAAGCGCGCGCGCGCGCGCGCGCGCGCATA")
-
-# Emits tuple boundaries [start, stop] representing Exon blocks
-println(genes) # e.g. [(24, 47)]
+seq = DNASeq("ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG")
+starts = find_start_codons(seq)
+stops = find_stop_codons(seq)
+splice = detect_splice_sites(seq)
+intervals = predict_genes_hmm(seq)
+summary = gene_density(intervals, length(seq); window_bp=1000)
 ```
 
-### Profile Structural Architecture
-Internally, the pipeline allocates a localized statistical machine avoiding hardcoded substring targets.
-- **State 1 (NonCoding)**: GC distribution flat (background), representing noise.
-- **State 2 (Coding)**: GC distribution artificially elevated mathematically (simulating generalized Exon bounds).
-- **Viterbi Trace**: It executes a full Log-Space trace and isolates State 2 continuity. The predictive nature mathematically overrides internal random noise (introns/defects) due to the Log-Sum sequence dependence.

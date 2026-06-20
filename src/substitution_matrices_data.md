@@ -1,16 +1,41 @@
-# substitution_matrices_data.jl
+# `substitution_matrices_data.jl` - Amino-Acid Substitution Matrix Data
 
-## Purpose
-This file is a data-only source of substitution matrices. It stores the raw text for many common amino-acid and nucleotide scoring tables so the alignment code can parse and reuse them without hard-coding large matrix literals into algorithmic modules.
+## Overview
 
-## What it contains
-- Named amino-acid matrices such as BENNER, BLOSUM, and PAM-style tables.
-- Nucleotide matrices such as BLASTN.
-- Protein-specific tables such as BLASTP and related scoring variants.
-- Extended alphabet tables for ambiguous residues and stop symbols.
+`substitution_matrices_data.jl` stores static amino-acid substitution matrices used by alignment, protein comparison, and phylogenetic distance routines. It intentionally contains data definitions rather than public analysis functions.
 
-## How it is used
-Alignment code reads these raw string constants and turns them into numeric scoring matrices when a caller asks for a named substitution scheme. That keeps the data centralized, avoids duplication, and makes it easier to add or audit matrix definitions later.
+### Purpose
 
-## Why it matters
-Substitution matrices are core inputs for pairwise and local alignment. Keeping them in a dedicated data file separates reference data from scoring algorithms and makes the package easier to maintain.
+Keeping the matrices in a separate source file avoids mixing large lookup tables into algorithm modules. Alignment and protein utilities can include or import the data without duplicating matrix constants.
+
+---
+
+## Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| **Data-only module file** | The file is a lookup-table source, not a workflow API. |
+| **Centralized matrices** | Shared substitution scores live in one place for consistency. |
+| **Algorithm-neutral storage** | Alignment, search, and phylogeny code can choose how to consume the tables. |
+| **Stable amino-acid ordering** | Matrices rely on predictable residue ordering for fast score lookup. |
+
+---
+
+## 1. Matrix Data
+
+| Data | Description |
+|---|---|
+| Substitution matrix constants | Amino-acid pair scoring tables used by alignment and protein distance functions. |
+| Residue ordering metadata | Ordering information used to map residues to matrix rows/columns. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+# Users normally access substitution scores through alignment/search APIs,
+# rather than reading this data file directly.
+```
+

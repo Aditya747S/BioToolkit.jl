@@ -1,3 +1,15 @@
+# ==============================================================================
+# clinical.jl — Clinical genomics and survival analysis
+#
+# Provides Kaplan-Meier estimation, Cox proportional hazards modeling,
+# log-rank testing, MAF file parsing, TCGA data access, survival ROC,
+# competing risks, and oncoprint visualization.
+#
+# References:
+#   - Kaplan & Meier (1958) JASA 53(282):457-481 (KM estimator)
+#   - Cox (1972) JRSS B 34(2):187-220 (proportional hazards)
+# ==============================================================================
+
 module Clinical
 
 using SparseArrays
@@ -11,11 +23,14 @@ using Downloads
 using Printf
 using Plots
 
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_container_provenance!, register_provenance!
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 
 export PatientCohort, KaplanMeierResult, CoxResult, CoxTermResult, MAFRecord, MAFSummary
 export read_maf, summarize_maf, tcga_query, tcga_download_files, merge_tcga_count_files, tcga_ingest, kaplan_meier, logrank_test, cox_ph
 export forest_plot, survival_roc, cif_curve, neural_cox, dose_response_curve, oncoprint
+export pharmacogenomics_star_alleles, omop_visit_summary, synthpop_like_cohort, trial_suitability_scores
+export cpic_metabolizer_phenotype, pharmgkb_like_recommendations, propensity_score_match
 
 """
     PatientCohort
@@ -27,7 +42,7 @@ struct PatientCohort
     genomics::Union{CountMatrix,SparseMatrixCSC{Int,Int},Matrix{Float32}}
     patient_ids::Vector{String}
 
-    function PatientCohort(clinical::DataFrame, genomics::Union{CountMatrix,SparseMatrixCSC{Int,Int},Matrix{Float32}}, patient_ids::AbstractVector{<:AbstractString})
+    function PatientCohort(clinical::DataFrame, genomics::Union{CountMatrix,SparseMatrixCSC{Int,Int},Matrix{Float32}}, patient_ids::AbstractVector{<:String})
         ids = String.(patient_ids)
         :patient_id in Symbol.(names(clinical)) || throw(ArgumentError("clinical DataFrame must contain a patient_id column"))
         clinical_ids = String.(clinical.patient_id)
@@ -46,7 +61,7 @@ end
 
 Kaplan-Meier survival curve summary with event and censoring counts.
 """
-struct KaplanMeierResult
+struct KaplanMeierResult <: AbstractAnalysisResult
     time::Vector{Float64}
     survival::Vector{Float64}
     at_risk::Vector{Int}
@@ -54,14 +69,18 @@ struct KaplanMeierResult
     censored::Vector{Int}
     censor_times::Vector{Float64}
     censor_survival::Vector{Float64}
+    provenance::ResultProvenance
 end
+
+KaplanMeierResult(time, survival, at_risk, events, censored, censor_times, censor_survival) =
+    KaplanMeierResult(time, survival, at_risk, events, censored, censor_times, censor_survival, provenance_record("KaplanMeierResult", "clinical"))
 
 """
     CoxTermResult
 
 Single coefficient summary from a Cox proportional hazards model.
 """
-struct CoxTermResult
+struct CoxTermResult <: AbstractAnalysisResult
     term::String
     beta::Float64
     hazard_ratio::Float64
@@ -70,21 +89,29 @@ struct CoxTermResult
     pvalue::Float64
     ci_lower::Float64
     ci_upper::Float64
+    provenance::ResultProvenance
 end
+
+CoxTermResult(term, beta, hazard_ratio, se, z_score, pvalue, ci_lower, ci_upper) =
+    CoxTermResult(term, beta, hazard_ratio, se, z_score, pvalue, ci_lower, ci_upper, provenance_record("CoxTermResult", "clinical"))
 
 """
     CoxResult
 
 Cox proportional hazards fit result with baseline hazard and convergence state.
 """
-struct CoxResult
+struct CoxResult <: AbstractAnalysisResult
     terms::Vector{CoxTermResult}
     baseline_times::Vector{Float64}
     baseline_hazard::Vector{Float64}
     loglik::Float64
     iterations::Int
     converged::Bool
+    provenance::ResultProvenance
 end
+
+CoxResult(terms, baseline_times, baseline_hazard, loglik, iterations, converged) =
+    CoxResult(terms, baseline_times, baseline_hazard, loglik, iterations, converged, provenance_record("CoxResult", "clinical"))
 
 """
     MAFRecord
@@ -115,28 +142,40 @@ struct MAFSummary
     variant_classes::Dict{String,Int}
 end
 
-struct ROCResult
+struct ROCResult <: AbstractAnalysisResult
     time::Float64
     thresholds::Vector{Float64}
     tpr::Vector{Float64}
     fpr::Vector{Float64}
     auc::Float64
+    provenance::ResultProvenance
 end
 
-struct CIFResult
+ROCResult(time, thresholds, tpr, fpr, auc) =
+    ROCResult(time, thresholds, tpr, fpr, auc, provenance_record("ROCResult", "clinical"))
+
+struct CIFResult <: AbstractAnalysisResult
     time::Vector{Float64}
     cumulative_incidence::Dict{Int,Vector{Float64}}
     censoring::Vector{Float64}
+    provenance::ResultProvenance
 end
 
-struct NeuralCoxResult
+CIFResult(time, cumulative_incidence, censoring) =
+    CIFResult(time, cumulative_incidence, censoring, provenance_record("CIFResult", "clinical"))
+
+struct NeuralCoxResult <: AbstractAnalysisResult
     weights::Vector{Matrix{Float64}}
     biases::Vector{Vector{Float64}}
     risk_scores::Vector{Float64}
     loglik::Float64
+    provenance::ResultProvenance
 end
 
-struct DoseResponseResult
+NeuralCoxResult(weights, biases, risk_scores, loglik) =
+    NeuralCoxResult(weights, biases, risk_scores, loglik, provenance_record("NeuralCoxResult", "clinical"))
+
+struct DoseResponseResult <: AbstractAnalysisResult
     concentrations::Vector{Float64}
     responses::Vector{Float64}
     emax::Float64
@@ -144,20 +183,28 @@ struct DoseResponseResult
     hill::Float64
     fitted::Vector{Float64}
     ic50::Float64
+    provenance::ResultProvenance
 end
 
-struct OncoprintResult
+DoseResponseResult(concentrations, responses, emax, ec50, hill, fitted, ic50) =
+    DoseResponseResult(concentrations, responses, emax, ec50, hill, fitted, ic50, provenance_record("DoseResponseResult", "clinical"))
+
+struct OncoprintResult <: AbstractAnalysisResult
     genes::Vector{String}
     samples::Vector{String}
     matrix::Matrix{Int}
     mutation_labels::Matrix{String}
+    provenance::ResultProvenance
 end
+
+OncoprintResult(genes, samples, matrix, mutation_labels) =
+    OncoprintResult(genes, samples, matrix, mutation_labels, provenance_record("OncoprintResult", "clinical"))
 
 function _clamp_probability(value::Real)
     return clamp(isfinite(Float64(value)) ? Float64(value) : 1.0, eps(Float64), 1.0)
 end
 
-function _clinical_index(cohort::PatientCohort, patient_id::AbstractString)
+function _clinical_index(cohort::PatientCohort, patient_id::String)
     index = findfirst(==(String(patient_id)), cohort.patient_ids)
     index === nothing && throw(KeyError(String(patient_id)))
     return index
@@ -196,7 +243,7 @@ function _cohort_view(cohort::PatientCohort, columns::Vector{Int})
     return PatientCohort(clinical, genomics, ids)
 end
 
-function Base.getindex(cohort::PatientCohort, patient_id::AbstractString)
+function Base.getindex(cohort::PatientCohort, patient_id::String)
     index = _clinical_index(cohort, patient_id)
     clinical_row = cohort.clinical[index, :]
     genomics_column = cohort.genomics isa CountMatrix ? cohort.genomics.counts[:, index] : cohort.genomics[:, index]
@@ -263,7 +310,7 @@ end
 
 Compute a Kaplan-Meier survival estimate from event times and censoring status.
 """
-function kaplan_meier(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer})
+function kaplan_meier(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     sorted_time, sorted_status = _sorted_event_data(time, status)
     unique_times = sort(unique(sorted_time[sorted_status .> 0]))
     survival = Float64[]
@@ -289,7 +336,8 @@ function kaplan_meier(time::AbstractVector{<:Real}, status::AbstractVector{<:Int
         end
     end
 
-    return KaplanMeierResult(unique_times, survival, at_risk, events, censored, censor_times, censor_survival)
+    result = KaplanMeierResult(unique_times, survival, at_risk, events, censored, censor_times, censor_survival)
+    return provenance_result!(_ctx, result, "kaplan_meier"; parents=provenance_parent_ids(time, status), parameters=(n=length(time), event_times=length(unique_times)))
 end
 
 """
@@ -297,14 +345,16 @@ end
 
 Plot a Kaplan-Meier survival curve.
 """
-function kaplan_meier_plot(result::KaplanMeierResult; title::AbstractString="Kaplan-Meier", xlabel::AbstractString="Time", ylabel::AbstractString="Survival probability", show_censors::Bool=true, kwargs...)
+function kaplan_meier_plot(result::KaplanMeierResult; title::String="Kaplan-Meier", xlabel::String="Time", ylabel::String="Survival probability", show_censors::Bool=true, kwargs...)
+    _ctx = active_provenance_context()
+
     x, y = _km_plot_data(result)
     plt = plot(x, y; seriestype=:steppost, linewidth=2.5, color=:black, title=title, xlabel=xlabel, ylabel=ylabel, ylim=(0, 1.05), legend=false, kwargs...)
     if show_censors && !isempty(result.censor_times)
         censor_y = [_km_survival_at(result, t) for t in result.censor_times]
         scatter!(plt, result.censor_times, censor_y; markershape=_KM_CENSOR_MARKER, markercolor=:black, markersize=6, label=nothing)
     end
-    return plt
+    return provenance_result!(_ctx, plt, "kaplan_meier_plot"; parents=provenance_parent_ids(result), parameters=(title=title, show_censors=show_censors))
 end
 
 function _logrank_components(time::Vector{Float64}, status::Vector{Int}, groups::Vector{Int})
@@ -334,7 +384,7 @@ end
 
 Compare two survival groups with a log-rank test.
 """
-function logrank_test(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}, groups::AbstractVector)
+function logrank_test(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}, groups::AbstractVector; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     sorted_time, sorted_status = _sorted_event_data(time, status)
     length(groups) == length(time) || throw(ArgumentError("groups must match time and status"))
     levels = _validated_group_levels(groups)
@@ -344,10 +394,11 @@ function logrank_test(time::AbstractVector{<:Real}, status::AbstractVector{<:Int
     observed, expected, variance = _logrank_components(sorted_time, sorted_status, reordered_groups)
     statistic = variance > 0 ? (observed - expected)^2 / variance : 0.0
     pvalue = ccdf(Chisq(1), statistic)
-    return (statistic=statistic, pvalue=pvalue, observed=observed, expected=expected, variance=variance)
+    result = (statistic=statistic, pvalue=pvalue, observed=observed, expected=expected, variance=variance)
+    return provenance_result!(_ctx, result, "logrank_test"; parents=provenance_parent_ids(time, status, groups), parameters=(n=length(time), group_count=length(levels), pvalue=pvalue))
 end
 
-function _encode_covariate(values::AbstractVector, term_name::AbstractString)
+function _encode_covariate(values::AbstractVector, term_name::String)
     any(ismissing, values) && throw(ArgumentError("covariate $(term_name) contains missing values"))
     if all(v -> v isa Real || v isa Bool, values)
         return reshape(Float64.(values), :, 1), [String(term_name)]
@@ -367,7 +418,7 @@ function _encode_covariate(values::AbstractVector, term_name::AbstractString)
 end
 
 function _cox_design_matrix(cohort::PatientCohort, covariates)
-    if covariates isa AbstractVector{<:AbstractString}
+    if covariates isa AbstractVector{<:String}
         design = ones(Float64, nrow(cohort.clinical), 1)
         names = String[]
         for covariate in covariates
@@ -449,6 +500,8 @@ end
 Fit a Cox proportional hazards model from a formula and cohort.
 """
 function cox_ph(formula, cohort::PatientCohort; max_iter::Int=50, tol::Real=1e-7)
+    _ctx = active_provenance_context()
+
     time_name, status_name, covariate_names = _parse_surv_formula(formula)
     X, term_names = _cox_design_matrix(cohort, covariate_names)
     time = Float64.(cohort.clinical[!, time_name])
@@ -503,7 +556,8 @@ function cox_ph(formula, cohort::PatientCohort; max_iter::Int=50, tol::Real=1e-7
         push!(baseline_hazard, cumulative)
     end
 
-    return CoxResult(terms, base_times, baseline_hazard, loglik, iterations, converged)
+    result = CoxResult(terms, base_times, baseline_hazard, loglik, iterations, converged)
+    return provenance_result!(_ctx, result, "cox_ph"; parents=provenance_parent_ids(cohort), parameters=(max_iter=max_iter, tol=Float64(tol), term_count=length(terms), iterations=iterations, converged=converged))
 end
 
 """
@@ -512,8 +566,12 @@ end
 Plot coefficient estimates and confidence intervals from a Cox model fit.
 """
 function forest_plot(cox_result::CoxResult)
+    _ctx = active_provenance_context()
     n = length(cox_result.terms)
-    n == 0 && return plot(title="Cox forest plot", legend=false)
+    if n == 0
+        plt = plot(title="Cox forest plot", legend=false)
+        return provenance_result!(_ctx, plt, "forest_plot"; parents=provenance_parent_ids(cox_result), parameters=(term_count=0))
+    end
     terms = reverse(cox_result.terms)
     labels = [term.term for term in terms]
     hazard_ratios = [term.hazard_ratio for term in terms]
@@ -530,7 +588,8 @@ function forest_plot(cox_result::CoxResult)
         annotate!(p2, 0.68, row, Plots.text(@sprintf("95%% CI %.2f-%.2f", term.ci_lower, term.ci_upper), 8, :black, :left))
         annotate!(p2, 0.98, row, Plots.text(@sprintf("p=%.3g", term.pvalue), 8, :black, :right))
     end
-    return plot(p1, p2; layout=(1, 2), size=(1100, 420))
+    plt = plot(p1, p2; layout=(1, 2), size=(1100, 420))
+    return provenance_result!(_ctx, plt, "forest_plot"; parents=provenance_parent_ids(cox_result), parameters=(term_count=n))
 end
 
 """
@@ -539,6 +598,8 @@ end
 Compute a time-dependent ROC curve for survival prediction.
 """
 function survival_roc(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}, marker::AbstractVector{<:Real}, predict_time::Real)
+    _ctx = active_provenance_context()
+
     length(time) == length(status) == length(marker) || throw(ArgumentError("time, status, and marker must have the same length"))
     timef = Float64.(time)
     statusi = Int.(status)
@@ -563,7 +624,8 @@ function survival_roc(time::AbstractVector{<:Real}, status::AbstractVector{<:Int
     fpr_curve = vcat(0.0, fpr[order], 1.0)
     tpr_curve = vcat(0.0, tpr[order], 1.0)
     auc = sum((fpr_curve[2:end] .- fpr_curve[1:end-1]) .* (tpr_curve[2:end] .+ tpr_curve[1:end-1]) ./ 2)
-    return ROCResult(Float64(predict_time), thresholds, tpr, fpr, auc)
+    result = ROCResult(Float64(predict_time), thresholds, tpr, fpr, auc)
+    return provenance_result!(_ctx, result, "survival_roc"; parents=provenance_parent_ids(time, status, marker), parameters=(n=length(time), predict_time=Float64(predict_time), auc=auc))
 end
 
 """
@@ -572,6 +634,8 @@ end
 Compute cumulative incidence curves for competing risks data.
 """
 function cif_curve(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}, cause::AbstractVector{<:Integer})
+    _ctx = active_provenance_context()
+
     length(time) == length(status) == length(cause) || throw(ArgumentError("time, status, and cause must have the same length"))
     timef = Float64.(time)
     statusi = Int.(status)
@@ -595,15 +659,17 @@ function cif_curve(time::AbstractVector{<:Real}, status::AbstractVector{<:Intege
         survival *= max(1 - total_events / n, 0.0)
         push!(censoring, survival)
     end
-    return CIFResult(event_times, cumulative, censoring)
+    result = CIFResult(event_times, cumulative, censoring)
+    return provenance_result!(_ctx, result, "cif_curve"; parents=provenance_parent_ids(time, status, cause), parameters=(n=length(time), cause_count=length(causes), event_times=length(event_times)))
 end
 
 """
-    read_maf(path::AbstractString)
+    read_maf(path::String)
 
 Read a MAF file into a vector of mutation records.
 """
-function read_maf(path::AbstractString)
+function read_maf(path::String)
+    _ctx = active_provenance_context()
     open(path, "r") do io
         header = String[]
         fieldmap = Dict{String,Int}()
@@ -630,10 +696,9 @@ function read_maf(path::AbstractString)
                 parse(Int, fields[fieldmap["Start_Position"]]),
                 parse(Int, fields[fieldmap["End_Position"]]),
                 fields[fieldmap["Reference_Allele"]],
-                fields[fieldmap["Tumor_Seq_Allele2"]],
-            ))
+                fields[fieldmap["Tumor_Seq_Allele2"]]))
         end
-        return records
+        return provenance_result!(_ctx, records, "read_maf"; parents=String[], parameters=(path=path, record_count=length(records)))
     end
 end
 
@@ -643,6 +708,8 @@ end
 Summarize mutation counts per sample, gene, and variant class.
 """
 function summarize_maf(maf::AbstractVector{<:MAFRecord})
+    _ctx = active_provenance_context()
+
     per_sample = Dict{String,Int}()
     per_gene = Dict{String,Int}()
     variant_classes = Dict{String,Int}()
@@ -651,7 +718,8 @@ function summarize_maf(maf::AbstractVector{<:MAFRecord})
         per_gene[record.gene] = get(per_gene, record.gene, 0) + 1
         variant_classes[record.variant_classification] = get(variant_classes, record.variant_classification, 0) + 1
     end
-    return MAFSummary(length(maf), per_sample, per_gene, variant_classes)
+    result = MAFSummary(length(maf), per_sample, per_gene, variant_classes)
+    return provenance_result!(_ctx, result, "summarize_maf"; parents=provenance_parent_ids(maf), parameters=(mutation_count=length(maf), sample_count=length(per_sample), gene_count=length(per_gene)))
 end
 
 function _maf_to_matrix(maf::AbstractVector{<:MAFRecord})
@@ -676,8 +744,10 @@ end
 Convert MAF records into an oncoprint matrix representation.
 """
 function oncoprint(maf::AbstractVector{<:MAFRecord})
+    _ctx = active_provenance_context()
     genes, samples, matrix, labels = _maf_to_matrix(maf)
-    return OncoprintResult(genes, samples, matrix, labels)
+    result = OncoprintResult(genes, samples, matrix, labels)
+    return provenance_result!(_ctx, result, "oncoprint"; parents=provenance_parent_ids(maf), parameters=(gene_count=length(genes), sample_count=length(samples), mutation_count=length(maf)))
 end
 
 function _mutation_level(labels::String)
@@ -686,7 +756,7 @@ function _mutation_level(labels::String)
     return first_label == "Missense_Mutation" ? 1 : first_label == "Nonsense_Mutation" ? 2 : first_label == "Frame_Shift_Del" ? 3 : first_label == "Frame_Shift_Ins" ? 4 : first_label == "Splice_Site" ? 5 : 6
 end
 
-function _oncoprint_plot(result::OncoprintResult; title::AbstractString="Oncoprint", kwargs...)
+function _oncoprint_plot(result::OncoprintResult; title::String="Oncoprint", kwargs...)
     if isempty(result.genes) || isempty(result.samples)
         return plot(title=title, legend=false)
     end
@@ -708,8 +778,10 @@ end
 
 Plot an oncoprint from a prepared result object.
 """
-function oncoprint_plot(result::OncoprintResult; kwargs...)
-    return _oncoprint_plot(result; kwargs...)
+function oncoprint_plot(result::OncoprintResult, kwargs...)
+    _ctx = active_provenance_context()
+    plt = _oncoprint_plot(result; kwargs...)
+    return provenance_result!(_ctx, plt, "oncoprint_plot"; parents=provenance_parent_ids(result), parameters=(gene_count=length(result.genes), sample_count=length(result.samples)))
 end
 
 """
@@ -717,7 +789,8 @@ end
 
 Query the GDC/TCGA API for matching files.
 """
-function tcga_query(; project::AbstractString, data_type::AbstractString, base_url::AbstractString="https://api.gdc.cancer.gov", limit::Int=50)
+function tcga_query(; project::String, data_type::String, base_url::String="https://api.gdc.cancer.gov", limit::Int=50)
+    _ctx = active_provenance_context()
     filters = Dict("op" => "and", "content" => [Dict("op" => "in", "content" => Dict("field" => "cases.project.project_id", "value" => [project])), Dict("op" => "in", "content" => Dict("field" => "data_type", "value" => [data_type]))])
     endpoint = string(base_url, "/files")
     payload = Dict("filters" => filters, "format" => "JSON", "size" => limit)
@@ -730,21 +803,23 @@ function tcga_query(; project::AbstractString, data_type::AbstractString, base_u
         parsed = JSON.parse(read(response_path, String))
         results = get(parsed, "data", Dict())
         hits = get(results, "hits", Any[])
-        return (project=project, data_type=data_type, hits=hits)
+        result = (project=project, data_type=data_type, hits=hits)
+        return provenance_result!(_ctx, result, "tcga_query"; parents=String[], parameters=(project=project, data_type=data_type, base_url=base_url, limit=limit, hit_count=length(hits)))
     catch err
-        return (project=project, data_type=data_type, hits=Any[], error=string(err))
+        result = (project=project, data_type=data_type, hits=Any[], error=string(err))
+        return provenance_result!(_ctx, result, "tcga_query"; parents=String[], parameters=(project=project, data_type=data_type, base_url=base_url, limit=limit, hit_count=0, error=string(err)))
     finally
         isfile(response_path) && rm(response_path; force=true)
     end
 end
 
-function _tcga_hit_string(hit::AbstractDict, key::AbstractString, fallback::AbstractString="")
+function _tcga_hit_string(hit::AbstractDict, key::String, fallback::String="")
     value = get(hit, key, nothing)
     value === nothing && return fallback
     return String(value)
 end
 
-function _tcga_case_field(hit::AbstractDict, field::AbstractString, fallback::AbstractString="")
+function _tcga_case_field(hit::AbstractDict, field::String, fallback::String="")
     cases = get(hit, "cases", Any[])
     isempty(cases) && return fallback
     first_case = first(cases)
@@ -773,11 +848,11 @@ function _tcga_file_name(hit::AbstractDict)
 end
 
 """
-    tcga_download_files(hits; base_url="https://api.gdc.cancer.gov", download_dir=tempdir())
+    tcga_download_files(hits; base_url="https://api.gdc.cancer.gov", download_dir=tempdir(), fetcher=Downloads.download, _ctx=nothing)
 
 Download TCGA/GDC files for a set of query hits.
 """
-function tcga_download_files(hits::AbstractVector; base_url::AbstractString="https://api.gdc.cancer.gov", download_dir::AbstractString=tempdir())
+function tcga_download_files(hits::AbstractVector; base_url::String="https://api.gdc.cancer.gov", download_dir::String=tempdir(), fetcher=Downloads.download, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     mkpath(download_dir)
     file_paths = String[]
     sample_ids = String[]
@@ -789,14 +864,15 @@ function tcga_download_files(hits::AbstractVector; base_url::AbstractString="htt
         file_name = _tcga_file_name(hit)
         output_name = isempty(sample_id) ? file_name : string(sample_id, "_", file_name)
         output_path = joinpath(download_dir, output_name)
-        Downloads.download(string(base_url, "/data/", file_id), output_path)
+        fetcher(string(base_url, "/data/", file_id), output_path)
         push!(file_paths, output_path)
         push!(sample_ids, sample_id)
     end
+    _ctx === nothing || register_provenance!(_ctx, "tcga_download_files"; parameters=(base_url=String(base_url), download_dir=String(download_dir), file_count=length(file_paths), sample_ids=sample_ids))
     return (file_paths=file_paths, sample_ids=sample_ids)
 end
 
-function _parse_tcga_count_file(path::AbstractString; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+function _parse_tcga_count_file(path::String; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
     genes = String[]
     counts = Int[]
     open(path, "r") do io
@@ -830,7 +906,9 @@ end
 
 Merge multiple TCGA count files into a sparse count matrix.
 """
-function merge_tcga_count_files(file_paths::AbstractVector{<:AbstractString}, sample_ids::AbstractVector{<:AbstractString}; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+function merge_tcga_count_files(file_paths::AbstractVector{<:String}, sample_ids::AbstractVector{<:String}; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+    _ctx = active_provenance_context()
+
     length(file_paths) == length(sample_ids) || throw(ArgumentError("file_paths and sample_ids must have the same length"))
     gene_order = String[]
     gene_index = Dict{String,Int}()
@@ -854,7 +932,8 @@ function merge_tcga_count_files(file_paths::AbstractVector{<:AbstractString}, sa
         end
     end
 
-    return CountMatrix(sparse(matrix), gene_order, String.(sample_ids))
+    result = CountMatrix(sparse(matrix), gene_order, String.(sample_ids))
+    return provenance_result!(_ctx, result, "merge_tcga_count_files"; parents=provenance_parent_ids(file_paths), parameters=(file_count=length(file_paths), sample_count=length(sample_ids), gene_count=length(gene_order), has_header=has_header, gene_column=gene_column, count_column=count_column))
 end
 
 """
@@ -862,21 +941,26 @@ end
 
 Ingest TCGA count files directly from local paths.
 """
-function tcga_ingest(file_paths::AbstractVector{<:AbstractString}, sample_ids::AbstractVector{<:AbstractString}; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
-    return merge_tcga_count_files(file_paths, sample_ids; has_header=has_header, gene_column=gene_column, count_column=count_column)
+function tcga_ingest(file_paths::AbstractVector{<:String}, sample_ids::AbstractVector{<:String}; has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+    _ctx = active_provenance_context()
+    matrix = merge_tcga_count_files(file_paths, sample_ids; has_header=has_header, gene_column=gene_column, count_column=count_column)
+    return provenance_result!(_ctx, matrix, "tcga_ingest"; parents=provenance_parent_ids(file_paths), parameters=(file_count=length(file_paths), sample_count=length(sample_ids), has_header=has_header, gene_column=gene_column, count_column=count_column))
 end
 
 """
-    tcga_ingest(; project, data_type, base_url="https://api.gdc.cancer.gov", limit=50, download_dir=tempdir(), has_header=true, gene_column=1, count_column=2)
+    tcga_ingest(; project, data_type, base_url="https://api.gdc.cancer.gov", limit=50, download_dir=tempdir(), has_header=true, gene_column=1, count_column=2, _ctx=nothing)
 
 Query, download, and merge TCGA count files in one step.
 """
-function tcga_ingest(; project::AbstractString, data_type::AbstractString, base_url::AbstractString="https://api.gdc.cancer.gov", limit::Int=50, download_dir::AbstractString=tempdir(), has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+function tcga_ingest(; project::String, data_type::String, base_url::String="https://api.gdc.cancer.gov", limit::Int=50, download_dir::String=tempdir(), has_header::Bool=true, gene_column::Int=1, count_column::Int=2)
+    _ctx = active_provenance_context()
     query = tcga_query(project=project, data_type=data_type, base_url=base_url, limit=limit)
     isempty(query.hits) && throw(ArgumentError("TCGA query returned no hits for project=$(project), data_type=$(data_type)"))
     downloads = tcga_download_files(query.hits; base_url=base_url, download_dir=download_dir)
     isempty(downloads.file_paths) && throw(ArgumentError("TCGA query returned downloadable hits, but no files were downloaded"))
-    return merge_tcga_count_files(downloads.file_paths, downloads.sample_ids; has_header=has_header, gene_column=gene_column, count_column=count_column)
+    matrix = merge_tcga_count_files(downloads.file_paths, downloads.sample_ids; has_header=has_header, gene_column=gene_column, count_column=count_column)
+    _ctx === nothing || register_container_provenance!(_ctx, matrix, "tcga_ingest"; parameters=(project=project, data_type=data_type, base_url=base_url, file_count=length(downloads.file_paths), sample_count=length(downloads.sample_ids)))
+    return matrix
 end
 
 function _gradient_step!(weights::Vector{Matrix{Float64}}, biases::Vector{Vector{Float64}}, activations, deltas, learning_rate::Float64)
@@ -912,6 +996,8 @@ end
 Fit a small neural-network Cox model for survival prediction.
 """
 function neural_cox(X::AbstractMatrix{<:Real}, time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}; hidden_units::Int=8, learning_rate::Real=0.01, epochs::Int=200, seed::Int=42)
+    _ctx = active_provenance_context()
+
     Xf = Matrix{Float64}(X)
     timef = Float64.(time)
     statusi = Int.(status)
@@ -950,7 +1036,8 @@ function neural_cox(X::AbstractMatrix{<:Real}, time::AbstractVector{<:Real}, sta
 
     final_activations = _forward_pass(Xf, best_weights, best_biases)
     risk_scores = vec(final_activations[end])
-    return NeuralCoxResult(best_weights, best_biases, risk_scores, best_loglik)
+    result = NeuralCoxResult(best_weights, best_biases, risk_scores, best_loglik)
+    return provenance_result!(_ctx, result, "neural_cox"; parents=provenance_parent_ids(X, time, status), parameters=(hidden_units=hidden_units, learning_rate=Float64(learning_rate), epochs=epochs, seed=seed, loglik=best_loglik))
 end
 
 """
@@ -958,7 +1045,8 @@ end
 
 Fit a Hill-style dose-response curve from concentration/response measurements.
 """
-function dose_response_curve(drug::AbstractString, cell_lines::AbstractVector{<:AbstractString}, concentrations::AbstractVector{<:Real}, responses::AbstractVector{<:Real})
+function dose_response_curve(drug::String, cell_lines::AbstractVector{<:String}, concentrations::AbstractVector{<:Real}, responses::AbstractVector{<:Real})
+    _ctx = active_provenance_context()
     length(concentrations) == length(responses) || throw(ArgumentError("concentrations and responses must have the same length"))
     length(cell_lines) == length(concentrations) || throw(ArgumentError("cell_lines must match concentrations and responses"))
     x = Float64.(concentrations)
@@ -967,7 +1055,8 @@ function dose_response_curve(drug::AbstractString, cell_lines::AbstractVector{<:
     any(x .<= 0) && throw(ArgumentError("concentrations must be positive"))
     if all(y .== first(y))
         fitted = fill(first(y), length(y))
-        return DoseResponseResult(x, y, first(y), median(x), 1.0, fitted, median(x))
+        result = DoseResponseResult(x, y, first(y), median(x), 1.0, fitted, median(x))
+        return provenance_result!(_ctx, result, "dose_response_curve"; parents=provenance_parent_ids(cell_lines, concentrations, responses), parameters=(drug=drug, n=length(x), flat=true))
     end
     emin = minimum(y)
     emax = maximum(y)
@@ -990,7 +1079,252 @@ function dose_response_curve(drug::AbstractString, cell_lines::AbstractVector{<:
             end
         end
     end
-    return DoseResponseResult(x, y, emax, best_ec50, best_hill, best_fitted, best_ec50)
+    result = DoseResponseResult(x, y, emax, best_ec50, best_hill, best_fitted, best_ec50)
+    return provenance_result!(_ctx, result, "dose_response_curve"; parents=provenance_parent_ids(cell_lines, concentrations, responses), parameters=(drug=drug, n=length(x), ec50=best_ec50, hill=best_hill))
+end
+
+"""
+    pharmacogenomics_star_alleles(variant_calls)
+
+Map PGx variants to a compact star-allele assignment table.
+"""
+function pharmacogenomics_star_alleles(variant_calls::DataFrame; gene_col::Symbol=:gene, variant_col::Symbol=:variant, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    hasproperty(variant_calls, gene_col) || throw(ArgumentError("missing gene column"))
+    hasproperty(variant_calls, variant_col) || throw(ArgumentError("missing variant column"))
+
+    star_map = Dict(
+        "CYP2D6" => Dict("rs1065852" => "*10", "rs3892097" => "*4", "rs16947" => "*2"),
+        "CYP2C19" => Dict("rs4244285" => "*2", "rs12248560" => "*17"))
+
+    out = DataFrame(gene=String[], variant=String[], star_allele=String[])
+    for row in eachrow(variant_calls)
+        gene = String(row[gene_col])
+        var = String(row[variant_col])
+        allele = haskey(star_map, gene) ? get(star_map[gene], var, "unknown") : "unknown"
+        push!(out, (gene, var, allele))
+    end
+    return provenance_result!(_ctx, out, "pharmacogenomics_star_alleles"; parents=provenance_parent_ids(variant_calls), parameters=(row_count=nrow(out), gene_col=gene_col, variant_col=variant_col))
+end
+
+"""
+    omop_visit_summary(person, visit_occurrence, condition_occurrence)
+
+Summarize OMOP person-level visit and condition burden.
+"""
+function omop_visit_summary(person::DataFrame, visit_occurrence::DataFrame, condition_occurrence::DataFrame)
+    hasproperty(person, :person_id) || throw(ArgumentError("person table must contain person_id"))
+    hasproperty(visit_occurrence, :person_id) || throw(ArgumentError("visit table must contain person_id"))
+    hasproperty(condition_occurrence, :person_id) || throw(ArgumentError("condition table must contain person_id"))
+    _ctx = active_provenance_context()
+
+    visits = combine(groupby(visit_occurrence, :person_id), nrow => :n_visits)
+    conds = combine(groupby(condition_occurrence, :person_id), nrow => :n_conditions)
+    out = leftjoin(person, visits, on=:person_id)
+    out = leftjoin(out, conds, on=:person_id)
+    out[!, :n_visits] = coalesce.(out.n_visits, 0)
+    out[!, :n_conditions] = coalesce.(out.n_conditions, 0)
+    return provenance_result!(_ctx, out, "omop_visit_summary"; parents=provenance_parent_ids(person, visit_occurrence, condition_occurrence), parameters=(person_count=nrow(person), visit_count=nrow(visit_occurrence), condition_count=nrow(condition_occurrence)))
+end
+
+"""
+    synthpop_like_cohort(df; n=nrow(df))
+
+Generate a synthetic cohort via bootstrap with mild Gaussian jitter for
+continuous variables.
+"""
+function synthpop_like_cohort(df::DataFrame; n::Int=nrow(df), seed::Int=1)
+    _ctx = active_provenance_context()
+
+    n >= 1 || throw(ArgumentError("n must be positive"))
+    rng = MersenneTwister(seed)
+    idx = rand(rng, 1:nrow(df), n)
+    out = copy(df[idx, :])
+
+    for name in names(out)
+        col = out[!, name]
+        if eltype(col) <: Real
+            σ = std(skipmissing(Float64.(col)))
+            noise = randn(rng, length(col)) .* (isfinite(σ) ? 0.05 * σ : 0.0)
+            out[!, name] = Float64.(col) .+ noise
+        end
+    end
+    return provenance_result!(_ctx, out, "synthpop_like_cohort"; parents=provenance_parent_ids(df), parameters=(input_rows=nrow(df), output_rows=n, seed=seed))
+end
+
+"""
+    trial_suitability_scores(clinical)
+
+Compute simple trial suitability scores from ECOG, age, and biomarker columns.
+"""
+function trial_suitability_scores(clinical::DataFrame; age_col::Symbol=:age, ecog_col::Symbol=:ecog, biomarker_cols::Vector{Symbol}=Symbol[], prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    hasproperty(clinical, age_col) || throw(ArgumentError("clinical table missing age column"))
+    hasproperty(clinical, ecog_col) || throw(ArgumentError("clinical table missing ecog column"))
+
+    n = nrow(clinical)
+    score = zeros(Float64, n)
+    for i in 1:n
+        age = Float64(clinical[i, age_col])
+        ecog = Float64(clinical[i, ecog_col])
+        s = 0.0
+        s += clamp((75.0 - age) / 40.0, 0.0, 1.0)
+        s += clamp((2.0 - ecog) / 2.0, 0.0, 1.0)
+        for b in biomarker_cols
+            hasproperty(clinical, b) || continue
+            v = clinical[i, b]
+            if v isa Bool
+                s += v ? 0.6 : 0.0
+            else
+                s += clamp(Float64(v), 0.0, 1.0)
+            end
+        end
+        score[i] = s / max(2 + length(biomarker_cols), 1)
+    end
+
+    out = copy(clinical)
+    out[!, :trial_score] = score
+    out[!, :eligible] = score .>= 0.5
+    return provenance_result!(_ctx, out, "trial_suitability_scores"; parents=provenance_parent_ids(clinical), parameters=(row_count=nrow(out), age_col=age_col, ecog_col=ecog_col, biomarker_count=length(biomarker_cols)))
+end
+
+"""
+    cpic_metabolizer_phenotype(diplotypes; gene="CYP2D6")
+
+Assign CPIC-like metabolizer categories from star-allele diplotypes.
+"""
+function cpic_metabolizer_phenotype(diplotypes::AbstractVector{<:AbstractString}; gene::AbstractString="CYP2D6", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    activity = Dict(
+        "*1" => 1.0,
+        "*2" => 1.0,
+        "*4" => 0.0,
+        "*5" => 0.0,
+        "*10" => 0.25,
+        "*17" => 0.5,
+        "*41" => 0.5)
+
+    out = DataFrame(gene=String[], diplotype=String[], activity_score=Float64[], phenotype=String[])
+    for d in diplotypes
+        tokens = split(replace(String(d), '+' => '/'), '/')
+        score = sum(get(activity, strip(t), 0.5) for t in tokens)
+        pheno = score > 2.0 ? "ultrarapid_metabolizer" : score >= 1.25 ? "normal_metabolizer" : score >= 0.25 ? "intermediate_metabolizer" : "poor_metabolizer"
+        push!(out, (String(gene), String(d), score, pheno))
+    end
+    return provenance_result!(_ctx, out, "cpic_metabolizer_phenotype"; parents=provenance_parent_ids(diplotypes), parameters=(gene=String(gene), row_count=nrow(out)))
+end
+
+"""
+    pharmgkb_like_recommendations(genotypes)
+
+Generate coarse PharmGKB/CPIC-like treatment recommendations from PGx diplotypes.
+"""
+function pharmgkb_like_recommendations(genotypes::DataFrame; gene_col::Symbol=:gene, diplotype_col::Symbol=:diplotype, sample_col::Union{Nothing,Symbol}=nothing)
+    _ctx = active_provenance_context()
+    hasproperty(genotypes, gene_col) || throw(ArgumentError("missing gene column"))
+    hasproperty(genotypes, diplotype_col) || throw(ArgumentError("missing diplotype column"))
+
+    rec_map = Dict(
+        "CYP2D6" => Dict(
+            "poor_metabolizer" => "consider alternative therapy or lower dose",
+            "intermediate_metabolizer" => "consider reduced dose",
+            "normal_metabolizer" => "standard dosing",
+            "ultrarapid_metabolizer" => "consider higher dose or alternate drug"),
+        "CYP2C19" => Dict(
+            "poor_metabolizer" => "avoid prodrug activation-dependent therapies",
+            "intermediate_metabolizer" => "consider alternative antiplatelet",
+            "normal_metabolizer" => "standard dosing",
+            "ultrarapid_metabolizer" => "monitor efficacy and adjust dose"))
+    drug_map = Dict(
+        "CYP2D6" => "codeine/tamoxifen",
+        "CYP2C19" => "clopidogrel/PPIs")
+
+    out = DataFrame(sample_id=String[], gene=String[], diplotype=String[], phenotype=String[], drug_context=String[], recommendation=String[])
+    for row in eachrow(genotypes)
+        gene = String(row[gene_col])
+        diplotype = String(row[diplotype_col])
+        ph = cpic_metabolizer_phenotype([diplotype]; gene=gene, prov_ctx=nothing).phenotype[1]
+        recommendation = haskey(rec_map, gene) ? get(rec_map[gene], ph, "manual curation required") : "manual curation required"
+        sample_id = sample_col === nothing || !hasproperty(genotypes, sample_col) ? "sample_unknown" : String(row[sample_col])
+        push!(out, (sample_id, gene, diplotype, ph, get(drug_map, gene, "general"), recommendation))
+    end
+    return provenance_result!(_ctx, out, "pharmgkb_like_recommendations"; parents=provenance_parent_ids(genotypes), parameters=(row_count=nrow(out), gene_col=gene_col, diplotype_col=diplotype_col, sample_col=sample_col === nothing ? "none" : String(sample_col)))
+end
+
+function _fit_logistic_irls(X::AbstractMatrix{<:Real}, y::AbstractVector{<:Real}; max_iter::Int=100, tol::Real=1e-7)
+    β = zeros(Float64, size(X, 2))
+    for _ in 1:max_iter
+        η = X * β
+        η = clamp.(η, -25.0, 25.0)
+        μ = 1.0 ./ (1.0 .+ exp.(-η))
+        w = max.(μ .* (1 .- μ), 1e-6)
+        H = X' * (X .* w) + 1e-6 * I
+        g = X' * (y .- μ)
+        Δ = H \ g
+        β_new = β .+ Δ
+        if norm(β_new - β) <= Float64(tol)
+            β = β_new
+            break
+        end
+        β = β_new
+    end
+    return β
+end
+
+"""
+    propensity_score_match(clinical; treatment_col=:treatment, covariates=Symbol[], ratio=1)
+
+Nearest-neighbor propensity score matching without replacement.
+"""
+function propensity_score_match(clinical::DataFrame; treatment_col::Symbol=:treatment, covariates::Vector{Symbol}=Symbol[], ratio::Int=1)
+    _ctx = active_provenance_context()
+
+    hasproperty(clinical, treatment_col) || throw(ArgumentError("clinical table missing treatment column"))
+    ratio >= 1 || throw(ArgumentError("ratio must be >= 1"))
+
+    if isempty(covariates)
+        covariates = [Symbol(name) for name in names(clinical) if Symbol(name) != treatment_col && eltype(clinical[!, Symbol(name)]) <: Real]
+    end
+    isempty(covariates) && throw(ArgumentError("no numeric covariates available for propensity model"))
+
+    Xraw = hcat([Float64.(clinical[!, c]) for c in covariates]...)
+    for j in axes(Xraw, 2)
+        μ = mean(@view Xraw[:, j])
+        σ = std(@view Xraw[:, j])
+        if isfinite(σ) && σ > 0
+            Xraw[:, j] .= (Xraw[:, j] .- μ) ./ σ
+        else
+            Xraw[:, j] .= 0.0
+        end
+    end
+
+    X = hcat(ones(Float64, nrow(clinical)), Xraw)
+    y = Float64.(clinical[!, treatment_col] .!= 0)
+    β = _fit_logistic_irls(X, y)
+    ps = 1.0 ./ (1.0 .+ exp.(-clamp.(X * β, -25.0, 25.0)))
+
+    treated = findall(==(1.0), y)
+    controls = Set(findall(==(0.0), y))
+    matches = DataFrame(treated_index=Int[], control_index=Int[], treated_ps=Float64[], control_ps=Float64[], abs_distance=Float64[])
+
+    for ti in sort(treated; by=i -> ps[i], rev=true)
+        isempty(controls) && break
+        for _ in 1:ratio
+            isempty(controls) && break
+            best = 0
+            best_dist = Inf
+            for ci in controls
+                d = abs(ps[ti] - ps[ci])
+                if d < best_dist
+                    best_dist = d
+                    best = ci
+                end
+            end
+            best == 0 && break
+            delete!(controls, best)
+            push!(matches, (ti, best, ps[ti], ps[best], best_dist))
+        end
+    end
+
+    result = (matches=matches, propensity_score=ps, coefficients=β, covariates=vcat(:intercept, covariates))
+    return provenance_result!(_ctx, result, "propensity_score_match"; parents=provenance_parent_ids(clinical), parameters=(row_count=nrow(clinical), treatment_col=treatment_col, covariate_count=length(covariates), ratio=ratio, match_count=nrow(matches)))
 end
 
 end # module Clinical

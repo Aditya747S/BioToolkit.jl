@@ -1,43 +1,95 @@
-# enrichment.jl
+# `enrichment.jl` - Gene Set Enrichment
 
-## Purpose
-This file implements functional enrichment analysis for BioToolkit. It provides the data model for annotated terms, the mapping layer for gene identifiers, the overrepresentation statistics, and helper functions for GO and KEGG style analyses.
+## Overview
 
-## Main structs
-- IDMapper: maps input identifiers to canonical IDs and stores reverse lookup information.
-- EnrichmentTerm: one annotation term with its ID, name, namespace, member genes, and parent terms.
-- EnrichmentDatabase: a collection of enrichment terms plus the identifier mapper used by the database.
-- EnrichmentResult: one enriched term with overlap statistics, p-values, adjusted p-values, odds ratio, and the matched genes.
+`enrichment.jl` manages annotation databases, identifier mapping, over-representation analysis, GSEA/GSVA-style scoring, pathway collections, network propagation, and plot-ready enrichment summaries.
 
-## Public functions
-- IDMapper(): create an empty mapper.
-- build_annotation_database(terms; mapper): construct an enrichment database from a list of terms.
-- builtin_annotation_terms and builtin_annotation_database: provide a built-in GO/KEGG-style example database.
-- load_annotation_database(path) and save_annotation_database(path, database): serialize and restore annotation databases as JSON.
-- map_id and map_ids: normalize one identifier or many identifiers through the mapper.
-- enrichment_test(query_genes, database; background, namespace, elim, threaded, min_overlap): perform general overrepresentation testing.
-- go_enrichment and kegg_enrichment: namespace-specific wrappers around enrichment_test.
-- dotplot: plotting helper for displaying enriched results.
+### Purpose
 
-## What the module does
-The module takes a query gene list and compares it against term gene sets stored in the database. It filters the query into the background universe, computes a right-tail Fisher-style enrichment p-value for each term, adjusts p-values with Benjamini-Hochberg correction, and returns a sorted list of EnrichmentResult objects.
+This file documents the exported analysis objects and workflow functions in `enrichment.jl`. It focuses on what each API does, what stage of the workflow it belongs to, and how the pieces compose with the rest of BioToolkit.
 
-## How the structs work together
-EnrichmentTerm holds the biological annotation itself. EnrichmentDatabase stores the full term map and the IDMapper used to translate gene symbols or other identifiers. EnrichmentResult is the final statistical output that a user inspects, plots, or filters for biological interpretation.
+---
 
-## Typical usage
-1. Build or load an EnrichmentDatabase.
-2. Optionally map a gene list through map_ids so identifiers are consistent with the database.
-3. Call enrichment_test, go_enrichment, or kegg_enrichment.
-4. Sort or filter the returned EnrichmentResult objects by padj or overlap.
-5. Pass the result list to dotplot if you want a visualization of the top terms.
+## Design Decisions
 
-## Important implementation details
-- _background_set collects the universe of genes represented in the database.
-- _effective_gene_sets supports elim-style term pruning when descendants or significant terms should be removed from parents.
-- _fisher_right_tail computes the right-tail hypergeometric enrichment probability.
-- _odds_ratio computes a smoothed odds ratio for the contingency table.
-- _benjamini_hochberg provides multiple-testing correction for the final term list.
+| Decision | Rationale |
+|---|---|
+| **End-to-end workflow coverage** | Public functions cover preprocessing, modeling, diagnostics, and reporting. |
+| **Explicit result objects** | Important outputs are typed so fields can be inspected and reused. |
+| **Method-compatible inputs** | Matrix, table, and BioToolkit container inputs are supported where the operation naturally allows it. |
+| **Statistical transparency** | Helpers expose normalization, filtering, testing, and correction steps rather than hiding them. |
+| **Plot/report readiness** | Returned objects are structured for downstream plotting and export. |
 
-## Why this file matters
-This module is the pathway and ontology interpretation layer of BioToolkit. It turns a gene list into ranked, statistically supported biological terms that can be reported or plotted.
+---
+
+## 1. Databases and IDs
+
+Annotation databases map terms to genes and translate identifiers across namespaces.
+
+| API | Description |
+|---|---|
+| `IDMapper` | Identifier mapping table/container. |
+| `EnrichmentTerm` | One gene-set term with id, name, namespace, and genes. |
+| `EnrichmentDatabase` | Collection of enrichment terms and optional ID mappings. |
+| `EnrichmentResult` | Over-representation result for one term. |
+| `GSEAResult` | Rank-based gene-set enrichment result. |
+| `GSVAResult` | Sample-level gene-set activity result. |
+| `load_annotation_database` | Loads a serialized annotation database. |
+| `save_annotation_database` | Saves an annotation database. |
+| `build_annotation_database` | Builds a database from term-to-gene records. |
+| `builtin_annotation_database` | Loads built-in term collections. |
+| `builtin_annotation_terms` | Lists built-in terms. |
+| `map_id` | Maps one identifier. |
+| `map_ids` | Maps many identifiers. |
+
+## 2. Enrichment Tests
+
+ORA, GSEA, GSVA, and collection-specific wrappers share result formats.
+
+| API | Description |
+|---|---|
+| `enrichment_test` | Runs hypergeometric/Fisher-style over-representation analysis. |
+| `go_enrichment` | Runs GO enrichment using a GO-like database. |
+| `kegg_enrichment` | Runs KEGG enrichment. |
+| `fgsea_like` | Fast preranked GSEA-like scoring. |
+| `gsea_preranked` | Runs rank-based enrichment from ordered genes/statistics. |
+| `gsva_score` | Computes sample-level pathway activity scores. |
+| `reactome_enrichment` | Runs Reactome-style enrichment. |
+| `wikipathways_enrichment` | Runs WikiPathways-style enrichment. |
+| `msigdb_enrichment` | Runs MSigDB-style enrichment. |
+| `competitive_gene_set_test` | Tests gene sets against background genes. |
+| `self_contained_gene_set_test` | Tests whether a gene set has signal without comparing to other genes. |
+
+## 3. Networks and Reporting
+
+Reporting helpers build overlaps, maps, semantic summaries, and plot payloads.
+
+| API | Description |
+|---|---|
+| `dotplot` | Creates dotplot-ready enrichment data. |
+| `network_propagation` | Propagates gene scores across a network. |
+| `heat_diffusion_enrichment` | Scores terms after heat-diffusion smoothing. |
+| `gene_set_overlap_matrix` | Computes pairwise term overlaps. |
+| `jaccard_similarity_matrix` | Computes pairwise Jaccard similarities. |
+| `leading_edge_genes` | Extracts leading-edge genes from GSEA results. |
+| `enrichment_map` | Builds an enrichment-map graph. |
+| `enrichment_heatmap_data` | Builds heatmap-ready gene-set matrices. |
+| `bubble_chart_data` | Builds bubble-chart payloads. |
+| `gene_ontology_semantic_similarity` | Computes GO semantic similarity between terms. |
+| `go_slim_mapping` | Maps detailed GO terms to slim terms. |
+| `term_to_gene_matrix` | Builds a binary term-by-gene matrix. |
+| `rank_genes_by_set_membership` | Ranks genes by membership frequency or weighted set scores. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+db = builtin_annotation_database(:go)
+res = go_enrichment(significant_genes, db; universe=background_genes)
+plotdata = dotplot(res)
+gsea = gsea_preranked(ranked_gene_scores, db)
+```
+

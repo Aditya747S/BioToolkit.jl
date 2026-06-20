@@ -15,7 +15,8 @@ function build_records(record_count::Integer, read_length::Integer)
             sequence[position] = bases[mod(index + position - 2, length(bases)) + 1]
         end
         quality = index % 5 == 0 ? high_quality * low_quality : repeat("I", read_length)
-        push!(records, FastqRecord("read$(index)", "read$(index)", String(sequence), quality))
+        typed_sequence = BioSequence{DNAAlphabet}(String(sequence))
+        push!(records, FastqRecord("read$(index)", "read$(index)", typed_sequence, quality))
     end
 
     return records

@@ -1,3 +1,16 @@
+# ==============================================================================
+# bam.jl — BAM/SAM binary alignment format I/O
+#
+# Provides BAM reading/writing with BGZF compression, CIGAR encoding,
+# sequence nibble-packing, quality encoding, auxiliary tag parsing, and
+# BAI index support for random-access region queries.
+#
+# References:
+#   - SAM/BAM specification v1.6 (hts-specs, samtools)
+#   - Li et al. (2009) Bioinformatics 25(16):2078-2079 (SAM format)
+#   - BGZF: blocked gzip with virtual file offsets
+# ==============================================================================
+
 const _BAM_MAGIC = UInt8[0x42, 0x41, 0x4d, 0x01]
 const _BAM_BAI_MAGIC = UInt8[0x42, 0x41, 0x49, 0x01]
 const _BAM_LINEAR_INDEX_WINDOW = 14
@@ -87,7 +100,7 @@ struct BamRecord
     mate_refname::Union{Nothing,String}
     mate_pos::Int32
     template_length::Int32
-    sequence::String
+    sequence::BioSequence{DNAAlphabet}
     quality::Union{Missing,String}
     tags::Dict{String,Any}
 end
@@ -100,6 +113,7 @@ In-memory BAM file container holding a header and records.
 struct BamFile
     header::BamHeader
     records::Vector{BamRecord}
+    metadata::Dict{Symbol,Any}
 end
 
 """
@@ -120,6 +134,78 @@ Bin and linear index tables used for BAM region queries.
 struct BamIndex
     bins::Vector{Dict{UInt32,Vector{BamChunk}}}
     linear::Vector{Dict{Int,UInt64}}
+end
+
+"""
+    AbstractBamRecordReader
+
+Abstract supertype for lazy BAM record iterators.
+"""
+abstract type AbstractBamRecordReader end
+
+"""
+    BamReader
+
+Sequential lazy BAM record reader.
+"""
+mutable struct BamReader <: AbstractBamRecordReader
+    io::BGZFStreams.BGZFStream
+    header::BamHeader
+    done::Bool
+end
+
+"""
+    BamRegionScanReader
+
+Sequential lazy reader that yields only records overlapping a region.
+"""
+mutable struct BamRegionScanReader <: AbstractBamRecordReader
+    io::BGZFStreams.BGZFStream
+    header::BamHeader
+    region::GenomicRanges.GenomicInterval
+    done::Bool
+end
+
+"""
+    BamIndexedRegionReader
+
+Indexed lazy reader that jumps to candidate chunks for a region.
+"""
+mutable struct BamIndexedRegionReader <: AbstractBamRecordReader
+    io::BGZFStreams.BGZFStream
+    header::BamHeader
+    region::GenomicRanges.GenomicInterval
+    chunks::Vector{BamChunk}
+    chunk_index::Int
+    chunk_stop::UInt64
+    seen::Set{UInt64}
+    done::Bool
+end
+
+"""
+    BamEmptyReader
+
+Empty lazy BAM record reader with a known header.
+"""
+struct BamEmptyReader <: AbstractBamRecordReader
+    header::BamHeader
+end
+
+Base.IteratorEltype(::Type{<:AbstractBamRecordReader}) = Base.HasEltype()
+Base.IteratorSize(::Type{<:AbstractBamRecordReader}) = Base.SizeUnknown()
+Base.eltype(::Type{<:AbstractBamRecordReader}) = BamRecord
+
+_close_bam_io!(io::BGZFStreams.BGZFStream) = (
+    try
+        close(io)
+    catch
+    end
+)
+
+@inline function _register_bam_result!(_explicit_ctx, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    _ctx = active_provenance_context(_explicit_ctx)
+    _ctx === nothing || register_provenance!(_ctx, operation; parents=parents, parameters=parameters)
+    return nothing
 end
 
 """
@@ -156,15 +242,6 @@ Test two BAM headers for value equality.
 """
 function Base.:(==)(left::BamHeader, right::BamHeader)
     return isequal(left.text, right.text) && isequal(left.references, right.references)
-end
-
-"""
-    Base.:(==)(left, right)
-
-Test two BAM file containers for value equality.
-"""
-function Base.:(==)(left::BamFile, right::BamFile)
-    return isequal(left.header, right.header) && isequal(left.records, right.records)
 end
 
 Base.iterate(file::BamFile, state...) = iterate(file.records, state...)
@@ -205,8 +282,10 @@ end
 Render a compact BAM file summary.
 """
 function Base.show(io::IO, file::BamFile)
-    print(io, "BamFile(", length(file.records), " records, ", length(file.header.references), " references)")
+    print(io, "BamFile(", length(file.records), " records, ", length(file.header.references), " references, ", container_provenance_summary(file), ")")
 end
+
+Base.:(==)(left::BamFile, right::BamFile) = isequal(left.header, right.header) && isequal(left.records, right.records) && isequal(left.metadata, right.metadata)
 
 """
     _bam_header_text(references)
@@ -227,7 +306,7 @@ end
 
 Construct a normalized BAM reference entry.
 """
-function BamReference(name::AbstractString, length::Integer)
+function BamReference(name::String, length::Integer)
     return BamReference(String(name), Int(length))
 end
 
@@ -236,7 +315,7 @@ end
 
 Construct a BAM header from a reference list and optional header text.
 """
-function BamHeader(references::AbstractVector{<:BamReference}; text::AbstractString="")
+function BamHeader(references::AbstractVector{<:BamReference}; text::String="")
     reference_list = BamReference[BamReference(reference.name, reference.length) for reference in references]
     header_text = isempty(strip(text)) ? _bam_header_text(reference_list) : String(text)
     return BamHeader(header_text, reference_list)
@@ -247,7 +326,7 @@ end
 
 Construct a BAM header from explicit text and references.
 """
-function BamHeader(text::AbstractString, references::AbstractVector{<:BamReference})
+function BamHeader(text::String, references::AbstractVector{<:BamReference})
     return BamHeader(String(text), BamReference[BamReference(reference.name, reference.length) for reference in references])
 end
 
@@ -266,17 +345,17 @@ end
 Construct a fully typed BAM alignment record.
 """
 function BamRecord(
-    qname::AbstractString,
-    refname::Union{Nothing,AbstractString},
+    qname::String,
+    refname::Union{Nothing,String},
     pos::Integer,
     cigar::AbstractVector{<:BamCigarOp},
-    sequence::AbstractString;
+    sequence::BioSequence{DNAAlphabet};
     flag::Integer=0,
     mapq::Integer=60,
-    mate_refname::Union{Nothing,AbstractString}=nothing,
+    mate_refname::Union{Nothing,String}=nothing,
     mate_pos::Integer=-1,
     template_length::Integer=0,
-    quality::Union{Missing,AbstractString}=missing,
+    quality::Union{Missing,String}=missing,
     tags::AbstractDict=Dict{String,Any}(),
 )
     ref_value = refname === nothing ? nothing : String(refname)
@@ -293,10 +372,46 @@ function BamRecord(
         mate_ref_value,
         Int32(mate_pos),
         Int32(template_length),
-        String(sequence),
+        sequence,
         quality_value,
         Dict{String,Any}(tags),
     )
+end
+
+function BamRecord(
+    qname::String,
+    refname::Union{Nothing,String},
+    pos::Integer,
+    cigar::AbstractVector{<:BamCigarOp},
+    sequence::BioSequence;
+    kwargs...
+)
+    return BamRecord(qname, refname, pos, cigar, BioSequence{DNAAlphabet}(sequence.data; validate=false); kwargs...)
+end
+
+@inline _bam_coerce_dna_sequence(sequence::BioSequence{DNAAlphabet}) = sequence
+
+function _bam_coerce_dna_sequence(sequence::BioSequence)
+    sequence_text = String(sequence)
+    validate_sequence(DNAAlphabet, sequence_text) || throw(ArgumentError("BamRecord sequence must be DNA-compatible"))
+    return BioSequence{DNAAlphabet}(sequence_text)
+end
+
+function _bam_coerce_dna_sequence(sequence)
+    sequence_text = String(sequence)
+    validate_sequence(DNAAlphabet, sequence_text) || throw(ArgumentError("BamRecord sequence must be DNA-compatible"))
+    return BioSequence{DNAAlphabet}(sequence_text)
+end
+
+function BamRecord(
+    qname::String,
+    refname::Union{Nothing,String},
+    pos::Integer,
+    cigar::AbstractVector{<:BamCigarOp},
+    sequence;
+    kwargs...
+)
+    return BamRecord(qname, refname, pos, cigar, _bam_coerce_dna_sequence(sequence); kwargs...)
 end
 
 """
@@ -304,10 +419,19 @@ end
 
 Wrap a list of BAM records in an in-memory file container.
 """
-function BamFile(records::AbstractVector{<:BamRecord}; header::Union{Nothing,BamHeader}=nothing)
+function BamFile(records::AbstractVector{<:BamRecord}; header::Union{Nothing,BamHeader}=nothing, metadata::AbstractDict=Dict{Symbol,Any}())
     bam_records = BamRecord[record for record in records]
     bam_header = header === nothing ? _infer_bam_header(bam_records) : header
-    return BamFile(bam_header, bam_records)
+    metadata_copy = Dict{Symbol,Any}(metadata)
+    ensure_provenance_id!(metadata_copy)
+    return BamFile(bam_header, bam_records, metadata_copy)
+end
+
+function BamFile(header::BamHeader, records::AbstractVector{<:BamRecord}; metadata::AbstractDict=Dict{Symbol,Any}())
+    bam_records = BamRecord[record for record in records]
+    metadata_copy = Dict{Symbol,Any}(metadata)
+    ensure_provenance_id!(metadata_copy)
+    return BamFile(header, bam_records, metadata_copy)
 end
 
 """
@@ -320,7 +444,7 @@ function _read_cstring(io::IO, nbytes::Integer)
     bytes = read(io, Int(nbytes))
     isempty(bytes) && return ""
     if bytes[end] == 0x00
-        resize!(bytes, Base.length(bytes) - 1)
+        pop!(bytes)
     end
     return String(bytes)
 end
@@ -334,7 +458,7 @@ function _read_bam_name(io::IO, nbytes::Integer)
     bytes = read(io, Int(nbytes))
     isempty(bytes) && return ""
     if bytes[end] == 0x00
-        resize!(bytes, Base.length(bytes) - 1)
+        pop!(bytes)
     end
     return String(bytes)
 end
@@ -342,30 +466,30 @@ end
 """
     _decode_bam_sequence(bytes, length)
 
-Decode BAM-packed nucleotide bytes into a sequence string.
+Decode BAM-packed nucleotide bytes into a typed DNA sequence.
 """
 function _decode_bam_sequence(bytes::Vector{UInt8}, length::Integer)
     if length == 0
-        return ""
+        return BioSequence{DNAAlphabet}(UInt8[]; validate=false)
     end
 
-    buffer = IOBuffer()
+    buffer = Vector{UInt8}(undef, Int(length))
     expected = Int(length)
     written = 0
     for byte in bytes
         high = (byte >> 4) & 0x0f
         low = byte & 0x0f
         if written < expected
-            write(buffer, get(_BAM_SEQUENCE_CODES, high, 'N'))
             written += 1
+            buffer[written] = UInt8(get(_BAM_SEQUENCE_CODES, high, 'N'))
         end
         if written < expected
-            write(buffer, get(_BAM_SEQUENCE_CODES, low, 'N'))
             written += 1
+            buffer[written] = UInt8(get(_BAM_SEQUENCE_CODES, low, 'N'))
         end
     end
 
-    return String(take!(buffer))
+    return BioSequence{DNAAlphabet}(buffer; validate=false)
 end
 
 """
@@ -373,12 +497,12 @@ end
 
 Encode a nucleotide sequence into BAM nibble-packed bytes.
 """
-function _encode_bam_sequence(sequence::AbstractString)
+function _encode_bam_sequence(sequence::BioSequence{DNAAlphabet})
     encoded = UInt8[]
     buffer = UInt8(0)
     use_high = true
 
-    for character in uppercase(sequence)
+    for character in String(sequence)
         code = get(_BAM_SEQUENCE_ENCODE, character, 0xF)
         if use_high
             buffer = UInt8(code << 4)
@@ -416,7 +540,7 @@ end
 
 Encode an ASCII quality string for BAM storage.
 """
-function _encode_bam_quality(quality::Union{Missing,AbstractString}, length::Integer)
+function _encode_bam_quality(quality::Union{Missing,String}, length::Integer)
     quality === missing && return fill(UInt8(0xff), Int(length))
     ncodeunits(quality) == length || throw(ArgumentError("quality length must match sequence length"))
     return UInt8.(codeunits(String(quality)) .- UInt8(33))
@@ -449,6 +573,46 @@ end
 
 Read a single BAM auxiliary tag value from a binary stream.
 """
+function _read_bam_array_values(io::IO, subtype::Char, count::Int)
+    count >= 0 || throw(ArgumentError("BAM B-array count must be non-negative"))
+
+    if subtype == 'c'
+        values = Vector{Int8}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'C'
+        values = Vector{UInt8}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 's'
+        values = Vector{Int16}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'S'
+        values = Vector{UInt16}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'i'
+        values = Vector{Int32}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'I'
+        values = Vector{UInt32}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'f'
+        values = Vector{Float32}(undef, count)
+        read!(io, values)
+        return values
+    elseif subtype == 'd'
+        values = Vector{Float64}(undef, count)
+        read!(io, values)
+        return values
+    end
+
+    throw(ArgumentError("unsupported BAM B-array subtype '$subtype'"))
+end
+
 function _read_bam_tag_value(io::IO, type::Char)
     if type == 'A'
         return Char(read(io, UInt8))
@@ -466,6 +630,8 @@ function _read_bam_tag_value(io::IO, type::Char)
         return read(io, UInt32)
     elseif type == 'f'
         return read(io, Float32)
+    elseif type == 'd'
+        return read(io, Float64)
     elseif type == 'Z' || type == 'H'
         buffer = IOBuffer()
         while !eof(io)
@@ -477,21 +643,7 @@ function _read_bam_tag_value(io::IO, type::Char)
     elseif type == 'B'
         subtype = Char(read(io, UInt8))
         count = Int(read(io, Int32))
-        if subtype == 'c'
-            return [read(io, Int8) for _ in 1:count]
-        elseif subtype == 'C'
-            return [read(io, UInt8) for _ in 1:count]
-        elseif subtype == 's'
-            return [read(io, Int16) for _ in 1:count]
-        elseif subtype == 'S'
-            return [read(io, UInt16) for _ in 1:count]
-        elseif subtype == 'i'
-            return [read(io, Int32) for _ in 1:count]
-        elseif subtype == 'I'
-            return [read(io, UInt32) for _ in 1:count]
-        elseif subtype == 'f'
-            return [read(io, Float32) for _ in 1:count]
-        end
+        return _read_bam_array_values(io, subtype, count)
     end
 
     throw(ArgumentError("unsupported BAM tag type '$type'"))
@@ -504,13 +656,18 @@ Parse packed BAM auxiliary tags into a dictionary.
 """
 function _parse_bam_tags(bytes::Vector{UInt8})
     tags = Dict{String,Any}()
-    isempty(bytes) && return tags
     io = IOBuffer(bytes)
+
     while !eof(io)
-        tag = String(read(io, 2))
-        type = Char(read(io, UInt8))
-        tags[tag] = _read_bam_tag_value(io, type)
+        remaining = bytesavailable(io)
+        remaining == 0 && break
+        remaining < 3 && throw(ArgumentError("truncated BAM auxiliary tag payload"))
+
+        key = String(read(io, 2))
+        type_char = Char(read(io, UInt8))
+        tags[key] = _read_bam_tag_value(io, type_char)
     end
+
     return tags
 end
 
@@ -534,9 +691,11 @@ function _encode_bam_tag_value(value)
         return 'i', Int32(value)
     elseif value isa UInt32 || value isa UInt || value isa UInt64
         return 'I', UInt32(value)
+    elseif value isa Float64
+        return 'd', value
     elseif value isa AbstractFloat
         return 'f', Float32(value)
-    elseif value isa AbstractString
+    elseif value isa String
         return 'Z', String(value)
     elseif value isa AbstractVector
         if isempty(value)
@@ -556,6 +715,9 @@ function _encode_bam_tag_value(value)
                 return 'B', ('i', Int32.(value))
             end
         elseif eltype(value) <: AbstractFloat
+            if eltype(value) <: Float64
+                return 'B', ('d', Float64.(value))
+            end
             return 'B', ('f', Float32.(value))
         end
     end
@@ -576,7 +738,7 @@ function _write_bam_tags(io::IO, tags::Dict{String,Any})
         write(io, UInt8(type))
         if type == 'A'
             write(io, encoded)
-        elseif type == 'c' || type == 'C' || type == 's' || type == 'S' || type == 'i' || type == 'I' || type == 'f'
+        elseif type == 'c' || type == 'C' || type == 's' || type == 'S' || type == 'i' || type == 'I' || type == 'f' || type == 'd'
             write(io, encoded)
         elseif type == 'Z' || type == 'H'
             write(io, codeunits(encoded))
@@ -675,19 +837,22 @@ function _bam_record_from_stream(io::BGZFStreams.BGZFStream, header::BamHeader)
     record_start = convert(UInt64, BGZFStreams.virtualoffset(io))
     try
         block_size = Int(read(io, Int32))
+        block_size >= 32 || throw(ArgumentError("invalid BAM record block size: $block_size"))
         refid = Int(read(io, Int32))
         pos = read(io, Int32)
         l_read_name = Int(read(io, UInt8))
+        l_read_name >= 0 || throw(ArgumentError("invalid BAM read-name length: $l_read_name"))
         mapq = read(io, UInt8)
         _bin = read(io, UInt16)
         n_cigar = Int(read(io, UInt16))
         flag = read(io, UInt16)
         l_seq = Int(read(io, Int32))
+        l_seq >= 0 || throw(ArgumentError("invalid BAM sequence length: $l_seq"))
         next_refid = Int(read(io, Int32))
         next_pos = read(io, Int32)
         tlen = read(io, Int32)
 
-        qname = _read_bam_name(io, l_read_name)
+        qname = l_read_name == 0 ? "" : _read_bam_name(io, l_read_name)
         cigar = BamCigarOp[_decode_bam_cigar(read(io, UInt32)) for _ in 1:n_cigar]
 
         seq_bytes = read(io, cld(l_seq, 2))
@@ -697,8 +862,9 @@ function _bam_record_from_stream(io::BGZFStreams.BGZFStream, header::BamHeader)
         quality = _decode_bam_quality(quality_bytes)
 
         consumed = 32 + l_read_name + 4 * n_cigar + cld(l_seq, 2) + l_seq
-        aux_bytes = max(block_size - consumed, 0)
-        tags = _parse_bam_tags(read(io, aux_bytes))
+        aux_bytes = block_size - consumed
+        aux_bytes >= 0 || throw(ArgumentError("malformed BAM record: block size ($block_size) is smaller than consumed bytes ($consumed)"))
+        tags = aux_bytes == 0 ? Dict{String,Any}() : _parse_bam_tags(read(io, aux_bytes))
 
         refname = _reference_name(header, refid)
         mate_refname = _reference_name(header, next_refid)
@@ -738,6 +904,44 @@ end
 
 Return candidate BAM chunks for a genomic region.
 """
+function _bam_linear_floor_offset(index::BamIndex, refindex::Integer, left::Integer)
+    refindex <= 0 && return UInt64(0)
+    refindex > length(index.linear) && return UInt64(0)
+
+    ref_linear = index.linear[refindex]
+    isempty(ref_linear) && return UInt64(0)
+    window = max((left - 1) >> _BAM_LINEAR_INDEX_WINDOW, 0)
+
+    while window >= 0
+        offset = get(ref_linear, window, UInt64(0))
+        offset != 0 && return offset
+        window -= 1
+    end
+
+    return UInt64(0)
+end
+
+function _bam_merge_chunks(chunks::Vector{BamChunk})
+    isempty(chunks) && return BamChunk[]
+
+    merged = BamChunk[]
+    current_start = chunks[1].start
+    current_stop = chunks[1].stop
+
+    for chunk in @view chunks[2:end]
+        if chunk.start <= current_stop
+            current_stop = max(current_stop, chunk.stop)
+        else
+            push!(merged, BamChunk(current_start, current_stop))
+            current_start = chunk.start
+            current_stop = chunk.stop
+        end
+    end
+    push!(merged, BamChunk(current_start, current_stop))
+
+    return merged
+end
+
 function _bam_region_chunks(index::BamIndex, refindex::Integer, left::Integer, right::Integer)
     refindex <= 0 && return BamChunk[]
     refindex > length(index.bins) && return BamChunk[]
@@ -757,8 +961,18 @@ function _bam_region_chunks(index::BamIndex, refindex::Integer, left::Integer, r
         end
     end
 
-    sort!(chunks, by = chunk -> (chunk.start, chunk.stop))
-    return chunks
+    sort!(chunks, by=chunk -> (chunk.start, chunk.stop))
+    min_offset = _bam_linear_floor_offset(index, refindex, left)
+    if min_offset != 0
+        filtered = BamChunk[]
+        for chunk in chunks
+            chunk.stop <= min_offset && continue
+            push!(filtered, BamChunk(max(chunk.start, min_offset), chunk.stop))
+        end
+        chunks = filtered
+    end
+
+    return _bam_merge_chunks(chunks)
 end
 
 """
@@ -859,14 +1073,14 @@ end
 
 Write a BAM index file to disk.
 """
-function _write_bam_index(path::AbstractString, header::BamHeader, index::BamIndex)
+function _write_bam_index(path::String, header::BamHeader, index::BamIndex)
     open(path, "w") do io
         write(io, _BAM_BAI_MAGIC)
         write(io, Int32(length(header.references)))
         for refindex in eachindex(header.references)
             ref_bins = index.bins[refindex]
             write(io, Int32(length(ref_bins)))
-            for (bin_id, chunks) in sort(collect(ref_bins); by = first)
+            for (bin_id, chunks) in sort(collect(ref_bins); by=first)
                 write(io, UInt32(bin_id))
                 write(io, Int32(length(chunks)))
                 for chunk in chunks
@@ -895,7 +1109,7 @@ end
 
 Read a BAM index file from disk.
 """
-function _read_bam_index(path::AbstractString)
+function _read_bam_index(path::String)
     open(path, "r") do io
         magic = read(io, 4)
         magic == _BAM_BAI_MAGIC || throw(ArgumentError("not a BAI index file"))
@@ -932,25 +1146,201 @@ function _read_bam_index(path::AbstractString)
 end
 
 """
+    _read_bam_header!(io)
+
+Read a BAM header from an already-open BGZF stream.
+"""
+function _read_bam_header!(io::BGZFStreams.BGZFStream)
+    magic = read(io, 4)
+    magic == _BAM_MAGIC || throw(ArgumentError("not a BAM file"))
+    text_length = Int(read(io, Int32))
+    text = text_length > 0 ? String(read(io, text_length)) : ""
+    n_ref = Int(read(io, Int32))
+    references = BamReference[]
+    for _ in 1:n_ref
+        name_length = Int(read(io, Int32))
+        name = _read_bam_name(io, name_length)
+        length = Int(read(io, Int32))
+        push!(references, BamReference(name, length))
+    end
+    return BamHeader(text, references)
+end
+
+function _assert_pure_julia_alignment_path(path::String)
+    endswith(lowercase(path), ".cram") && throw(ArgumentError("CRAM input is not supported yet in pure-Julia mode"))
+    return nothing
+end
+
+function _open_bam_stream(path::String)
+    _assert_pure_julia_alignment_path(path)
+    io = open(BGZFStreams.BGZFStream, path, "r")
+    try
+        header = _read_bam_header!(io)
+        return io, header
+    catch
+        _close_bam_io!(io)
+        rethrow()
+    end
+end
+
+"""
     _read_bam_header(path)
 
 Read a BAM header from disk.
 """
-function _read_bam_header(path::AbstractString)
+function _read_bam_header(path::String)
+    _assert_pure_julia_alignment_path(path)
     open(BGZFStreams.BGZFStream, path, "r") do io
-        magic = read(io, 4)
-        magic == _BAM_MAGIC || throw(ArgumentError("not a BAM file"))
-        text_length = Int(read(io, Int32))
-        text = text_length > 0 ? String(read(io, text_length)) : ""
-        n_ref = Int(read(io, Int32))
-        references = BamReference[]
-        for _ in 1:n_ref
-            name_length = Int(read(io, Int32))
-            name = _read_bam_name(io, name_length)
-            length = Int(read(io, Int32))
-            push!(references, BamReference(name, length))
+        return _read_bam_header!(io)
+    end
+end
+
+function BamReader(path::String)
+    io, header = _open_bam_stream(path)
+    return BamReader(io, header, false)
+end
+
+function BamRegionScanReader(path::String, region::GenomicRanges.GenomicInterval)
+    io, header = _open_bam_stream(path)
+    return BamRegionScanReader(io, header, region, false)
+end
+
+function Base.close(reader::BamReader)
+    reader.done = true
+    _close_bam_io!(reader.io)
+    return nothing
+end
+
+function Base.close(reader::BamRegionScanReader)
+    reader.done = true
+    _close_bam_io!(reader.io)
+    return nothing
+end
+
+function Base.close(reader::BamIndexedRegionReader)
+    reader.done = true
+    _close_bam_io!(reader.io)
+    return nothing
+end
+
+Base.close(::BamEmptyReader) = nothing
+
+function Base.iterate(reader::BamReader, _state=nothing)
+    reader.done && return nothing
+
+    _record_start, record = _bam_record_from_stream(reader.io, reader.header)
+    if record === nothing
+        close(reader)
+        return nothing
+    end
+
+    return record, nothing
+end
+
+function Base.iterate(reader::BamRegionScanReader, _state=nothing)
+    reader.done && return nothing
+
+    while true
+        _record_start, record = _bam_record_from_stream(reader.io, reader.header)
+        if record === nothing
+            close(reader)
+            return nothing
         end
-        return BamHeader(text, references)
+        _bam_overlaps(record, reader.region) && return record, nothing
+    end
+end
+
+function _bam_indexed_seek_next_chunk!(reader::BamIndexedRegionReader)
+    while reader.chunk_index <= length(reader.chunks)
+        chunk = reader.chunks[reader.chunk_index]
+        reader.chunk_index += 1
+        chunk.stop > chunk.start || continue
+        seek(reader.io, convert(BGZFStreams.VirtualOffset, chunk.start))
+        reader.chunk_stop = chunk.stop
+        return true
+    end
+
+    reader.chunk_stop = UInt64(0)
+    return false
+end
+
+function Base.iterate(reader::BamIndexedRegionReader, _state=nothing)
+    reader.done && return nothing
+
+    while true
+        if reader.chunk_stop == 0 || convert(UInt64, BGZFStreams.virtualoffset(reader.io)) >= reader.chunk_stop
+            _bam_indexed_seek_next_chunk!(reader) || begin
+                close(reader)
+                return nothing
+            end
+        end
+
+        record_start, record = _bam_record_from_stream(reader.io, reader.header)
+        if record === nothing
+            close(reader)
+            return nothing
+        end
+        record_start >= reader.chunk_stop && continue
+        record_start in reader.seen && continue
+        push!(reader.seen, record_start)
+        _bam_overlaps(record, reader.region) || continue
+        return record, nothing
+    end
+end
+
+Base.iterate(::BamEmptyReader, _state=nothing) = nothing
+
+function _bam_collect(reader::AbstractBamRecordReader)
+    records = BamRecord[]
+    try
+        for record in reader
+            push!(records, record)
+        end
+    finally
+        close(reader)
+    end
+    return BamFile(reader.header, records)
+end
+
+"""
+    stream_bam(path)
+
+Open a BAM file as a lazy pure-Julia record iterator.
+"""
+function stream_bam(path::String)
+
+    return BamReader(path)
+end
+
+"""
+    stream_bam(path, region)
+
+Open a BAM file as a lazy iterator of records overlapping a region.
+"""
+function stream_bam(path::String, region::GenomicRanges.GenomicInterval)
+
+    io, header = _open_bam_stream(path)
+    try
+        refindex = _reference_index(header, region.chrom === nothing ? nothing : String(region.chrom))
+
+        if refindex == 0
+            _close_bam_io!(io)
+            return BamEmptyReader(header)
+        end
+
+        index_path = string(path, ".bai")
+        if !isfile(index_path)
+            return BamRegionScanReader(io, header, region, false)
+        end
+
+        index = _read_bam_index(index_path)
+        chunks = _bam_region_chunks(index, refindex, region.left, region.right)
+        isempty(chunks) && return BamRegionScanReader(io, header, region, false)
+
+        return BamIndexedRegionReader(io, header, region, chunks, 1, UInt64(0), Set{UInt64}(), false)
+    catch
+        _close_bam_io!(io)
+        rethrow()
     end
 end
 
@@ -959,16 +1349,9 @@ end
 
 Scan a BAM file sequentially for alignments overlapping a region.
 """
-function _bam_scan_region(path::AbstractString, header::BamHeader, region::GenomicRanges.GenomicInterval)
-    records = BamRecord[]
-    open(BGZFStreams.BGZFStream, path, "r") do io
-        while !eof(io)
-            _record_start, record = _bam_record_from_stream(io, header)
-            record === nothing && break
-            _bam_overlaps(record, region) && push!(records, record)
-        end
-    end
-    return BamFile(header, records)
+function _bam_scan_region(path::String, header::BamHeader, region::GenomicRanges.GenomicInterval)
+    bam = _bam_collect(BamRegionScanReader(path, region))
+    return header == bam.header ? bam : BamFile(header, bam.records)
 end
 
 """
@@ -976,31 +1359,17 @@ end
 
 Use a BAM index to read only alignments overlapping a region.
 """
-function _bam_region_from_index(path::AbstractString, header::BamHeader, region::GenomicRanges.GenomicInterval, index::BamIndex)
+function _bam_region_from_index(path::String, header::BamHeader, region::GenomicRanges.GenomicInterval, index::BamIndex)
     refindex = _reference_index(header, region.chrom === nothing ? nothing : String(region.chrom))
     refindex == 0 && return BamFile(header, BamRecord[])
 
     chunks = _bam_region_chunks(index, refindex, region.left, region.right)
     isempty(chunks) && return _bam_scan_region(path, header, region)
 
-    records = BamRecord[]
-    seen = Set{UInt64}()
-    open(BGZFStreams.BGZFStream, path, "r") do io
-        for chunk in chunks
-            seek(io, convert(BGZFStreams.VirtualOffset, chunk.start))
-            while !eof(io)
-                current_offset = convert(UInt64, BGZFStreams.virtualoffset(io))
-                current_offset >= chunk.stop && break
-                record_start, record = _bam_record_from_stream(io, header)
-                record === nothing && break
-                record_start in seen && continue
-                push!(seen, record_start)
-                _bam_overlaps(record, region) && push!(records, record)
-            end
-        end
-    end
-
-    return BamFile(header, records)
+    io, stream_header = _open_bam_stream(path)
+    reader = BamIndexedRegionReader(io, stream_header, region, chunks, 1, UInt64(0), Set{UInt64}(), false)
+    bam = _bam_collect(reader)
+    return header == bam.header ? bam : BamFile(header, bam.records)
 end
 
 """
@@ -1008,29 +1377,26 @@ end
 
 Read a BAM file into an in-memory `BamFile`.
 """
-function read_bam(path::AbstractString)
-    open(BGZFStreams.BGZFStream, path, "r") do io
-        magic = read(io, 4)
-        magic == _BAM_MAGIC || throw(ArgumentError("not a BAM file"))
-        text_length = Int(read(io, Int32))
-        text = text_length > 0 ? String(read(io, text_length)) : ""
-        n_ref = Int(read(io, Int32))
-        references = BamReference[]
-        for _ in 1:n_ref
-            name_length = Int(read(io, Int32))
-            name = _read_bam_name(io, name_length)
-            length = Int(read(io, Int32))
-            push!(references, BamReference(name, length))
+function read_bam(path::String; materialize::Bool=true, prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    reader = stream_bam(path)
+    if materialize
+        provenance_hash = _ctx === nothing ? nothing : file_provenance_hash(path)
+        bam = _bam_collect(reader)
+        provenance_hash === nothing || (bam.metadata[PROVENANCE_HASH_KEY] = provenance_hash)
+        _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+            root = register_provenance!(_ctx, "read_bam"; parents=String[], parameters=(source=path, materialized=materialize, hash=provenance_hash, record_count=length(bam.records)))
+            register_container_provenance!(_ctx, bam, "read_bam"; parents=[root.id], parameters=(source=path, materialized=materialize, record_count=length(bam.records)), provenance_hash=provenance_hash)
         end
-        header = BamHeader(text, references)
-        records = BamRecord[]
-        while !eof(io)
-            _record_start, record = _bam_record_from_stream(io, header)
-            record === nothing && break
-            push!(records, record)
-        end
-        return BamFile(header, records)
+        return bam
     end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        register_provenance!(_ctx, "read_bam"; parents=String[], parameters=(source=path, materialized=materialize, hash=provenance_hash))
+    end
+    return reader
 end
 
 """
@@ -1038,12 +1404,26 @@ end
 
 Read only alignments overlapping a genomic interval.
 """
-function read_bam(path::AbstractString, region::GenomicRanges.GenomicInterval)
-    header = _read_bam_header(path)
-    index_path = string(path, ".bai")
-    isfile(index_path) || return _bam_scan_region(path, header, region)
-    index = _read_bam_index(index_path)
-    return _bam_region_from_index(path, header, region, index)
+function read_bam(path::String, region::GenomicRanges.GenomicInterval; materialize::Bool=true, prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    reader = stream_bam(path, region)
+    if materialize
+        provenance_hash = _ctx === nothing ? nothing : file_provenance_hash(path)
+        bam = _bam_collect(reader)
+        provenance_hash === nothing || (bam.metadata[PROVENANCE_HASH_KEY] = provenance_hash)
+        _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+            root = register_provenance!(_ctx, "read_bam"; parents=String[], parameters=(source=path, region=string(region), materialized=materialize, hash=provenance_hash, record_count=length(bam.records)))
+            register_container_provenance!(_ctx, bam, "read_bam"; parents=[root.id], parameters=(source=path, region=string(region), materialized=materialize, record_count=length(bam.records)), provenance_hash=provenance_hash)
+        end
+        return bam
+    end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        register_provenance!(_ctx, "read_bam"; parents=String[], parameters=(source=path, region=string(region), materialized=materialize, hash=provenance_hash))
+    end
+    return reader
 end
 
 """
@@ -1051,7 +1431,9 @@ end
 
 Write BAM records to disk and optionally create an index.
 """
-function write_bam(path::AbstractString, records; header::Union{Nothing,BamHeader}=nothing, write_index::Bool=true)
+function write_bam(path::String, records; header::Union{Nothing,BamHeader}=nothing, write_index::Bool=true, prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    _assert_pure_julia_alignment_path(path)
     bam = records isa BamFile ? records : BamFile(records; header=header)
     index = BamIndex([Dict{UInt32,Vector{BamChunk}}() for _ in bam.header.references], [Dict{Int,UInt64}() for _ in bam.header.references])
 
@@ -1076,6 +1458,14 @@ function write_bam(path::AbstractString, records; header::Union{Nothing,BamHeade
     if write_index
         _write_bam_index(string(path, ".bai"), bam.header, index)
     end
+
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        _register_bam_result!(_ctx, "write_bam"; parents=provenance_parent_ids(bam), parameters=(output=path, header_reference_count=length(bam.header.references), record_count=length(bam.records), write_index=write_index, hash=provenance_hash))
+    end
+
+    _ctx = active_provenance_context(_ctx)
 
     return path
 end

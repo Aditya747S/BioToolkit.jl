@@ -1,49 +1,112 @@
-# differentialexpression.jl
+# `differentialexpression.jl` - Differential Expression Analysis
 
-## Purpose
-This file implements the count-based differential expression workflow in BioToolkit. It provides the core count-matrix container, normalization factor estimation, dispersion modeling, GLM fitting helpers, and result types used for RNA-seq style analysis.
+## Overview
 
-## Main structs
-- CountMatrix: a sparse gene-by-sample count matrix with gene IDs and sample IDs.
-- DEResult: one differential expression result containing base mean, log2 fold change, standard error, test statistic, p-value, and adjusted p-value.
-- GLMSolver: reusable internal state for iterative GLM fitting.
+`differentialexpression.jl` implements DESeq2-, edgeR-, and limma-inspired workflows for count matrices: normalization, dispersion estimation, negative-binomial testing, GLM/QL tests, effect-size shrinkage, transformations, and batch correction.
 
-## Public functions
-- CountMatrix(counts, gene_ids, sample_ids): construct a validated count matrix.
-- filter_low_counts(counts; min_total): remove genes with very low total counts.
-- calc_norm_factors(counts): estimate sample normalization factors.
-- estimate_dispersions(counts, norm_factors): estimate gene-wise dispersion values.
-- differential_expression: perform the full differential expression analysis.
-- benjamini_hochberg: adjust p-values for multiple testing.
-- shrink_lfc: shrink fold-change estimates.
-- vst: compute a variance-stabilizing transformation.
-- fit_gene_fast!: fit a gene-level GLM in place using a fast iterative solver.
-- remove_batch_effect and combat_correction: correct batch effects.
-- estimate_surrogates: estimate surrogate variables.
+### Purpose
 
-## What the module does
-The workflow starts with raw count data and turns it into normalized, model-ready statistics. Low-count genes can be filtered first, then normalization factors and dispersions are estimated, and finally gene-wise GLM models are fitted to obtain test statistics and p-values. The output is a collection of DEResult records that can be converted to tables or fed into plotting and enrichment modules.
+This file documents the exported analysis objects and workflow functions in `differentialexpression.jl`. It focuses on what each API does, what stage of the workflow it belongs to, and how the pieces compose with the rest of BioToolkit.
 
-## How the structs work together
-CountMatrix is the main input container and is used throughout the pipeline. GLMSolver is the iterative fitting state that stores design matrices, weights, fitted coefficients, and working variables. DEResult is the final user-facing output structure that captures the statistical evidence for each gene.
+---
 
-## Typical usage
-1. Build a CountMatrix from a sparse integer matrix or a dense matrix.
-2. Run filter_low_counts to remove weakly expressed genes.
-3. Estimate normalization factors with calc_norm_factors.
-4. Estimate dispersions and fit the model with differential_expression.
-5. Convert the DEResult objects to a DataFrame or pass them to volcano and MA plotting helpers.
+## Design Decisions
 
-## Important implementation details
-- _library_sizes and _row_totals summarize counts at the sample and gene level.
-- _trimmed_weighted_mean is used for robust normalization.
-- _solve_irls! updates the GLM coefficients during iterative fitting.
-- The DataFrame and show methods make the results easy to inspect in notebooks or the REPL.
+| Decision | Rationale |
+|---|---|
+| **End-to-end workflow coverage** | Public functions cover preprocessing, modeling, diagnostics, and reporting. |
+| **Explicit result objects** | Important outputs are typed so fields can be inspected and reused. |
+| **Method-compatible inputs** | Matrix, table, and BioToolkit container inputs are supported where the operation naturally allows it. |
+| **Statistical transparency** | Helpers expose normalization, filtering, testing, and correction steps rather than hiding them. |
+| **Plot/report readiness** | Returned objects are structured for downstream plotting and export. |
 
-## Threading notes
-- `calc_norm_factors()` now defaults to threaded sample-wise normalization when multiple threads are available.
-- `estimate_dispersions()` now defaults to threaded gene-wise dispersion estimation.
-- `combat_correction()` now defaults to threaded batch-wise correction, with each batch processed independently.
+---
 
-## Why this file matters
-This module is the statistical backbone of transcriptomics analysis in BioToolkit. It turns raw count data into interpretable effect sizes and significance values that other modules can visualize or integrate into larger analyses.
+## 1. Core Types and Setup
+
+Dataset containers preserve counts, design matrices, feature names, sample names, and model state.
+
+| API | Description |
+|---|---|
+| `CountMatrix` | Count matrix with gene/sample identifiers and metadata. |
+| `DEResult` | Differential-expression row/result object. |
+| `GLMSolver` | Configuration for GLM fitting routines. |
+| `DESeqDataSet` | DESeq-style dataset with counts, design, size factors, dispersions, and results. |
+| `DESeqDataSetFromMatrix` | Builds a `DESeqDataSet` from count matrix and sample metadata/design. |
+| `counts` | Retrieves count data from a dataset. |
+| `design` | Retrieves design information. |
+| `makeExampleDESeqDataSet` | Creates a small synthetic DESeq-style dataset for examples/tests. |
+
+## 2. Normalization and Dispersion
+
+These functions estimate size factors, normalization factors, and dispersion trends/priors.
+
+| API | Description |
+|---|---|
+| `calc_tmm_factors` | Computes TMM-like library normalization factors. |
+| `calc_norm_factors` | General normalization-factor wrapper. |
+| `estimateSizeFactorsForMatrix` | Median-ratio size factor estimation from a raw matrix. |
+| `estimateSizeFactors` | Stores size factors in a dataset. |
+| `sizeFactors` | Reads size factors. |
+| `sizeFactors!` | Sets size factors. |
+| `normalizationFactors` | Reads gene/sample normalization factors. |
+| `normalizationFactors!` | Sets normalization factors. |
+| `estimate_dispersions` | Estimates per-gene negative-binomial dispersions. |
+| `estimate_dispersions_prior` | Estimates prior/trend information for dispersion shrinkage. |
+| `estimateDispersions` | Full DESeq-style dispersion workflow. |
+| `estimateDispersionsGeneEst` | Gene-wise dispersion estimation. |
+| `estimateDispersionsFit` | Fits a dispersion trend. |
+| `estimateDispersionsMAP` | MAP/shrunken dispersion estimation. |
+| `estimateDispersionsPriorVar` | Estimates dispersion prior variance. |
+
+## 3. Testing and Results
+
+Wald, likelihood-ratio, exact, and quasi-likelihood workflows are available.
+
+| API | Description |
+|---|---|
+| `nbinomWaldTest` | Runs negative-binomial Wald tests. |
+| `nbinomLRT` | Runs negative-binomial likelihood-ratio tests. |
+| `DESeq` | Runs the standard DESeq-style pipeline. |
+| `results` | Extracts contrast/coefficient results. |
+| `resultsNames` | Lists available result coefficients. |
+| `benjamini_hochberg` | Adjusts p-values by BH FDR. |
+| `differential_expression` | Convenience wrapper for count filtering, normalization, testing, and results. |
+| `filter_low_counts` | Removes weakly expressed genes. |
+| `shrink_lfc` | Applies log-fold-change shrinkage. |
+| `cooks_distance` | Computes Cook distance diagnostics. |
+| `replace_outliers` | Replaces flagged count outliers. |
+
+## 4. edgeR, Transforms, and Batch Effects
+
+Additional workflows support edgeR-like tests and downstream matrix correction.
+
+| API | Description |
+|---|---|
+| `estimate_dispersion_edgeR` | Estimates edgeR-style dispersions. |
+| `trend_dispersion_edgeR` | Fits dispersion trends. |
+| `dispersion_prior_dof` | Estimates prior degrees of freedom. |
+| `exact_test_edgeR` | Runs exact tests for two-group count comparisons. |
+| `glm_ql_fit` | Fits quasi-likelihood GLMs. |
+| `glm_ql_f_test` | Runs QL F-tests. |
+| `edgeR_qlf_test` | Convenience edgeR QL workflow. |
+| `vst` | Variance-stabilizing transformation. |
+| `fit_gene_fast!` | Fits one gene/model efficiently in place. |
+| `remove_batch_effect` | Linear batch-effect removal. |
+| `combat_correction` | ComBat-style empirical Bayes batch correction. |
+| `estimate_surrogates` | Estimates surrogate variables from expression matrices. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+dds = DESeqDataSetFromMatrix(counts_matrix, sample_table, design_matrix)
+dds = estimateSizeFactors(dds)
+dds = estimateDispersions(dds)
+dds = nbinomWaldTest(dds)
+res = results(dds)
+```
+

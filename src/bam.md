@@ -1,54 +1,84 @@
-# bam.jl
+# `bam.jl` - Pure-Julia BAM I/O
 
-## Purpose
-This file defines the BAM data model and most of the low-level binary encoding and decoding logic for alignment files. It is responsible for representing BAM headers, records, indices, and the conversion between packed BAM data and Julia objects.
+## Overview
 
-## Main structs
-- BamReference: a reference sequence name and length entry from the BAM header.
-- BamHeader: the textual header plus its list of references.
-- BamCigarOp: a single CIGAR operation and its length.
-- BamRecord: one alignment record containing read name, flags, reference positions, CIGAR operations, mate information, sequence, qualities, and tags.
-- BamFile: a simple in-memory container holding a header and a list of records.
-- BamChunk: a compressed file chunk used for random-access indexing.
-- BamIndex: the binning and linear index tables used for region queries.
+`bam.jl` provides BAM headers, records, CIGAR operations, BGZF-backed streaming readers, materialized BAM files, BAM writing, and BAI-style index support.
 
-## Public constructors and Base methods
-- BamReference(name, length): normalize a reference entry.
-- BamHeader(references; text=""): create or infer a header string from references.
-- BamHeader(text, references): construct a header from explicit text and references.
-- BamCigarOp(length, op): create a CIGAR operation.
-- BamRecord(...): construct a fully typed alignment record.
-- BamFile(records; header=nothing): wrap a list of records in a file container and infer the header if needed.
-- == methods for BamReference, BamCigarOp, BamRecord, BamHeader, and BamFile.
-- show methods for readable summaries of the BAM-related structs.
+### Purpose
 
-## Important internal helpers
-- _bam_header_text: generate a minimal SAM-style header text block.
-- _decode_bam_sequence and _encode_bam_sequence: translate between BAM nucleotide encoding and plain strings.
-- _decode_bam_quality and _encode_bam_quality: convert quality data.
-- _decode_bam_cigar and _encode_bam_cigar: convert CIGAR binary codes to and from BamCigarOp.
-- _parse_bam_tags and _write_bam_tags: handle auxiliary tag fields.
-- _bam_reference_name_map, _reference_index, and _reference_name: resolve reference IDs and names.
-- _bam_reference_span and _bam_query_span: compute read and alignment spans.
-- _bam_overlaps: test overlap between a record and a genomic interval.
-- _bam_record_from_stream: decode a BAM record from a BGZF stream.
-- _bam_reg2bins and _bam_region_chunks: compute index bins and chunks for regional queries.
-- _infer_bam_header and _bam_infer_reference_lengths: infer header content when it is missing.
-- _write_bam_record and _write_bam_index: serialize BAM data and its index.
-- _read_bam_index and _read_bam_header: load BAM metadata from disk.
-- _bam_scan_region and _bam_region_from_index: read alignments restricted to a region.
+This module lets BioToolkit read, create, scan, and write coordinate-aligned sequencing records without relying on htslib for the common BAM path.
 
-## Public I/O functions
-- read_bam(path): read a BAM file into a BamFile object.
-- read_bam(path, region): read only alignments overlapping a genomic interval.
-- write_bam(path, records; header, write_index): write records to disk and optionally generate an index.
+---
 
-## Typical usage
-1. Read a BAM file with read_bam(path).
-2. Inspect the returned BamFile, its header, and its records.
-3. Query a region with read_bam(path, region) when you only need a genomic slice.
-4. Construct BamRecord objects manually when exporting data or creating synthetic alignments.
-5. Use write_bam to save edited or generated records back to disk.
+## Design Decisions
 
-## Why this file matters
-This is the foundational BAM layer for the package. It keeps the binary format details in one place so the rest of BioToolkit can work with high-level alignment records instead of byte-level BAM structures.
+| Decision | Rationale |
+|---|---|
+| **Domain-specific containers** | Results use explicit structs where the workflow has stable fields or needs provenance metadata. |
+| **Workflow APIs** | Functions expose complete analysis steps, not only internal numeric kernels. |
+| **Table-compatible outputs** | Outputs are designed to work with Julia arrays, dictionaries, named tuples, and DataFrames. |
+| **Pure-Julia core** | External tools are optional wrappers; core summaries remain usable inside Julia. |
+| **Provenance hooks** | Many public functions accept provenance context keywords or return result containers with provenance records. |
+
+---
+
+## 1. Core Types
+
+These types model BAM metadata, alignments, files, and index chunks.
+
+| API | Description |
+|---|---|
+| `BamReference` | Reference sequence name and length from the BAM header. |
+| `BamHeader` | Header text plus ordered `BamReference` records. |
+| `BamCigarOp` | Single CIGAR operation with operation character and length. |
+| `BamRecord` | One alignment record with query name, flag, reference, position, CIGAR, sequence, quality, mate fields, and tags. |
+| `BamFile` | Materialized BAM container holding a header and records. |
+| `BamChunk` | Virtual-offset span used by BAI bins. |
+| `BamIndex` | In-memory BAM index with bins and linear offsets. |
+
+## 2. Reading
+
+Readers support full-file iteration and region-restricted access.
+
+| API | Description |
+|---|---|
+| `BamReader` | Streaming reader over all records in a BAM file. |
+| `BamRegionScanReader` | Region reader that scans records and filters overlaps when no index path is used. |
+| `BamIndexedRegionReader` | Region reader that seeks through BAI chunks for indexed queries. |
+| `BamEmptyReader` | Empty iterator returned for regions with no matching chunks. |
+| `read_bam` | Reads a BAM file, optionally materializing records or restricting to a `GenomicInterval`. |
+
+## 3. Writing and Indexing
+
+Writers encode records, CIGARs, tags, qualities, and optional BAI indexes.
+
+| API | Description |
+|---|---|
+| `write_bam` | Writes records to a BGZF-compressed BAM file with an inferred or supplied header. |
+| `write_bam_index` | Writes a BAI-compatible index for a coordinate-sorted BAM. |
+| `read_bam_index` | Loads BAI bins/chunks and linear indexes from disk. |
+
+---
+
+## Quick Reference
+
+| Area | Main APIs |
+|---|---|
+| Core Types | `BamReference`, `BamHeader`, `BamCigarOp`, `BamRecord`, `BamFile`, `BamChunk`, ... |
+| Reading | `BamReader`, `BamRegionScanReader`, `BamIndexedRegionReader`, `BamEmptyReader`, `read_bam` |
+| Writing and Indexing | `write_bam`, `write_bam_index`, `read_bam_index` |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+ref = BamReference("chr1", 1_000_000)
+header = BamHeader([ref])
+record = BamRecord("read1", DNASeq("ACGT"); refname="chr1", pos=0, cigar=[BamCigarOp(4, M)])
+write_bam("example.bam", [record]; header=header)
+bam = read_bam("example.bam")
+```
+

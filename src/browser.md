@@ -1,56 +1,60 @@
-# browser.jl
+# `browser.jl` - Interactive Browser Utilities
 
-## Purpose
-This file implements the genome browser core for BioToolkit. It defines the browser viewport, track types, render-plan objects, and the logic that turns genomic content into layouts that can be rendered by different graphical backends.
+## Overview
 
-## Main structs
-- GenomeViewport: stores the chromosome, genomic range, pixel width, and derived resolution.
-- AbstractTrack: abstract parent for all browser tracks.
-- GeneTrack: gene annotation track with style, height, color, and labeling settings.
-- CoverageTrack: coverage or signal track with windowing and sorting settings.
-- AlignmentTrack: read-alignment track with mismatch and pair display options.
-- GenomeBrowser: the full browser object holding tracks, viewport, spacing, and title.
-- GeneSegment: one drawn segment inside a gene placement.
-- GenePlacement: a gene interval assigned to a row, with label and segment breakdown.
-- GeneRenderPlan: complete gene-track layout for a viewport.
-- CoverageBin: one binned coverage interval with summary statistics.
-- CoverageRenderPlan: complete coverage-track layout for a viewport.
-- ReadMismatch: one mismatch position inside a read.
-- ReadPlacement: a read assigned to a row with blocks and mismatch annotations.
-- ReadConnector: a paired-read connector line.
-- AlignmentRenderPlan: complete alignment-track layout for a viewport.
+`browser.jl` contains lightweight in-memory browser/viewer state for single-cell archives and interactive selection workflows.
 
-## Public functions and constructors
-- GenomeViewport(chrom, range, pixel_width): create a viewport from a genomic interval.
-- GenomeBrowser(tracks, viewport; gap, title): assemble a browser from tracks and an existing viewport.
-- GenomeBrowser(tracks, chrom, start, stop; width, gap, title): convenience constructor that builds the viewport for you.
-- GeneTrack(intervals; style, height, color, label_field, max_labels): create a gene track from genomic intervals.
-- GeneTrack(collection; kwargs...): construct a gene track from an interval collection.
-- CoverageTrack(source; chrom, height, color, style, window_size, sorted, start): configure a coverage track.
-- AlignmentTrack(source; show_mismatches, height, color, max_reads, rng_seed, show_pairs): configure a read-alignment track.
-- genome_lod(viewport): decide whether the viewport should be shown at chromosome, gene, or basepair detail.
-- render_track(track, viewport): convert one track into its corresponding render plan.
-- render_browser(browser): convert all browser tracks into render plans.
-- export_figure(browser, path; dpi): export browser figures when a graphics backend is available.
+### Purpose
 
-## What the module does
-The browser code does not directly draw shapes. Instead, it computes an appropriate representation of what should be drawn. For example, genes can be packed into rows, coverage can be binned, and alignments can be downsampled or expanded depending on the current resolution. The result is a structured render plan that other code can turn into a figure.
+This page documents the public surface of `browser.jl`: the result types, workflow functions, and helper APIs a BioToolkit user is expected to call directly. Private helpers are intentionally omitted unless they define behavior users must understand.
 
-## Rendering logic
-The module uses level-of-detail thresholds to decide how much information to display. At coarse resolution, tracks are summarized. At intermediate resolution, genes are laid out by row. At fine resolution, alignments and read mismatches are shown in more detail. This keeps the browser readable across a wide range of genomic spans.
+---
 
-## Typical usage
-1. Create a GenomeViewport for the chromosome and region of interest.
-2. Create one or more tracks, such as GeneTrack, CoverageTrack, or AlignmentTrack.
-3. Build a GenomeBrowser from the tracks and viewport.
-4. Call render_browser to inspect the plans or use the plotting extension to render the browser visually.
+## Design Decisions
 
-## Important internal helpers
-- _visible_interval and _visible_intervals filter features to the viewport.
-- _gene_label chooses a readable label from feature metadata.
-- _coerce_segment and _gene_segments break feature locations into drawable pieces.
-- _pack_genes assigns genes to rows so overlapping annotations do not collide.
-- _coverage_plan and _alignment_plan build the respective render plans.
+| Decision | Rationale |
+|---|---|
+| **Structured domain outputs** | Stable results are returned as structs, named tuples, or table-friendly payloads. |
+| **Composable Julia inputs** | APIs favor ordinary arrays, matrices, dictionaries, BioToolkit records, and DataFrames. |
+| **Workflow granularity** | Each public function maps to a recognizable analysis or data-preparation step. |
+| **Optional external integration** | Wrapper-style functions prepare command inputs or parse results without making all workflows depend on external tools. |
+| **Reporting-ready summaries** | Many functions return data that can be plotted, exported, or passed into downstream modules. |
 
-## Why this file matters
-This file is the architectural center of BioToolkit's genome browser. It keeps the layout rules in one place, so the same browser object can be rendered in different front ends without duplicating the logic for packing genes or summarizing reads.
+---
+
+## 1. Archive Browsing
+
+Archive helpers expose layers, embeddings, and metadata without forcing users to materialize every matrix.
+
+| API | Description |
+|---|---|
+| `SingleCellArchiveBrowser` | State object for browsing a `SingleCellArchive`. |
+| `browse_singlecell_archive` | Creates a browser object from an archive path or loaded archive. |
+| `archive_layer` | Retrieves a named matrix layer from an archive. |
+| `archive_embedding` | Retrieves a named low-dimensional embedding from an archive. |
+
+## 2. Interactive Single-Cell Viewer
+
+Viewer functions keep selection and reclustering state in Julia objects.
+
+| API | Description |
+|---|---|
+| `SingleCellViewer` | Interactive single-cell viewer state with embedding, labels, selections, and metadata. |
+| `interactive_singlecell_viewer` | Constructs a viewer from a `SingleCellExperiment`. |
+| `lasso_select_cells` | Selects cells inside a polygon/lasso region in embedding space. |
+| `recluster_singlecell_viewer!` | Reclusters the current viewer selection or full viewer dataset in place. |
+| `cell_hover_text` | Formats metadata-rich hover labels for cells. |
+| `top_expressed_genes` | Returns top marker/expression genes for selected cells or clusters. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+viewer = interactive_singlecell_viewer(sce; embedding=:umap)
+selected = lasso_select_cells(viewer, polygon_points)
+labels = cell_hover_text(viewer, selected)
+```
+

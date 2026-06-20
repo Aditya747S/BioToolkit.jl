@@ -1,6 +1,8 @@
 using Statistics
 using Random
 
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+
 export GenomeViewport, AbstractTrack, GeneTrack, CoverageTrack, AlignmentTrack, GenomeBrowser
 export GeneSegment, GenePlacement, GeneRenderPlan, CoverageBin, CoverageRenderPlan
 export ReadMismatch, ReadPlacement, ReadConnector, AlignmentRenderPlan
@@ -10,6 +12,10 @@ const _GENOME_BROWSER_CHROMOSOME_LOD = 10_000.0
 const _GENOME_BROWSER_GENE_LOD = 20.0
 const _GENOME_BROWSER_DEFAULT_PIXEL_WIDTH = 1200
 
+@inline function _register_browser_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
+
 abstract type AbstractTrack end
 
 struct GenomeViewport
@@ -18,7 +24,7 @@ struct GenomeViewport
     pixel_width::Int
     resolution::Float64
 
-    function GenomeViewport(chrom::AbstractString, range::UnitRange{<:Integer}, pixel_width::Integer)
+    function GenomeViewport(chrom::String, range::UnitRange{<:Integer}, pixel_width::Integer)
         pixel_width > 0 || throw(ArgumentError("pixel_width must be positive"))
         first_position = Int(first(range))
         last_position = Int(last(range))
@@ -28,8 +34,13 @@ struct GenomeViewport
     end
 end
 
-GenomeViewport(chrom::AbstractString, start::Integer, stop::Integer; width::Integer=_GENOME_BROWSER_DEFAULT_PIXEL_WIDTH, pixel_width::Union{Nothing,Integer}=nothing) = GenomeViewport(chrom, Int(start):Int(stop), Int(pixel_width === nothing ? width : pixel_width))
-GenomeViewport(chrom::AbstractString, start::Integer, stop::Integer, pixel_width::Integer) = GenomeViewport(chrom, Int(start):Int(stop), Int(pixel_width))
+function _register_viewport(_ctx, chrom::String, range::UnitRange{<:Integer}, pixel_width::Integer)
+    result = GenomeViewport(chrom, range, pixel_width)
+    return _register_browser_result!(_ctx, result, "GenomeViewport"; parents=provenance_parent_ids(chrom, range, pixel_width), parameters=(chrom=String(chrom), start=first(result.range), stop=last(result.range), pixel_width=Int(pixel_width)))
+end
+GenomeViewport(chrom::String, range::UnitRange{<:Integer}; pixel_width::Integer=_GENOME_BROWSER_DEFAULT_PIXEL_WIDTH, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_viewport(_ctx, chrom, range, pixel_width)
+GenomeViewport(chrom::String, start::Integer, stop::Integer; width::Integer=_GENOME_BROWSER_DEFAULT_PIXEL_WIDTH, pixel_width::Union{Nothing,Integer}=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_viewport(_ctx, chrom, Int(start):Int(stop), Int(pixel_width === nothing ? width : pixel_width))
+GenomeViewport(chrom::String, start::Integer, stop::Integer, pixel_width::Integer; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_viewport(_ctx, chrom, Int(start):Int(stop), Int(pixel_width))
 
 struct GeneTrack <: AbstractTrack
     intervals::Vector{GenomicInterval}
@@ -156,15 +167,15 @@ function Base.show(io::IO, ::MIME"text/plain", browser::GenomeBrowser)
     show(io, browser)
 end
 
-GenomeBrowser(tracks::AbstractVector{<:AbstractTrack}, viewport::GenomeViewport; gap::Integer=12, title::AbstractString="Genome Browser") = GenomeBrowser(AbstractTrack[track for track in tracks], viewport, Int(gap), String(title))
-GenomeBrowser(tracks::AbstractVector{<:AbstractTrack}, chrom::AbstractString, start::Integer, stop::Integer; width::Integer=_GENOME_BROWSER_DEFAULT_PIXEL_WIDTH, gap::Integer=12, title::AbstractString="Genome Browser") = GenomeBrowser(tracks, GenomeViewport(chrom, start, stop; width=width); gap=gap, title=title)
+GenomeBrowser(tracks::AbstractVector{<:AbstractTrack}, viewport::GenomeViewport; gap::Integer=12, title::String="Genome Browser") = GenomeBrowser(AbstractTrack[track for track in tracks], viewport, Int(gap), String(title))
+GenomeBrowser(tracks::AbstractVector{<:AbstractTrack}, chrom::String, start::Integer, stop::Integer; width::Integer=_GENOME_BROWSER_DEFAULT_PIXEL_WIDTH, gap::Integer=12, title::String="Genome Browser") = GenomeBrowser(tracks, GenomeViewport(chrom, start, stop; width=width); gap=gap, title=title)
 
-GeneTrack(intervals::AbstractVector{<:GenomicInterval}; style::Symbol=:squish, height::Integer=100, color=:black, label_field::Union{Nothing,Symbol}=nothing, max_labels::Integer=12) = GeneTrack(GenomicInterval[interval for interval in intervals], style, Int(height), color, label_field, Int(max_labels))
+GeneTrack(intervals::AbstractVector{<:GenomicInterval}; style::Symbol=:squish, height::Integer=100, color=:black, label_field::Union{Nothing,Symbol}=nothing, max_labels::Integer=12, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_browser_result!(_ctx, GeneTrack(GenomicInterval[interval for interval in intervals], style, Int(height), color, label_field, Int(max_labels)), "GeneTrack"; parents=provenance_parent_ids(intervals), parameters=(style=style, height=Int(height), label_field=label_field === nothing ? "none" : String(label_field), max_labels=Int(max_labels)))
 GeneTrack(collection::IntervalCollection; kwargs...) = GeneTrack(collection.intervals; kwargs...)
 
-CoverageTrack(source; chrom::Union{Nothing,AbstractString}=nothing, height::Integer=150, color=:blue, style::Symbol=:line, window_size::Union{Nothing,Integer}=nothing, sorted::Bool=false, start::Integer=1) = CoverageTrack(source, chrom === nothing ? nothing : String(chrom), Int(height), color, style, window_size === nothing ? nothing : Int(window_size), sorted, Int(start))
+CoverageTrack(source; chrom::Union{Nothing,String}=nothing, height::Integer=150, color=:blue, style::Symbol=:line, window_size::Union{Nothing,Integer}=nothing, sorted::Bool=false, start::Integer=1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_browser_result!(_ctx, CoverageTrack(source, chrom === nothing ? nothing : String(chrom), Int(height), color, style, window_size === nothing ? nothing : Int(window_size), sorted, Int(start)), "CoverageTrack"; parents=provenance_parent_ids(source), parameters=(chrom=chrom === nothing ? "none" : String(chrom), height=Int(height), style=style, window_size=window_size === nothing ? "none" : Int(window_size), sorted=sorted, start=Int(start)))
 
-AlignmentTrack(source; show_mismatches::Bool=true, height::Integer=300, color=:steelblue, max_reads::Integer=500, rng_seed::Integer=0, show_pairs::Bool=true) = AlignmentTrack(source, show_mismatches, Int(height), color, Int(max_reads), Int(rng_seed), show_pairs)
+AlignmentTrack(source; show_mismatches::Bool=true, height::Integer=300, color=:steelblue, max_reads::Integer=500, rng_seed::Integer=0, show_pairs::Bool=true, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) = _register_browser_result!(_ctx, AlignmentTrack(source, show_mismatches, Int(height), color, Int(max_reads), Int(rng_seed), show_pairs), "AlignmentTrack"; parents=provenance_parent_ids(source), parameters=(show_mismatches=show_mismatches, height=Int(height), max_reads=Int(max_reads), rng_seed=Int(rng_seed), show_pairs=show_pairs))
 
 genome_lod(viewport::GenomeViewport) = viewport.resolution > _GENOME_BROWSER_CHROMOSOME_LOD ? :chromosome : viewport.resolution > _GENOME_BROWSER_GENE_LOD ? :gene : :basepair
 
@@ -193,7 +204,7 @@ function _visible_intervals(intervals::AbstractVector{<:GenomicInterval}, viewpo
     return visible
 end
 
-function _metadata_value(metadata::AbstractDict, key::AbstractString, default=nothing)
+function _metadata_value(metadata::AbstractDict, key::String, default=nothing)
     haskey(metadata, key) && return metadata[key]
     symbol_key = Symbol(key)
     haskey(metadata, symbol_key) && return metadata[symbol_key]
@@ -395,14 +406,33 @@ function _coverage_plan(track::CoverageTrack, viewport::GenomeViewport, lod::Sym
     end
 end
 
-function _read_reference_span(record::BamRecord)
-    return Int(record.pos) + 1, Int(record.pos) + _bam_reference_span(record.cigar)
+function _bam_reference_span(cigar)
+    span = 0
+    for op in cigar
+        if op.op in ('M', 'D', 'N', '=', 'X')
+            span += op.length
+        end
+    end
+    return span
 end
 
-function _read_blocks(record::BamRecord)
+function _read_reference_span(record)
+    return Int(getproperty(record, :pos)) + 1, Int(getproperty(record, :pos)) + _bam_reference_span(getproperty(record, :cigar))
+end
+
+function _bam_overlaps(record, region::GenomicInterval)
+    hasproperty(record, :refname) || return false
+    refname = getproperty(record, :refname)
+    refname === nothing && return false
+    String(refname) != region.chrom && return false
+    left, right = _read_reference_span(record)
+    return !(right < region.left || left > region.right)
+end
+
+function _read_blocks(record)
     blocks = Tuple{Int,Int}[]
-    cursor = Int(record.pos) + 1
-    for op in record.cigar
+    cursor = Int(getproperty(record, :pos)) + 1
+    for op in getproperty(record, :cigar)
         if op.op in ('M', '=', 'X')
             push!(blocks, (cursor, cursor + op.length - 1))
             cursor += op.length
@@ -413,7 +443,7 @@ function _read_blocks(record::BamRecord)
     return blocks
 end
 
-function _parse_md_number(md::AbstractString, index::Int)
+function _parse_md_number(md::String, index::Int)
     cursor = index
     while cursor <= lastindex(md) && isdigit(md[cursor])
         cursor += 1
@@ -421,12 +451,13 @@ function _parse_md_number(md::AbstractString, index::Int)
     return parse(Int, md[index:cursor - 1]), cursor
 end
 
-function _read_mismatches(record::BamRecord)
-    md = get(record.tags, "MD", nothing)
-    md isa AbstractString || return ReadMismatch[]
+function _read_mismatches(record)
+    tags = getproperty(record, :tags)
+    md = get(tags, "MD", nothing)
+    md isa String || return ReadMismatch[]
 
     mismatches = ReadMismatch[]
-    reference_cursor = Int(record.pos) + 1
+    reference_cursor = Int(getproperty(record, :pos)) + 1
     index = firstindex(md)
     while index <= lastindex(md)
         character = md[index]
@@ -449,30 +480,31 @@ function _read_mismatches(record::BamRecord)
     return mismatches
 end
 
-function _read_connector(record::BamRecord)
-    record.mate_refname === nothing && return nothing
-    record.mate_refname != record.refname && return nothing
-    record.mate_pos < 0 && return nothing
-    mate_left = Int(record.mate_pos) + 1
-    mate_right = mate_left + max(0, abs(Int(record.template_length)))
+function _read_connector(record)
+    mate_refname = getproperty(record, :mate_refname)
+    mate_refname === nothing && return nothing
+    mate_refname != getproperty(record, :refname) && return nothing
+    mate_pos = getproperty(record, :mate_pos)
+    mate_pos < 0 && return nothing
+    mate_left = Int(mate_pos) + 1
+    mate_right = mate_left + max(0, abs(Int(getproperty(record, :template_length))))
     left, right = _read_reference_span(record)
-    return ReadConnector(record.qname, left, right, mate_left, mate_right)
+    return ReadConnector(getproperty(record, :qname), left, right, mate_left, mate_right)
 end
 
 function _read_records(source, viewport::GenomeViewport)
     region = GenomicInterval(viewport.chrom, _viewport_start(viewport), _viewport_stop(viewport))
-    if source isa AbstractString
+    if source isa String
+        isdefined(@__MODULE__, :read_bam) || throw(ArgumentError("BAM support is not bundled as a hard dependency"))
         return read_bam(source, region).records
-    elseif source isa BamFile
-        return [record for record in source.records if _bam_overlaps(record, region)]
-    elseif source isa AbstractVector{<:BamRecord}
+    elseif source isa AbstractVector
         return [record for record in source if _bam_overlaps(record, region)]
     else
         throw(ArgumentError("unsupported alignment source $(typeof(source))"))
     end
 end
 
-function _reservoir_sample(records::Vector{BamRecord}, max_reads::Int, rng::AbstractRNG)
+function _reservoir_sample(records::AbstractVector, max_reads::Int, rng::AbstractRNG)
     length(records) <= max_reads && return records, false
     sampled = records[1:max_reads]
     for index in max_reads+1:length(records)
@@ -484,7 +516,7 @@ function _reservoir_sample(records::Vector{BamRecord}, max_reads::Int, rng::Abst
     return sampled, true
 end
 
-function _pack_reads(records::Vector{BamRecord})
+function _pack_reads(records::AbstractVector)
     placements = ReadPlacement[]
     connectors = ReadConnector[]
     row_ends = Int[]
@@ -503,10 +535,10 @@ function _pack_reads(records::Vector{BamRecord})
 
         blocks = _read_blocks(record)
         mismatches = _read_mismatches(record)
-        paired = record.mate_refname !== nothing && record.mate_refname == record.refname && record.mate_pos >= 0
+        paired = hasproperty(record, :mate_refname) && getproperty(record, :mate_refname) !== nothing && getproperty(record, :mate_refname) == getproperty(record, :refname) && getproperty(record, :mate_pos) >= 0
         paired && push!(connectors, _read_connector(record))
-        strand = (record.flag & 0x10) == 0x10 ? '-' : '+'
-        push!(placements, ReadPlacement(record.qname, row, left, right, blocks, mismatches, paired, strand))
+        strand = (getproperty(record, :flag) & 0x10) == 0x10 ? '-' : '+'
+        push!(placements, ReadPlacement(getproperty(record, :qname), row, left, right, blocks, mismatches, paired, strand))
     end
 
     return placements, connectors
@@ -525,32 +557,45 @@ function _alignment_plan(track::AlignmentTrack, viewport::GenomeViewport, lod::S
     return AlignmentRenderPlan(lod, placements, connectors, downsampled)
 end
 
-function render_track(track::GeneTrack, viewport::GenomeViewport)
+function render_track(track::GeneTrack, viewport::GenomeViewport; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lod = genome_lod(viewport)
     if lod == :chromosome
         bin_size = max(1, ceil(Int, viewport.resolution) * 10)
         density, bin_edges = _gene_density(track.intervals, viewport, bin_size)
-        return GeneRenderPlan(lod, GenePlacement[], density, bin_edges, 0, String[])
+        result = GeneRenderPlan(lod, GenePlacement[], density, bin_edges, 0, String[])
+        return _register_browser_result!(_ctx, result, "render_track"; parents=provenance_parent_ids(track, viewport), parameters=(track_type="GeneTrack", lod=String(lod)))
     end
 
     placements, labels, row_count = _pack_genes(track.intervals, viewport, lod, track.label_field, track.max_labels)
-    return GeneRenderPlan(lod, placements, Float64[], Int[], row_count, labels)
+    result = GeneRenderPlan(lod, placements, Float64[], Int[], row_count, labels)
+
+
+    return _register_browser_result!(_ctx, result, "render_track"; parents=provenance_parent_ids(track, viewport), parameters=(track_type="GeneTrack", lod=String(lod), placement_count=length(placements)))
 end
 
-function render_track(track::CoverageTrack, viewport::GenomeViewport)
+function render_track(track::CoverageTrack, viewport::GenomeViewport; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lod = genome_lod(viewport)
-    return _coverage_plan(track, viewport, lod)
+    result = _coverage_plan(track, viewport, lod)
+
+
+    return _register_browser_result!(_ctx, result, "render_track"; parents=provenance_parent_ids(track, viewport), parameters=(track_type="CoverageTrack", lod=String(lod)))
 end
 
-function render_track(track::AlignmentTrack, viewport::GenomeViewport)
+function render_track(track::AlignmentTrack, viewport::GenomeViewport; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lod = genome_lod(viewport)
-    return _alignment_plan(track, viewport, lod)
+    result = _alignment_plan(track, viewport, lod)
+
+
+    return _register_browser_result!(_ctx, result, "render_track"; parents=provenance_parent_ids(track, viewport), parameters=(track_type="AlignmentTrack", lod=String(lod), read_count=length(result.reads)))
 end
 
 render_track(track::AbstractTrack, viewport::GenomeViewport) = throw(ArgumentError("unsupported track type $(typeof(track))"))
 
-function render_browser(browser::GenomeBrowser)
-    return [(track = track, plan = render_track(track, browser.viewport)) for track in browser.tracks]
+function render_browser(browser::GenomeBrowser; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = [(track = track, plan = render_track(track, browser.viewport; _ctx=_ctx)) for track in browser.tracks]
+
+
+    return _register_browser_result!(_ctx, result, "render_browser"; parents=provenance_parent_ids(browser), parameters=(track_count=length(browser.tracks), title=browser.title))
 end
 
 function _render_axis!(backend::Module, axis, plan::GeneRenderPlan, track::GeneTrack)
@@ -616,6 +661,10 @@ function render!(scene, track::AbstractTrack, viewport::GenomeViewport)
     throw(ArgumentError("Makie extension required to render $(typeof(track))"))
 end
 
-function export_figure(browser::GenomeBrowser, path::AbstractString; dpi::Integer=300)
-    throw(ArgumentError("CairoMakie extension required to export browser figures"))
+function export_figure(browser::GenomeBrowser, path::String; dpi::Integer=300)
+    result = throw(ArgumentError("CairoMakie extension required to export browser figures"))
+    _ctx = active_provenance_context()
+
+
+    return _register_browser_result!(_ctx, result, "export_figure"; parents=provenance_parent_ids(browser), parameters=(path=path, dpi=Int(dpi)))
 end

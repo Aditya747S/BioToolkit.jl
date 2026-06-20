@@ -42,6 +42,9 @@ using Turing
     @test all(iszero, diag(bray_curtis))
     @test BioToolkit.pairwise_bray_curtis(profile) ≈ bray_curtis
 
+    zero_counts = BioToolkit.CountMatrix(sparse(Int[0 0; 0 0]), ["g1", "g2"], ["z1", "z2"])
+    @test isnan(BioToolkit.pairwise_bray_curtis(zero_counts)[1, 2])
+
     unifrac = BioToolkit.unifrac(profile)
     @test size(unifrac) == (3, 3)
     @test unifrac ≈ unifrac'

@@ -1,49 +1,99 @@
-# annotation.jl
+# `annotation.jl` - Sequence Annotation Utilities
 
-## Purpose
-This file defines the annotation model used by BioToolkit for gene features, sequence records, and feature slicing. It is the module that turns plain sequences into annotated biological records that can be queried, sliced, displayed, and converted between common feature formats.
+## Overview
 
-## Main structs
-- AbstractFeatureLocation: abstract parent for all feature-location objects.
-- FeatureLocationLite: a simple interval with start, stop, strand, and partiality flags.
-- CompoundFeatureLocation: a compound feature location made up of multiple parts such as joins or orders.
-- SeqFeatureLite: a compact feature record with feature type, location, qualifiers, and identifier.
-- AnnotatedSeqRecord: a mutable annotated sequence record with features, per-letter annotations, and metadata.
-- SangerTrace: a chromatogram-style trace object with A, C, G, and T signal arrays plus qualities and annotations.
+`annotation.jl` provides feature-location types, annotated sequence records, feature slicing, GenBank/GFF conversion, feature tables, and simple variant consequence annotation.
 
-## Public functions and methods
-- feature_spans(location or feature): returns the spans represented by a feature location.
-- feature_bounds(location): returns the outer start and stop coordinates for a feature.
-- feature_start and feature_stop: convenience accessors for the first and last coordinate.
-- feature_strand: returns the strand direction encoded in a location.
-- feature_identifier and feature_annotations: extract identifiers and qualifiers.
-- feature_annotation(feature, key; default): read a single qualifier value.
-- feature_contains: test whether a position falls inside a feature.
-- feature_overlaps: test overlap between two features or locations.
-- feature_extract: pull the subsequence for a location or feature.
-- feature_slice: slice sequence records while preserving or transforming annotations.
-- slice_feature_location and slice_feature: remap a feature into a sliced coordinate system.
-- slice_annotated_record: slice a full annotated record.
-- reverse_complement(record): reverse-complement an annotated record.
-- annotate_gff_records and annotate_genbank_record(s): convert parsed format-specific records into SeqFeatureLite containers.
-- annotate_variants: score and annotate variant records against gene features.
-- parse_feature_location: parse GenBank/GFF-style location strings into typed locations.
-- feature_table(record): convert annotated features into a tabular DataFrame.
-- features_overlapping and select_features: query annotations by region or feature criteria.
+### Purpose
 
-## What the structs represent
-FeatureLocationLite is the simplest case: a contiguous interval with orientation and optional partial ends. CompoundFeatureLocation handles complex feature expressions such as split exons or ordered intervals. SeqFeatureLite stores the feature type and qualifier dictionary in a form that is easy to inspect and manipulate. AnnotatedSeqRecord is the main high-level container, combining the raw sequence with annotations and features. SangerTrace is separate because it is a trace-format object rather than a gene-annotation object, but it lives here because it represents annotated sequence evidence.
+This document is a source-matched reference for the public API in `annotation.jl`. It groups exported types and functions by workflow stage and explains the biological or statistical role of each entry.
 
-## How the module is used
-Typical use starts with parsing a record or converting a GenBank/GFF feature into SeqFeatureLite. From there, the user can:
-1. Query feature coordinates with feature_start, feature_stop, or feature_bounds.
-2. Slice records while keeping annotations synchronized.
-3. Reverse-complement an annotated record when strand orientation changes.
-4. Search features by overlap or containment.
-5. Build a DataFrame with feature_table for reporting or downstream analysis.
+---
 
-## Internal design
-The file contains a feature-location parser with caching, helper functions for splitting nested location expressions, and translation/variant-annotation helpers for consequence prediction. It also includes logic for handling GenBank and GFF-specific metadata so the package can normalize different annotation sources into the same data model.
+## Design Decisions
 
-## Why this file matters
-This is the package's annotation bridge. It connects parsed file formats, biological feature semantics, and sequence slicing in a single place so downstream analysis code can work with one consistent record model.
+| Decision | Rationale |
+|---|---|
+| **Workflow-oriented grouping** | Functions are organized by how users run the analysis. |
+| **Typed domain state** | Reusable records and result objects are represented explicitly. |
+| **Scalable summaries** | APIs return compact matrices/tables for large biological datasets. |
+| **Interoperable outputs** | Results can feed plotting, enrichment, reporting, and downstream modeling modules. |
+| **Explicit thresholds and controls** | Filtering, QC, and model functions expose important parameters as keywords. |
+
+---
+
+## 1. Feature Model
+
+Annotation objects describe single intervals, compound joins/orders, feature qualifiers, and sequence-level metadata.
+
+| API | Description |
+|---|---|
+| `AbstractFeatureLocation` | Common supertype for simple and compound feature locations. |
+| `FeatureLocationLite` | Simple interval with start, stop, strand, and partial-end flags. |
+| `CompoundFeatureLocation` | Joined/ordered collection of feature-location parts. |
+| `SeqFeatureLite` | Feature type, location, qualifiers, and feature id. |
+| `AnnotatedSeqRecord` | Sequence plus id/name/description, features, annotations, and letter annotations. |
+| `SangerTrace` | Container for Sanger trace/channel data and base calls. |
+
+## 2. Location Queries
+
+These helpers compute bounds, spans, strand, containment, and overlap relationships.
+
+| API | Description |
+|---|---|
+| `parse_feature_location` | Parses GenBank-style location strings, including complements and joins. |
+| `feature_spans` | Returns one or more concrete spans for a location or feature. |
+| `feature_start` | Returns the minimum start coordinate. |
+| `feature_stop` | Returns the maximum stop coordinate. |
+| `feature_bounds` | Returns start/stop bounds for a location. |
+| `feature_length` | Computes total feature length across parts. |
+| `feature_strand` | Returns feature strand, respecting compound locations. |
+| `feature_contains` | Tests whether a position falls inside a feature/location. |
+| `feature_overlaps` | Tests whether two features/locations overlap. |
+
+## 3. Slicing and Extraction
+
+Slicing functions preserve or transform feature coordinates and annotations.
+
+| API | Description |
+|---|---|
+| `feature_sequence` | Extracts sequence covered by a feature/location. |
+| `feature_extract` | Alias-style extraction for records or sequences. |
+| `feature_slice` | Slices `SeqRecordLite`, `AnnotatedSeqRecord`, or `GenBankRecord` over a coordinate range. |
+| `slice_feature_location` | Transforms a location into slice-relative coordinates. |
+| `slice_feature` | Transforms a feature into slice-relative coordinates. |
+| `slice_annotated_record` | Slices sequence, features, annotations, and letter annotations together. |
+| `reverse_complement` | Reverse-complements annotated records while transforming feature coordinates. |
+
+## 4. Selection, Tables, and Format Conversion
+
+Converters normalize external formats into lightweight BioToolkit annotations.
+
+| API | Description |
+|---|---|
+| `feature_summary` | Returns a compact named-tuple summary for one feature. |
+| `select_features` | Filters features by type, id, qualifier, strand, or region. |
+| `features_at` | Returns features overlapping one position. |
+| `features_overlapping` | Returns features overlapping a location/range. |
+| `feature_table` | Builds a DataFrame-style feature table. |
+| `feature_annotations` | Returns feature qualifier dictionary. |
+| `feature_annotation` | Retrieves one qualifier with a default. |
+| `annotate_gff_records` | Converts GFF records to `SeqFeatureLite`s. |
+| `annotate_genbank_record` | Converts a GenBank record to an annotated record. |
+| `annotate_genbank_records` | Batch GenBank annotation conversion. |
+| `annotate_variants` | Annotates variants against gene features and optional reference sequences. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+loc = parse_feature_location("complement(join(10..20,30..40))")
+feature = SeqFeatureLite("CDS", loc; qualifiers=Dict("gene"=>["abc"]))
+record = AnnotatedSeqRecord(DNASeq("ACGT"^20); features=[feature])
+cds = feature_sequence(record, feature)
+table = feature_table(record)
+```
+

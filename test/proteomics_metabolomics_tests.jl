@@ -40,6 +40,23 @@ using Turing
         @test denovo.sequence == "GA"
     end
 
+    @testset "Typed protein biotypes" begin
+        protein = BioToolkit.AASeq("ACDEFGHIKLMNPQRSTVWY")
+        short = BioToolkit.AASeq("YYY")
+
+        @test BioToolkit.protein_mass(protein; type="monoisotopic") > 2000.0
+        @test BioToolkit.protein_mass(protein; type="average") > BioToolkit.protein_mass(protein; type="monoisotopic")
+        @test BioToolkit.extinction_coefficient(short) == 4470
+        @test BioToolkit.instability_index(protein) > 0.0
+        @test BioToolkit.gravy(protein) isa Float64
+        @test BioToolkit.aliphatic_index(protein) > 0.0
+
+        params = BioToolkit.protparam(protein)
+        @test params.length == 20
+        @test params.extinction_coefficient == 7115
+        @test params.isoelectric_point > 0.0
+    end
+
     matrix = Matrix{Union{Missing,Float64}}([
         1.0 2.0 0.0 4.0;
         2.0 missing 1.0 3.0;

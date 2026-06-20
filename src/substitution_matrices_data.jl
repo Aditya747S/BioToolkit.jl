@@ -724,5 +724,4 @@ const _BIOPYTHON_NAMED_SUBSTITUTION_MATRIX_TEXT = Dict{String,String}(
     T 0 5 4 0
     C 0 4 5 0
     G 4 0 0 5
-    """,
-)
+    """)

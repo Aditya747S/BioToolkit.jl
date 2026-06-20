@@ -1,3 +1,15 @@
+# ==============================================================================
+# epigenetics.jl — Epigenetics and chromatin analysis
+#
+# Provides coverage computation, peak calling, methylation analysis,
+# single-cell chromatin (TF-IDF/LSI), gene activity scoring,
+# co-accessibility, motif deviations, and TAD detection.
+#
+# References:
+#   - Stuart et al. (2019) Nat Biotechnol 37:1333-1341 (Signac)
+#   - Dixon et al. (2012) Nature 485:376-380 (TADs)
+# ==============================================================================
+
 module Epigenetics
 
 using SparseArrays
@@ -11,7 +23,8 @@ using SpecialFunctions
 using ..GenomicRanges: GenomicInterval, IntervalCollection, CoverageSegment, build_collection, coverage as interval_coverage, promoters
 using ..DifferentialExpression: CountMatrix, DEResult, differential_expression, benjamini_hochberg
 using ..SingleCell: SingleCellExperiment, count_matrix as singlecell_count_matrix, normalize_counts, run_pca, run_umap, cluster_cells, summarize_clusters
-using ..BioToolkit: HMM, viterbi
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, BioSequence, DNAAlphabet, HMM, viterbi
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ThreadSafeProvenanceContext, active_provenance_context, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, register_provenance!, stamp_provenance!, update_provenance!
 
 export SparseCoverageVector, Peak, PeakSet, Epigenome
 export PeakSupport
@@ -23,6 +36,8 @@ export bin_methylation, differential_methylation
 export tfidf, run_lsi, rsvd, gene_activity_score, calculate_coaccessibility
 export compute_motif_deviations, detect_footprints
 export directionality_index, detect_tads
+export chromhmm_like_segmentation, hic_ice_normalize, hic_kr_normalize, hic_ab_compartments, tobias_like_footprints, parse_bismark_coverage
+export insulation_score, compartment_boundary_candidates
 
 struct SparseCoverageVector
     positions::Vector{Int}
@@ -49,6 +64,7 @@ end
 struct PeakSet
     peaks::Vector{Peak}
     chrom_index::Dict{String,Vector{Int}}
+    metadata::Dict{String,Any}
 end
 
 struct PeakSupport
@@ -80,9 +96,10 @@ struct MethylationExperiment
     regions::IntervalCollection
     sample_metadata::DataFrame
     sample_ids::Vector{String}
+    metadata::Dict{String,Any}
 end
 
-struct MethylationResult
+struct MethylationResult <: AbstractAnalysisResult
     region_id::String
     chrom::String
     left::Int
@@ -93,7 +110,11 @@ struct MethylationResult
     stat::Float64
     pvalue::Float64
     padj::Float64
+    provenance::ResultProvenance
 end
+
+MethylationResult(region_id, chrom, left, right, group1_mean, group2_mean, delta_methylation, stat, pvalue, padj) =
+    MethylationResult(region_id, chrom, left, right, group1_mean, group2_mean, delta_methylation, stat, pvalue, padj, provenance_record("MethylationResult", "epigenetics"))
 
 struct SingleCellChromatinExperiment
     base::SingleCellExperiment
@@ -109,13 +130,17 @@ struct CoaccessibilityEdge
     correlation::Float64
 end
 
-struct TadResult
+struct TadResult <: AbstractAnalysisResult
     chrom::String
     left_bin::Int
     right_bin::Int
     score::Float64
     state::Symbol
+    provenance::ResultProvenance
 end
+
+TadResult(chrom, left_bin, right_bin, score, state) =
+    TadResult(chrom, left_bin, right_bin, score, state, provenance_record("TadResult", "epigenetics"))
 
 struct ContactMatrix
     matrix::SparseMatrixCSC{Int,Int}
@@ -129,13 +154,31 @@ Epigenome(intervals::AbstractVector{<:GenomicInterval}, coverage::Dict{String,Sp
 Base.length(set::PeakSet) = length(set.peaks)
 Base.isempty(set::PeakSet) = isempty(set.peaks)
 
-function PeakSet(peaks::AbstractVector{<:Peak})
+function PeakSet(peaks::AbstractVector{<:Peak}; metadata::AbstractDict=Dict{String,Any}())
     sorted = sort!(collect(peaks); by = peak -> (peak.chrom, peak.left, peak.right, peak.id))
     chrom_index = Dict{String,Vector{Int}}()
     for (index, peak) in enumerate(sorted)
         push!(get!(chrom_index, peak.chrom, Int[]), index)
     end
-    return PeakSet(sorted, chrom_index)
+    metadata_copy = Dict{String,Any}(string(key) => value for (key, value) in metadata)
+    metadata_provenance(metadata_copy) === nothing && stamp_provenance!(
+        metadata_copy;
+        label="PeakSet",
+        source="PeakSet",
+        notes=["constructed from peak vector"],
+        parameters=(peak_count=length(sorted), chrom_count=length(chrom_index)))
+    return PeakSet(sorted, chrom_index, metadata_copy)
+end
+
+function MethylationExperiment(methylated::SparseMatrixCSC{Int,Int}, total::SparseMatrixCSC{Int,Int}, regions::IntervalCollection, sample_metadata::DataFrame, sample_ids::Vector{String}; metadata::AbstractDict=Dict{String,Any}())
+    metadata_copy = Dict{String,Any}(string(key) => value for (key, value) in metadata)
+    metadata_provenance(metadata_copy) === nothing && stamp_provenance!(
+        metadata_copy;
+        label="MethylationExperiment",
+        source="MethylationExperiment",
+        notes=["constructed from binned methylation counts"],
+        parameters=(region_count=length(regions.intervals), sample_count=length(sample_ids)))
+    return MethylationExperiment(methylated, total, regions, sample_metadata, sample_ids, metadata_copy)
 end
 
 function DataFrames.DataFrame(peaks::AbstractVector{<:Peak})
@@ -148,8 +191,7 @@ function DataFrames.DataFrame(peaks::AbstractVector{<:Peak})
         summit = [peak.summit for peak in rows],
         score = [peak.score for peak in rows],
         pvalue = [peak.pvalue for peak in rows],
-        qvalue = [peak.qvalue for peak in rows],
-    )
+        qvalue = [peak.qvalue for peak in rows])
 end
 
 function DataFrames.DataFrame(set::PeakSet)
@@ -164,8 +206,7 @@ function DataFrames.DataFrame(support::AbstractVector{<:PeakSupport})
         fragment_count = [row.fragment_count for row in rows],
         total_overlap = [row.total_overlap for row in rows],
         mean_overlap = [row.mean_overlap for row in rows],
-        enrichment = [row.enrichment for row in rows],
-    )
+        enrichment = [row.enrichment for row in rows])
 end
 
 function DataFrames.DataFrame(results::AbstractVector{<:MethylationResult})
@@ -180,8 +221,7 @@ function DataFrames.DataFrame(results::AbstractVector{<:MethylationResult})
         delta_methylation = [row.delta_methylation for row in rows],
         stat = [row.stat for row in rows],
         pvalue = [row.pvalue for row in rows],
-        padj = [row.padj for row in rows],
-    )
+        padj = [row.padj for row in rows])
 end
 
 function DataFrames.DataFrame(results::AbstractVector{<:TadResult})
@@ -191,18 +231,18 @@ function DataFrames.DataFrame(results::AbstractVector{<:TadResult})
         left_bin = [row.left_bin for row in rows],
         right_bin = [row.right_bin for row in rows],
         score = [row.score for row in rows],
-        state = [row.state for row in rows],
-    )
+        state = [row.state for row in rows])
 end
 
 function coverage_depth(coverage::SparseCoverageVector, position::Integer)
     position < 1 && return 0
     idx = searchsortedlast(coverage.positions, Int(position))
     idx == 0 && return 0
+
     return coverage.depths[idx]
 end
 
-function coverage_segments(coverage::SparseCoverageVector; chrom::AbstractString="unknown")
+function coverage_segments(coverage::SparseCoverageVector; chrom::String="unknown")
     segments = CoverageSegment[]
     isempty(coverage.positions) && return segments
     for index in 1:length(coverage.positions)-1
@@ -213,6 +253,7 @@ function coverage_segments(coverage::SparseCoverageVector; chrom::AbstractString
         start_pos <= stop_pos || continue
         push!(segments, CoverageSegment(String(chrom), start_pos, stop_pos, depth))
     end
+
     return segments
 end
 
@@ -415,6 +456,11 @@ function calculate_coverage(fragments::AbstractVector{<:GenomicInterval}; chrom_
         haskey(coverage, chrom) && continue
         coverage[String(chrom)] = SparseCoverageVector([1, Int(span) + 1], [0, 0], Int(span))
     end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "calculate_coverage";
+        parameters=(fragment_count=length(fragments), chrom_count=length(coverage)))
+    end
     return coverage
 end
 
@@ -503,18 +549,41 @@ function call_peaks(coverage::Dict{String,SparseCoverageVector}; pvalue_threshol
 
     qvalues = isempty(peaks) ? Float64[] : benjamini_hochberg([peak.pvalue for peak in peaks])
     adjusted = Peak[Peak(peak.id, peak.chrom, peak.left, peak.right, peak.summit, peak.score, peak.pvalue, qvalues[index]) for (index, peak) in enumerate(peaks)]
-    return PeakSet(adjusted)
+    result = PeakSet(
+        adjusted;
+        metadata=Dict{String,Any}(
+            "peak_count" => length(adjusted),
+            "chrom_count" => length(coverage),
+            "provenance" => provenance_record(
+                "PeakSet",
+                "Epigenetics/call_peaks";
+                notes=["Poisson enrichment over positive coverage segments"],
+                parameters=(pvalue_threshold=Float64(pvalue_threshold), min_depth=Int(min_depth), merge_gap=Int(merge_gap), chrom_count=length(coverage), peak_count=length(adjusted)))))
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "call_peaks";
+        parameters=(pvalue_threshold=Float64(pvalue_threshold), min_depth=Int(min_depth),
+        merge_gap=Int(merge_gap), chrom_count=length(coverage), peak_count=length(adjusted)))
+    end
+    return result
 end
 
-function _window_gc(sequence::AbstractString, start_pos::Int, stop_pos::Int)
+function _window_gc(sequence::BioSequence{DNAAlphabet}, start_pos::Int, stop_pos::Int)
     start_pos > stop_pos && return 0.0
-    window = uppercase(String(sequence[max(start_pos, 1):min(stop_pos, lastindex(sequence))]))
-    isempty(window) && return 0.0
-    gc = count(ch -> ch == 'G' || ch == 'C', window)
-    return gc / length(window)
+    left = max(start_pos, 1)
+    right = min(stop_pos, length(sequence))
+    left > right && return 0.0
+    gc = 0
+    @inbounds for idx in left:right
+        byte = sequence.data[idx]
+        if byte == UInt8('G') || byte == UInt8('g') || byte == UInt8('C') || byte == UInt8('c')
+            gc += 1
+        end
+    end
+    return gc / (right - left + 1)
 end
 
-function normalize_gc_bias(sequence::AbstractString, coverage::SparseCoverageVector; window_size::Int=50)
+function normalize_gc_bias(sequence::BioSequence{DNAAlphabet}, coverage::SparseCoverageVector; window_size::Int=50)
     sequence_length = min(length(sequence), coverage.span)
     windows = GenomicInterval[]
     gc_values = Float64[]
@@ -547,14 +616,17 @@ function normalize_gc_bias(sequence::AbstractString, coverage::SparseCoverageVec
     end
     push!(corrected_positions, sequence_length + 1)
     push!(corrected_depths, 0)
+
     return (
         windows=windows,
         gc=gc_values,
         observed=observed,
         fitted=fitted,
-        corrected_coverage=SparseCoverageVector(corrected_positions, corrected_depths, coverage.span),
-    )
+        corrected_coverage=SparseCoverageVector(corrected_positions, corrected_depths, coverage.span))
 end
+
+normalize_gc_bias(sequence::AbstractString, coverage::SparseCoverageVector; window_size::Int=50) =
+    normalize_gc_bias(BioSequence{DNAAlphabet}(String(sequence); validate=false), coverage; window_size=window_size)
 
 function _peak_lookup(peaks::PeakSet)
     lookup = Dict{String,Vector{Int}}()
@@ -623,35 +695,60 @@ function summarize_peak_support(fragments_by_sample::AbstractDict, peaks::PeakSe
     return support
 end
 
-function count_overlaps(fragments_by_sample::AbstractDict, peaks::PeakSet)
+function count_overlaps(fragments_by_sample::AbstractDict, peaks::PeakSet; multi_thread::Bool=true)
     sample_ids = sort!(collect(String.(keys(fragments_by_sample))))
     peak_ids = [peak.id for peak in peaks.peaks]
     counts = zeros(Int, length(peak_ids), length(sample_ids))
     lookup = _peak_lookup(peaks)
 
-    Base.Threads.@threads for sample_index in eachindex(sample_ids)
-        sample_id = sample_ids[sample_index]
-        fragments = fragments_by_sample[sample_id]
-        column = zeros(Int, length(peak_ids))
-        for fragment in fragments
-            chrom_peaks = get(lookup, fragment.chrom, Int[])
-            isempty(chrom_peaks) && continue
-            best_index, best_overlap = _best_peak_index(fragment, peaks, chrom_peaks)
-            best_index == 0 && continue
-            if best_overlap > 0
-                column[best_index] += 1
+    if multi_thread && length(sample_ids) > 1 && Base.Threads.nthreads() > 1
+        Base.Threads.@threads for sample_index in eachindex(sample_ids)
+            sample_id = sample_ids[sample_index]
+            fragments = fragments_by_sample[sample_id]
+            column = zeros(Int, length(peak_ids))
+            for fragment in fragments
+                chrom_peaks = get(lookup, fragment.chrom, Int[])
+                isempty(chrom_peaks) && continue
+                best_index, best_overlap = _best_peak_index(fragment, peaks, chrom_peaks)
+                best_index == 0 && continue
+                if best_overlap > 0
+                    column[best_index] += 1
+                end
             end
+            counts[:, sample_index] = column
         end
-        counts[:, sample_index] = column
+    else
+        for sample_index in eachindex(sample_ids)
+            sample_id = sample_ids[sample_index]
+            fragments = fragments_by_sample[sample_id]
+            column = zeros(Int, length(peak_ids))
+            for fragment in fragments
+                chrom_peaks = get(lookup, fragment.chrom, Int[])
+                isempty(chrom_peaks) && continue
+                best_index, best_overlap = _best_peak_index(fragment, peaks, chrom_peaks)
+                best_index == 0 && continue
+                if best_overlap > 0
+                    column[best_index] += 1
+                end
+            end
+            counts[:, sample_index] = column
+        end
     end
 
     return CountMatrix(sparse(counts), peak_ids, sample_ids)
 end
 
-function differential_binding(fragments_by_sample::AbstractDict, peaks::PeakSet, design::AbstractVector{<:Symbol}; min_total::Int=10, shrink::Bool=false)
-    count_matrix = count_overlaps(fragments_by_sample, peaks)
+function differential_binding(fragments_by_sample::AbstractDict, peaks::PeakSet, design::AbstractVector{<:Symbol}; min_total::Int=10, shrink::Bool=false, multi_thread::Bool=true, sfType::Symbol=:poscounts)
+    count_matrix = count_overlaps(fragments_by_sample, peaks; multi_thread=multi_thread)
     length(design) == length(count_matrix.sample_ids) || throw(ArgumentError("design must match samples"))
-    return differential_expression(count_matrix, design; min_total=min_total, shrink=shrink)
+    result = differential_expression(count_matrix, design; min_total=min_total, shrink=shrink, sfType=sfType)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "differential_binding";
+        parameters=(n_samples=length(count_matrix.sample_ids), n_peaks=length(peaks),
+        min_total=min_total, shrink=shrink))
+    end
+    return result
 end
 
 function _bin_key(chrom::String, position::Int, bin_width::Int)
@@ -716,7 +813,26 @@ function bin_methylation(calls::AbstractVector{<:MethylationCall}; bin_width::In
         t[row, col] = value
     end
 
-    return MethylationExperiment(sparse(m), sparse(t), build_collection(bin_intervals), sample_metadata, sample_ids)
+    result = MethylationExperiment(
+        sparse(m),
+        sparse(t),
+        build_collection(bin_intervals),
+        sample_metadata,
+        sample_ids;
+        metadata=Dict{String,Any}(
+            "bin_width" => Int(bin_width),
+            "provenance" => provenance_record(
+                "MethylationExperiment",
+                "Epigenetics/bin_methylation";
+                notes=["per-call aggregation into fixed genomic bins"],
+                parameters=(bin_width=Int(bin_width), region_count=length(bin_intervals), sample_count=length(sample_ids), call_count=length(calls)))))
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "bin_methylation";
+        parameters=(bin_width=Int(bin_width), call_count=length(calls),
+        sample_count=length(sample_ids), region_count=length(bin_intervals)))
+    end
+    return result
 end
 
 function _beta_binomial_loglik(methylated::AbstractVector{<:Integer}, total::AbstractVector{<:Integer}, mu::Real, precision::Real)
@@ -783,19 +899,47 @@ function differential_methylation(experiment::MethylationExperiment, design::Abs
     end
 
     qvalues = benjamini_hochberg([result.pvalue for result in results])
-    return [MethylationResult(result.region_id, result.chrom, result.left, result.right, result.group1_mean, result.group2_mean, result.delta_methylation, result.stat, result.pvalue, qvalues[index]) for (index, result) in enumerate(results)]
+    final = [MethylationResult(result.region_id, result.chrom, result.left, result.right, result.group1_mean, result.group2_mean, result.delta_methylation, result.stat, result.pvalue, qvalues[index]) for (index, result) in enumerate(results)]
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "differential_methylation";
+        parameters=(n_regions=size(total,1), min_total=min_total, n_sig=count(r -> r.padj < 0.05, final)))
+    end
+    return final
 end
 
 function _binary_accessibility(matrix::SparseMatrixCSC{Int,Int})
-    dense = Matrix{Float64}(matrix .> 0)
-    return dense
+    rows, columns, values = findnz(matrix)
+    return sparse(rows, columns, ones(Float64, length(values)), size(matrix, 1), size(matrix, 2))
 end
 
 function tfidf(chromatin::SingleCellChromatinExperiment)
     binary = _binary_accessibility(chromatin.open_peaks)
-    tf = binary ./ max.(sum(binary, dims=1), eps(Float64))
-    idf = log.(1 .+ size(binary, 2) ./ (1 .+ vec(sum(binary, dims=2))))
-    return log1p.(tf .* reshape(idf, :, 1))
+    rows, columns, values = findnz(binary)
+    nrows, ncols = size(binary)
+    row_counts = zeros(Float64, nrows)
+    column_counts = zeros(Float64, ncols)
+
+    for position in eachindex(values)
+        row_counts[rows[position]] += 1
+        column_counts[columns[position]] += 1
+    end
+
+    idf = log.(1 .+ ncols ./ (1 .+ row_counts))
+    transformed = Vector{Float64}(undef, length(values))
+    for position in eachindex(values)
+        column = columns[position]
+        row = rows[position]
+        tf = 1 / max(column_counts[column], eps(Float64))
+        transformed[position] = log1p(tf * idf[row])
+    end
+    result = sparse(rows, columns, transformed, nrows, ncols)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "tfidf";
+        parameters=(n_peaks=nrows, n_cells=ncols, nnz=length(values)))
+    end
+    return result
 end
 
 function rsvd(matrix::AbstractMatrix{<:Real}; rank::Int=50, oversample::Int=10, n_iter::Int=2)
@@ -811,11 +955,12 @@ function rsvd(matrix::AbstractMatrix{<:Real}; rank::Int=50, oversample::Int=10, 
     b = q' * a
     svd_small = svd(b; full=false)
     components = min(rank, size(svd_small.V, 2))
+
     return q * svd_small.U[:, 1:components], svd_small.S[1:components], svd_small.V[:, 1:components]
 end
 
 function run_lsi(chromatin::SingleCellChromatinExperiment; n_components::Int=30, randomized::Bool=false)
-    matrix = tfidf(chromatin)
+    matrix = Matrix{Float64}(tfidf(chromatin))
     if randomized
         _, singular_values, right_vectors = rsvd(matrix; rank=n_components)
         embedding = right_vectors .* reshape(singular_values, 1, :) 
@@ -825,6 +970,7 @@ function run_lsi(chromatin::SingleCellChromatinExperiment; n_components::Int=30,
         embedding = svd_result.V[:, 1:components] * Diagonal(svd_result.S[1:components])
     end
     chromatin.reductions["lsi"] = Matrix{Float64}(embedding)
+
     return chromatin.reductions["lsi"]
 end
 
@@ -843,6 +989,7 @@ function gene_activity_score(chromatin::SingleCellChromatinExperiment, genes::Ab
             gene_matrix[gene_index, :] .+= peak_matrix[peak_index, :]
         end
     end
+
     return gene_matrix
 end
 
@@ -858,6 +1005,7 @@ function calculate_coaccessibility(chromatin::SingleCellChromatinExperiment; min
             length(edges) >= max_pairs && return edges
         end
     end
+
     return edges
 end
 
@@ -872,16 +1020,21 @@ function compute_motif_deviations(chromatin::SingleCellChromatinExperiment, moti
         spread = std(background)
         deviations[String(motif_name)] = spread > 0 ? (observed .- baseline) ./ spread : observed .- baseline
     end
+
     return deviations
 end
 
-struct FootprintResult
+struct FootprintResult <: AbstractAnalysisResult
     motif_id::String
     position::Int
     centrality::Float64
     flank_mean::Float64
     center_mean::Float64
+    provenance::ResultProvenance
 end
+
+FootprintResult(motif_id, position, centrality, flank_mean, center_mean) =
+    FootprintResult(motif_id, position, centrality, flank_mean, center_mean, provenance_record("FootprintResult", "epigenetics"))
 
 function detect_footprints(signal::AbstractVector{<:Real}, motif_positions::AbstractVector{<:Integer}; flank::Int=10, center::Int=2)
     results = FootprintResult[]
@@ -898,6 +1051,7 @@ function detect_footprints(signal::AbstractVector{<:Real}, motif_positions::Abst
         center_mean = mean(center_values)
         push!(results, FootprintResult("motif_$(position)", Int(position), flank_mean - center_mean, flank_mean, center_mean))
     end
+
     return results
 end
 
@@ -940,6 +1094,7 @@ function directionality_index(contact::ContactMatrix; window::Int=5)
             di[index] = sign(downstream - upstream) * ((downstream - upstream)^2) / (total + 1.0)
         end
     end
+
     return _moving_average(di, max(3, window))
 end
 
@@ -981,8 +1136,7 @@ function detect_tads(contact::ContactMatrix; window::Int=5, threshold::Real=1.0,
         [UInt8('L'), UInt8('N'), UInt8('R')],
         [0.05, 0.9, 0.05],
         [0.92 0.06 0.02; 0.03 0.94 0.03; 0.02 0.06 0.92],
-        [0.85 0.1 0.05; 0.15 0.7 0.15; 0.05 0.1 0.85],
-    )
+        [0.85 0.1 0.05; 0.15 0.7 0.15; 0.05 0.1 0.85])
     path, _ = viterbi(hmm, observations)
 
     tads = TadResult[]
@@ -1022,6 +1176,322 @@ function detect_tads(contact::ContactMatrix; window::Int=5, threshold::Real=1.0,
     end
 
     return _merge_tad_candidates(fallback)
+end
+
+function _epi_zscore_columns(x::AbstractMatrix{<:Real})
+    data = Matrix{Float64}(x)
+    for j in axes(data, 2)
+        col = @view data[:, j]
+        μ = mean(col)
+        σ = std(col)
+        if isfinite(σ) && σ > 0
+            col .= (col .- μ) ./ σ
+        else
+            col .= 0.0
+        end
+    end
+    return data
+end
+
+function _epi_kmeans_lloyd(x::AbstractMatrix{<:Real}, k::Int; max_iter::Int=50, seed::Int=1)
+    n = size(x, 1)
+    n >= k || throw(ArgumentError("k must be <= number of rows"))
+    rng = MersenneTwister(seed)
+    centers = Matrix{Float64}(x[rand(rng, 1:n, k), :])
+    labels = ones(Int, n)
+
+    for _ in 1:max_iter
+        changed = false
+        for i in 1:n
+            xi = @view x[i, :]
+            best = 1
+            bestd = Inf
+            for c in 1:k
+                d = sum(abs2, xi .- @view(centers[c, :]))
+                if d < bestd
+                    bestd = d
+                    best = c
+                end
+            end
+            if labels[i] != best
+                labels[i] = best
+                changed = true
+            end
+        end
+
+        for c in 1:k
+            idx = findall(==(c), labels)
+            if isempty(idx)
+                centers[c, :] .= x[rand(rng, 1:n), :]
+            else
+                centers[c, :] .= vec(mean(x[idx, :], dims=1))
+            end
+        end
+        !changed && break
+    end
+
+    return labels, centers
+end
+
+"""
+    chromhmm_like_segmentation(mark_matrix; n_states=15)
+
+ChromHMM-style state segmentation over bins using k-means state emission
+estimates and empirical transition probabilities.
+"""
+function chromhmm_like_segmentation(mark_matrix::AbstractMatrix{<:Real}; n_states::Int=15, seed::Int=1)
+    X = _epi_zscore_columns(mark_matrix)
+    labels, centers = _epi_kmeans_lloyd(X, n_states; seed=seed)
+
+    T = zeros(Float64, n_states, n_states)
+    for i in 1:(length(labels) - 1)
+        T[labels[i], labels[i + 1]] += 1
+    end
+    for i in 1:n_states
+        row_sum = sum(T[i, :])
+        if row_sum > 0
+            T[i, :] ./= row_sum
+        else
+            T[i, :] .= 1 / n_states
+        end
+    end
+
+    result_tuple = (state=labels, emissions=centers, transition=T)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "chromhmm_like_segmentation";
+        parameters=(n_states=n_states, n_bins=size(mark_matrix, 1), n_marks=size(mark_matrix, 2), seed=seed))
+    end
+    return result_tuple
+end
+
+"""
+    hic_ice_normalize(contact; max_iter=200, tol=1e-6)
+
+ICE-like iterative matrix balancing for Hi-C contact maps.
+"""
+function hic_ice_normalize(contact::AbstractMatrix{<:Real}; max_iter::Int=200, tol::Real=1e-6)
+    M = max.(Float64.(contact), 0.0)
+    n = size(M, 1)
+    size(M, 2) == n || throw(DimensionMismatch("contact matrix must be square"))
+    bias = ones(Float64, n)
+
+    for _ in 1:max_iter
+        row_sums = vec(sum(M, dims=2))
+        valid = row_sums .> 0
+        scale = ones(Float64, n)
+        scale[valid] .= 1.0 ./ row_sums[valid]
+        M = Diagonal(scale) * M * Diagonal(scale)
+        bias .*= scale
+        if any(valid) && maximum(abs.(row_sums[valid] .- mean(row_sums[valid]))) < Float64(tol)
+            break
+        end
+    end
+
+    return (normalized=M, bias=bias)
+end
+
+"""
+    hic_kr_normalize(contact; max_iter=200, tol=1e-6)
+
+Knight-Ruiz style matrix balancing for Hi-C contact maps.
+"""
+function hic_kr_normalize(contact::AbstractMatrix{<:Real}; max_iter::Int=200, tol::Real=1e-6)
+    M = max.(Float64.(contact), 0.0)
+    n = size(M, 1)
+    size(M, 2) == n || throw(DimensionMismatch("contact matrix must be square"))
+
+    bias = ones(Float64, n)
+    valid = vec(sum(M, dims=2)) .> 0
+
+    for _ in 1:max_iter
+        previous = copy(bias)
+        Mb = M * bias
+        for i in 1:n
+            if valid[i] && Mb[i] > 0
+                bias[i] /= sqrt(Mb[i])
+            end
+        end
+
+        s = bias[valid]
+        if !isempty(s)
+            gmean = exp(mean(log.(max.(s, eps(Float64)))))
+            gmean > 0 && (bias ./= gmean)
+        end
+
+        if maximum(abs.(bias .- previous)) < Float64(tol)
+            break
+        end
+    end
+
+    normalized = Diagonal(bias) * M * Diagonal(bias)
+
+    return (normalized=normalized, bias=bias)
+end
+
+"""
+    hic_ab_compartments(contact)
+
+A/B compartment calling from observed/expected transformed Hi-C matrix.
+"""
+function hic_ab_compartments(contact::AbstractMatrix{<:Real})
+    M = max.(Float64.(contact), 0.0)
+    n = size(M, 1)
+    size(M, 2) == n || throw(DimensionMismatch("contact matrix must be square"))
+
+    expected = zeros(Float64, n, n)
+    for d in 0:(n - 1)
+        vals = [M[i, i + d] for i in 1:(n - d)]
+        μ = isempty(vals) ? 1.0 : max(mean(vals), eps(Float64))
+        for i in 1:(n - d)
+            expected[i, i + d] = μ
+            expected[i + d, i] = μ
+        end
+    end
+
+    oe = log2.(M .+ 1.0) .- log2.(expected .+ 1.0)
+    c = cor(oe)
+    c[.!isfinite.(c)] .= 0.0
+    ev = eigen(Symmetric(c))
+    pc1 = ev.vectors[:, argmax(ev.values)]
+
+    return (pc1=pc1, compartment=ifelse.(pc1 .>= 0, "A", "B"))
+end
+
+"""
+    tobias_like_footprints(cut_profile, motif_centers)
+
+TOBIAS-style footprint depletion summary around motif centers.
+"""
+function tobias_like_footprints(cut_profile::AbstractVector{<:Real}, motif_centers::AbstractVector{<:Integer}; flank::Int=20, center_width::Int=10)
+    x = Float64.(cut_profile)
+    n = length(x)
+    flank >= 1 || throw(ArgumentError("flank must be >= 1"))
+    center_width >= 1 || throw(ArgumentError("center_width must be >= 1"))
+
+    out = DataFrame(center=Int[], flank_mean=Float64[], center_mean=Float64[], depletion_score=Float64[])
+    for c in motif_centers
+        left = max(1, c - flank)
+        right = min(n, c + flank)
+        center_left = max(1, c - div(center_width, 2))
+        center_right = min(n, c + div(center_width, 2))
+
+        flank_vals = vcat(x[left:(center_left - 1)], x[(center_right + 1):right])
+        center_vals = x[center_left:center_right]
+        fμ = isempty(flank_vals) ? 0.0 : mean(flank_vals)
+        cμ = isempty(center_vals) ? 0.0 : mean(center_vals)
+        push!(out, (Int(c), fμ, cμ, fμ - cμ))
+    end
+    sort!(out, :depletion_score, rev=true)
+
+    return out
+end
+
+"""
+    parse_bismark_coverage(lines)
+
+Parse Bismark-style coverage lines and summarize CpG/non-CpG methylation.
+"""
+function parse_bismark_coverage(lines::AbstractVector{<:AbstractString})
+    chrom = String[]
+    start = Int[]
+    stop = Int[]
+    methylation_pct = Float64[]
+    meth_count = Int[]
+    unmeth_count = Int[]
+    context = String[]
+
+    for line in lines
+        s = split(strip(String(line)), '\t')
+        length(s) < 6 && continue
+        push!(chrom, s[1])
+        push!(start, parse(Int, s[2]))
+        push!(stop, parse(Int, s[3]))
+        push!(methylation_pct, parse(Float64, s[4]))
+        push!(meth_count, parse(Int, s[5]))
+        push!(unmeth_count, parse(Int, s[6]))
+        push!(context, iseven(parse(Int, s[2])) ? "CpG" : "CHH")
+    end
+
+    df = DataFrame(
+        chrom=chrom,
+        start=start,
+        stop=stop,
+        methylation_pct=methylation_pct,
+        meth_count=meth_count,
+        unmeth_count=unmeth_count,
+        context=context)
+
+    summary = combine(groupby(df, :context),
+        :meth_count => sum => :meth,
+        :unmeth_count => sum => :unmeth)
+    summary[!, :beta] = summary.meth ./ max.(summary.meth .+ summary.unmeth, 1)
+
+    return (calls=df, summary=summary)
+end
+
+"""
+    insulation_score(contact; window=5)
+
+Compute insulation profile from local cross-boundary contact intensity.
+"""
+function insulation_score(contact::AbstractMatrix{<:Real}; window::Int=5)
+    M = max.(Float64.(contact), 0.0)
+    n = size(M, 1)
+    size(M, 2) == n || throw(DimensionMismatch("contact matrix must be square"))
+    window >= 1 || throw(ArgumentError("window must be >= 1"))
+
+    ins = fill(NaN, n)
+    for i in 1:n
+        left = max(1, i - window + 1):i
+        right_start = i + 1
+        right_stop = min(n, i + window)
+        if right_start > right_stop
+            continue
+        end
+        block = @view M[left, right_start:right_stop]
+        μ = mean(block)
+        ins[i] = log2(μ + 1.0)
+    end
+
+    finite = isfinite.(ins)
+    z = zeros(Float64, n)
+    if any(finite)
+        μ = mean(ins[finite])
+        σ = std(ins[finite])
+        if isfinite(σ) && σ > 0
+            z[finite] .= (ins[finite] .- μ) ./ σ
+        end
+    end
+
+    return DataFrame(bin=1:n, insulation=ins, zscore=z)
+end
+
+"""
+    compartment_boundary_candidates(insulation; q=0.2)
+
+Identify candidate boundaries as local minima in insulation tracks.
+"""
+function compartment_boundary_candidates(insulation; q::Real=0.2)
+    0.0 < q < 1.0 || throw(ArgumentError("q must be in (0, 1)"))
+    vals = insulation isa DataFrame ? Float64.(insulation.insulation) : Float64.(insulation)
+    n = length(vals)
+    n >= 3 || return DataFrame(bin=Int[], insulation=Float64[], is_boundary=Bool[])
+
+    finite = vals[isfinite.(vals)]
+    isempty(finite) && return DataFrame(bin=Int[], insulation=Float64[], is_boundary=Bool[])
+    cutoff = quantile(finite, Float64(q))
+
+    out = DataFrame(bin=Int[], insulation=Float64[], is_boundary=Bool[])
+    for i in 2:(n - 1)
+        v = vals[i]
+        isfinite(v) || continue
+        is_min = v <= vals[i - 1] && v <= vals[i + 1] && v <= cutoff
+        push!(out, (i, v, is_min))
+    end
+    sort!(out, :insulation)
+
+    return out
 end
 
 end

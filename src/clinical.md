@@ -1,52 +1,99 @@
-# clinical.jl
+# `clinical.jl` - Clinical Genomics and Survival Analysis
 
-## Purpose
-This file implements the clinical genomics layer of BioToolkit. It combines patient cohort management, survival analysis, Cox modeling, ROC and competing-risks summaries, MAF handling, and several clinically oriented plotting helpers.
+## Overview
 
-## Main structs
-- PatientCohort: links a clinical table with genomic data and stable patient IDs.
-- KaplanMeierResult: a survival curve with event times, survival probabilities, risk counts, and censoring information.
-- CoxTermResult: one term in a Cox proportional hazards model.
-- CoxResult: the complete Cox model output with all terms and baseline hazard data.
-- MAFRecord: one mutation annotation format record.
-- MAFSummary: aggregate mutation counts by sample, gene, and variant class.
-- ROCResult: survival ROC summary with thresholds, TPR, FPR, and AUC.
-- CIFResult: cumulative incidence function output for competing risks.
-- NeuralCoxResult: neural-network-style Cox model output.
-- DoseResponseResult: dose-response fitting output with Emax, EC50, Hill coefficient, and fitted values.
-- OncoprintResult: mutation matrix and labels for oncoprint-style display.
+`clinical.jl` supports cohort containers, MAF parsing, TCGA file utilities, Kaplan-Meier and Cox survival analysis, ROC/CIF curves, pharmacogenomics helpers, and clinical visualization payloads.
 
-## Public functions
-- read_maf and summarize_maf: parse MAF records and generate summaries.
-- tcga_query, tcga_download_files, merge_tcga_count_files, tcga_ingest: data acquisition and ingestion helpers for TCGA-style workflows.
-- kaplan_meier: build a KaplanMeierResult from time and status vectors.
-- logrank_test: compare survival curves between groups.
-- cox_ph: fit Cox proportional hazards models.
-- forest_plot: produce a forest plot from model terms.
-- survival_roc: compute a time-dependent survival ROC curve.
-- cif_curve: compute cumulative incidence curves.
-- neural_cox: fit a neural Cox model.
-- dose_response_curve: fit dose-response data.
-- oncoprint: build a mutation heatmap-style summary.
+### Purpose
 
-## What the module does
-The module turns clinical and genomic data into interpretable statistical objects. It validates cohort structure, handles survival event coding, supports modeling across patient groups, and returns compact result types that can be plotted or further summarized.
+This page documents the public surface of `clinical.jl`: the result types, workflow functions, and helper APIs a BioToolkit user is expected to call directly. Private helpers are intentionally omitted unless they define behavior users must understand.
 
-## Typical usage
-1. Create a PatientCohort from a clinical DataFrame and a matching genomic matrix.
-2. Use kaplan_meier or cox_ph to build survival results.
-3. Use logrank_test to compare groups and survival_roc or cif_curve to inspect predictive performance or competing risks.
-4. Use read_maf and summarize_maf to inspect mutation burden and variant distribution.
-5. Use dose_response_curve or oncoprint for response and alteration summaries.
+---
 
-## Plotting helpers
-This file also contains the main clinical plotting API. Kaplan-Meier, forest, ROC, CIF, dose-response, and oncoprint figures are meant to be generated from the corresponding result types, and the plotting extension layer can reuse those results directly.
+## Design Decisions
 
-## Important implementation details
-- _clamp_probability keeps p-values and probabilities numerically stable.
-- _clinical_index and _cohort_view support patient-level lookup and subsetting.
-- _sorted_event_data, _validated_group_levels, and _count_tie_events support survival calculations.
-- _km_survival_at and _km_plot_data support Kaplan-Meier plotting and censor alignment.
+| Decision | Rationale |
+|---|---|
+| **Structured domain outputs** | Stable results are returned as structs, named tuples, or table-friendly payloads. |
+| **Composable Julia inputs** | APIs favor ordinary arrays, matrices, dictionaries, BioToolkit records, and DataFrames. |
+| **Workflow granularity** | Each public function maps to a recognizable analysis or data-preparation step. |
+| **Optional external integration** | Wrapper-style functions prepare command inputs or parse results without making all workflows depend on external tools. |
+| **Reporting-ready summaries** | Many functions return data that can be plotted, exported, or passed into downstream modules. |
 
-## Why this file matters
-This module is the clinical analysis hub for BioToolkit. It keeps patient-level data, survival models, mutation summaries, and clinical plots aligned so the package can move from cohort input to publication-ready clinical interpretation.
+---
+
+## 1. Core Types
+
+These containers hold clinical cohorts, mutation summaries, and model outputs.
+
+| API | Description |
+|---|---|
+| `PatientCohort` | Patient/sample table with outcomes, covariates, and molecular annotations. |
+| `KaplanMeierResult` | Survival curve estimates by group. |
+| `CoxResult` | Cox model result with fitted terms and diagnostics. |
+| `CoxTermResult` | One Cox coefficient, hazard ratio, interval, and p-value. |
+| `MAFRecord` | One mutation annotation format record. |
+| `MAFSummary` | Per-sample/per-gene mutation summary. |
+| `ROCResult` | Sensitivity/specificity curve and AUC metadata. |
+| `CIFResult` | Cumulative incidence function estimate. |
+| `NeuralCoxResult` | Neural survival-model output. |
+| `DoseResponseResult` | Dose-response fit and IC/EC-style summaries. |
+| `OncoprintResult` | Matrix and annotation payload for oncoprints. |
+
+## 2. Mutation and TCGA
+
+MAF and TCGA helpers turn public cancer-genomics files into analysis-ready tables.
+
+| API | Description |
+|---|---|
+| `read_maf` | Reads MAF records from a file or stream. |
+| `summarize_maf` | Summarizes mutation burden, top genes, variant classes, and samples. |
+| `tcga_query` | Builds a TCGA/GDC query description. |
+| `tcga_download_files` | Downloads or stages files from a TCGA query result. |
+| `merge_tcga_count_files` | Merges TCGA count files into a count matrix. |
+| `tcga_ingest` | Runs query, download/staging, merge, and metadata assembly. |
+
+## 3. Survival and Clinical Models
+
+Model helpers return result objects and plotting payloads.
+
+| API | Description |
+|---|---|
+| `kaplan_meier` | Computes Kaplan-Meier survival estimates. |
+| `kaplan_meier_plot` | Builds a plot-ready survival curve payload. |
+| `logrank_test` | Compares survival curves with a log-rank test. |
+| `cox_ph` | Fits Cox proportional hazards models. |
+| `forest_plot` | Creates forest-plot data from Cox or other interval results. |
+| `survival_roc` | Computes time-dependent survival ROC summaries. |
+| `cif_curve` | Estimates cumulative incidence under competing risks. |
+| `neural_cox` | Fits a compact neural Cox-style model. |
+| `dose_response_curve` | Fits and summarizes dose-response data. |
+| `oncoprint` | Builds an alteration matrix for cohort-level mutation display. |
+
+## 4. Pharmacogenomics and Cohorts
+
+These helpers support translational cohort interpretation.
+
+| API | Description |
+|---|---|
+| `pharmacogenomics_star_alleles` | Calls or summarizes star-allele diplotypes from variant inputs. |
+| `cpic_metabolizer_phenotype` | Maps diplotypes to CPIC-like metabolizer phenotypes. |
+| `pharmgkb_like_recommendations` | Creates PharmGKB-style drug/gene recommendation summaries. |
+| `trial_suitability_scores` | Scores patient records against trial inclusion/exclusion features. |
+| `propensity_score_match` | Performs simple propensity-score matching. |
+| `omop_visit_summary` | Summarizes OMOP visit records. |
+| `synthpop_like_cohort` | Generates synthetic cohort-like tables for testing workflows. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+maf = read_maf("cohort.maf")
+summary = summarize_maf(maf)
+km = kaplan_meier(times, events, groups)
+fit = cox_ph(cohort, :survival_time, :event; covariates=[:age, :stage])
+```
+

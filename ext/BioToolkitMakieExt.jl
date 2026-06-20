@@ -3,7 +3,7 @@ module BioToolkitMakieExt
 using BioToolkit
 using Makie
 
-import BioToolkit: render!, _render_axis!, GenomeBrowser, GenomeViewport, GeneTrack, CoverageTrack, AlignmentTrack
+import BioToolkit: render!, _render_axis!, GenomeBrowser, GenomeViewport, GeneTrack, CoverageTrack, AlignmentTrack, SingleCellViewer, interactive_singlecell_viewer, cell_hover_text, recluster_singlecell_viewer!
 
 function _browser_figure(browser::GenomeBrowser)
     rows = max(length(browser.tracks), 1)
@@ -33,6 +33,27 @@ end
 
 function Base.display(browser::GenomeBrowser)
     display(_browser_figure(browser))
+end
+
+function _viewer_figure(viewer::SingleCellViewer)
+    coordinates = viewer.embedding[:, 1:2]
+    label_state = Observable(copy(viewer.cluster_labels))
+    figure = Makie.Figure(resolution=(900, 700), fontsize=14)
+    axis = Makie.Axis(figure[1, 1]; title=viewer.title, xlabel="embedding 1", ylabel="embedding 2")
+    scatter = Makie.scatter!(axis, coordinates[:, 1], coordinates[:, 2]; color=label_state, markersize=8, inspectable=true, inspector_label = (plot, index, position) -> cell_hover_text(viewer, index))
+    slider_label = Makie.Label(figure[2, 1], "resolution k = $(viewer.k)")
+    slider = Makie.Slider(figure[3, 1], range=5:1:max(5, min(50, size(viewer.embedding, 1))), startvalue=viewer.k)
+    Makie.on(slider.value) do value
+        k = Int(round(value))
+        recluster_singlecell_viewer!(viewer; k=k)
+        label_state[] = copy(viewer.cluster_labels)
+        slider_label.text = "resolution k = $(k)"
+    end
+    return figure
+end
+
+function Base.display(viewer::SingleCellViewer)
+    display(_viewer_figure(viewer))
 end
 
 end

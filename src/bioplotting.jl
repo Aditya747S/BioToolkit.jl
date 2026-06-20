@@ -6,6 +6,8 @@ using Plots
 using Distributions
 
 using ..GWAS: GWASResult, MetaAnalysisResult
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id
+import ..BioToolkit: ProvenanceContext, analysis_result_fields, analysis_result_summary, container_provenance_summary, ensure_provenance_id!, provenance_result!, provenance_parent_ids, register_container_provenance!, register_provenance!
 
 export VolcanoPoint, VolcanoPlotResult, MAPoint, MAPlotResult, ClusteredHeatmapResult
 export ManhattanPoint, ManhattanPlotResult, QQPoint, QQPlotResult, ForestPoint, ForestPlotResult
@@ -32,26 +34,41 @@ struct MAPoint
     category::Symbol
 end
 
-struct VolcanoPlotResult
+struct VolcanoPlotResult <: AbstractAnalysisResult
     points::Vector{VolcanoPoint}
     summary::NamedTuple
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
 end
 
-struct MAPlotResult
+VolcanoPlotResult(points, summary, figure, metadata) =
+    VolcanoPlotResult(points, summary, figure, metadata, provenance_record("VolcanoPlotResult", "bioplotting"))
+
+struct MAPlotResult <: AbstractAnalysisResult
     points::Vector{MAPoint}
     summary::NamedTuple
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
 end
 
-struct ClusteredHeatmapResult
+MAPlotResult(points, summary, figure, metadata) =
+    MAPlotResult(points, summary, figure, metadata, provenance_record("MAPlotResult", "bioplotting"))
+
+struct ClusteredHeatmapResult <: AbstractAnalysisResult
     matrix::Matrix{Float64}
     row_order::Vector{Int}
     column_order::Vector{Int}
     row_labels::Vector{String}
     column_labels::Vector{String}
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
 end
+
+ClusteredHeatmapResult(matrix, row_order, column_order, row_labels, column_labels, figure, metadata) =
+    ClusteredHeatmapResult(matrix, row_order, column_order, row_labels, column_labels, figure, metadata, provenance_record("ClusteredHeatmapResult", "bioplotting"))
 
 struct ManhattanPoint
     snp_id::String
@@ -80,22 +97,85 @@ struct ForestPoint
     qvalue::Float64
 end
 
-struct ManhattanPlotResult
+struct ManhattanPlotResult <: AbstractAnalysisResult
     points::Vector{ManhattanPoint}
     summary::NamedTuple
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
 end
 
-struct QQPlotResult
+ManhattanPlotResult(points, summary, figure, metadata) =
+    ManhattanPlotResult(points, summary, figure, metadata, provenance_record("ManhattanPlotResult", "bioplotting"))
+
+struct QQPlotResult <: AbstractAnalysisResult
     points::Vector{QQPoint}
     summary::NamedTuple
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
 end
 
-struct ForestPlotResult
+QQPlotResult(points, summary, figure, metadata) =
+    QQPlotResult(points, summary, figure, metadata, provenance_record("QQPlotResult", "bioplotting"))
+
+struct ForestPlotResult <: AbstractAnalysisResult
     points::Vector{ForestPoint}
     summary::NamedTuple
     figure::Any
+    metadata::Dict{Symbol,Any}
+    provenance::ResultProvenance
+end
+
+ForestPlotResult(points, summary, figure, metadata) =
+    ForestPlotResult(points, summary, figure, metadata, provenance_record("ForestPlotResult", "bioplotting"))
+
+@inline function _plot_result_metadata(metadata::AbstractDict=Dict{Symbol,Any}())
+    metadata_copy = Dict{Symbol,Any}(metadata)
+    ensure_provenance_id!(metadata_copy)
+    return metadata_copy
+end
+
+VolcanoPlotResult(points::Vector{VolcanoPoint}, summary::NamedTuple, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = VolcanoPlotResult(points, summary, figure, _plot_result_metadata(metadata))
+MAPlotResult(points::Vector{MAPoint}, summary::NamedTuple, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = MAPlotResult(points, summary, figure, _plot_result_metadata(metadata))
+ClusteredHeatmapResult(matrix::Matrix{Float64}, row_order::Vector{Int}, column_order::Vector{Int}, row_labels::Vector{String}, column_labels::Vector{String}, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = ClusteredHeatmapResult(matrix, row_order, column_order, row_labels, column_labels, figure, _plot_result_metadata(metadata))
+ManhattanPlotResult(points::Vector{ManhattanPoint}, summary::NamedTuple, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = ManhattanPlotResult(points, summary, figure, _plot_result_metadata(metadata))
+QQPlotResult(points::Vector{QQPoint}, summary::NamedTuple, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = QQPlotResult(points, summary, figure, _plot_result_metadata(metadata))
+ForestPlotResult(points::Vector{ForestPoint}, summary::NamedTuple, figure; metadata::AbstractDict=Dict{Symbol,Any}()) = ForestPlotResult(points, summary, figure, _plot_result_metadata(metadata))
+
+analysis_result_fields(::Type{VolcanoPlotResult}) = (:points, :summary, :figure)
+analysis_result_fields(::Type{MAPlotResult}) = (:points, :summary, :figure)
+analysis_result_fields(::Type{ClusteredHeatmapResult}) = (:matrix, :row_order, :column_order, :row_labels, :column_labels, :figure)
+analysis_result_fields(::Type{ManhattanPlotResult}) = (:points, :summary, :figure)
+analysis_result_fields(::Type{QQPlotResult}) = (:points, :summary, :figure)
+analysis_result_fields(::Type{ForestPlotResult}) = (:points, :summary, :figure)
+
+function Base.show(io::IO, result::VolcanoPlotResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, result::MAPlotResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, result::ClusteredHeatmapResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, result::ManhattanPlotResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, result::QQPlotResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, result::ForestPlotResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+@inline function _plot_result_finalize(result, _ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, parents, operation::AbstractString, parameters)
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
 end
 
 function _safe_probability(value::Real)
@@ -133,8 +213,8 @@ function volcano_data(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, labe
         total = length(points),
         significant = count(point -> point.category != :neutral, points),
         upregulated = count(point -> point.category == :up, points),
-        downregulated = count(point -> point.category == :down, points),
-    )
+        downregulated = count(point -> point.category == :down, points))
+
     return points, summary
 end
 
@@ -161,8 +241,8 @@ function ma_data(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, threaded:
     end
     summary = (
         total = length(points),
-        significant = count(point -> point.category == :significant, points),
-    )
+        significant = count(point -> point.category == :significant, points))
+
     return points, summary
 end
 
@@ -271,13 +351,13 @@ function _reorder_labels(labels, order::Vector{Int})
     return [String(labels[index]) for index in order]
 end
 
-function _save_plots_figure(path::Union{Nothing,AbstractString}, figure)
+function _save_plots_figure(path::Union{Nothing,String}, figure)
     path === nothing && return nothing
     savefig(figure, path)
     return path
 end
 
-function volcano_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, label_top::Integer=10, title::AbstractString="Volcano plot", size=(980, 700), save_path::Union{Nothing,AbstractString}=nothing, kwargs...)
+function volcano_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, label_top::Integer=10, title::String="Volcano plot", size=(980, 700), save_path::Union{Nothing,String}=nothing, kwargs...)
     points, summary = volcano_data(results; lfc_cutoff=lfc_cutoff, fdr_cutoff=fdr_cutoff, label_top=label_top)
     figure = plot(; title=title, xlabel="log2 fold change", ylabel="-log10 p-value", size=size, legend=:outerright, background_color=:white, left_margin=15Plots.mm, bottom_margin=15Plots.mm, top_margin=10Plots.mm, right_margin=28Plots.mm, kwargs...)
     palette = Dict(:up => :firebrick, :down => :royalblue, :neutral => :gray)
@@ -295,10 +375,18 @@ function volcano_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, labe
         annotate!(figure, point.log2_fold_change, point.negative_log10_pvalue + offset_y, text(point.gene_id, 7, :black, :center, :bottom; rotation=90))
     end
     _save_plots_figure(save_path, figure)
-    return VolcanoPlotResult(points, summary, figure)
+    result = VolcanoPlotResult(points, summary, figure)
+    provenance_parameters = Dict{Any,Any}(kwargs)
+    provenance_parameters[:lfc_cutoff] = lfc_cutoff
+    provenance_parameters[:fdr_cutoff] = fdr_cutoff
+    provenance_parameters[:label_top] = label_top
+    provenance_parameters[:title] = title
+    provenance_parameters[:size] = size
+    _ctx = active_provenance_context()
+    return _plot_result_finalize(result, _ctx, provenance_parent_ids(results), "volcano_plot", provenance_parameters)
 end
 
-function ma_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, title::AbstractString="MA plot", size=(900, 660), save_path::Union{Nothing,AbstractString}=nothing, kwargs...)
+function ma_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, title::String="MA plot", size=(900, 660), save_path::Union{Nothing,String}=nothing, kwargs...)
     points, summary = ma_data(results; lfc_cutoff=lfc_cutoff, fdr_cutoff=fdr_cutoff)
     figure = plot(; title=title, xlabel="log2 abundance", ylabel="log2 fold change", size=size, legend=:topright, background_color=:white, left_margin=15Plots.mm, bottom_margin=15Plots.mm, top_margin=10Plots.mm, kwargs...)
     palette = Dict(:significant => :darkmagenta, :background => :slategray)
@@ -310,10 +398,17 @@ function ma_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, title::Ab
     end
     hline!(figure, [0.0]; color=:gray, linestyle=:dash, label=false)
     _save_plots_figure(save_path, figure)
-    return MAPlotResult(points, summary, figure)
+    result = MAPlotResult(points, summary, figure)
+    provenance_parameters = Dict{Any,Any}(kwargs)
+    provenance_parameters[:lfc_cutoff] = lfc_cutoff
+    provenance_parameters[:fdr_cutoff] = fdr_cutoff
+    provenance_parameters[:title] = title
+    provenance_parameters[:size] = size
+    _ctx = active_provenance_context()
+    return _plot_result_finalize(result, _ctx, provenance_parent_ids(results), "ma_plot", provenance_parameters)
 end
 
-function clustered_heatmap(matrix::AbstractMatrix{<:Real}; row_labels=nothing, column_labels=nothing, scale::Symbol=:row, metric::Symbol=:correlation, title::AbstractString="Clustered heatmap", size=(1080, 740), save_path::Union{Nothing,AbstractString}=nothing, kwargs...)
+function clustered_heatmap(matrix::AbstractMatrix{<:Real}; row_labels=nothing, column_labels=nothing, scale::Symbol=:row, metric::Symbol=:correlation, title::String="Clustered heatmap", size=(1080, 740), save_path::Union{Nothing,String}=nothing, kwargs...)
     scaled = _scale_matrix(matrix; scale=scale)
     row_order = _hierarchical_order(scaled; metric=metric)
     column_order = _hierarchical_order(permutedims(scaled); metric=metric)
@@ -325,17 +420,25 @@ function clustered_heatmap(matrix::AbstractMatrix{<:Real}; row_labels=nothing, c
     yticks!(figure, (1:length(row_names), row_names))
     plot!(figure; xrotation=45)
     _save_plots_figure(save_path, figure)
-    return ClusteredHeatmapResult(reordered, row_order, column_order, row_names, column_names, figure)
+    result = ClusteredHeatmapResult(reordered, row_order, column_order, row_names, column_names, figure)
+    provenance_parameters = Dict{Any,Any}(kwargs)
+    provenance_parameters[:scale] = scale
+    provenance_parameters[:metric] = metric
+    provenance_parameters[:title] = title
+    provenance_parameters[:size] = size
+    _ctx = active_provenance_context()
+    return _plot_result_finalize(result, _ctx, provenance_parent_ids(matrix), "clustered_heatmap", provenance_parameters)
 end
 
-function export_plot(result, save_path::AbstractString)
+function export_plot(result, save_path::String)
     result isa VolcanoPlotResult && result.figure !== nothing && savefig(result.figure, save_path)
     result isa MAPlotResult && result.figure !== nothing && savefig(result.figure, save_path)
     result isa ClusteredHeatmapResult && result.figure !== nothing && savefig(result.figure, save_path)
+
     return save_path
 end
 
-function _chromosome_key(chromosome::AbstractString)
+function _chromosome_key(chromosome::String)
     stripped = replace(lowercase(String(chromosome)), "chr" => "")
     parsed = tryparse(Int, stripped)
     return parsed === nothing ? typemax(Int) : parsed
@@ -395,8 +498,8 @@ function manhattan_data(result::GWASResult; pvalue_threshold::Real=5e-8, label_t
         total = length(points),
         significant = count(point -> point.category == :significant, points),
         chromosomes = length(order),
-        span = total_span,
-    )
+        span = total_span)
+
     return points, summary
 end
 
@@ -418,7 +521,11 @@ function manhattan_plot(result::GWASResult; pvalue_threshold::Real=5e-8, label_t
         annotate!(figure, [(point.cumulative_position, point.negative_log10_pvalue, text(point.snp_id, 7, "#000000", halign=:left)) for point in labeled])
     end
     hline!(figure, [-log10(clamp(Float64(pvalue_threshold), eps(Float64), 1.0))]; linestyle=:dash, color="#7d1f2f", linewidth=1.5)
-    return ManhattanPlotResult(points, summary, figure)
+    result_plot = ManhattanPlotResult(points, summary, figure)
+    _ctx = active_provenance_context()
+
+
+    return _plot_result_finalize(result_plot, _ctx, provenance_parent_ids(result), "manhattan_plot", (pvalue_threshold=pvalue_threshold, label_top=label_top))
 end
 
 function qq_data(result::GWASResult; threaded::Bool=true)
@@ -443,8 +550,8 @@ function qq_data(result::GWASResult; threaded::Bool=true)
     lambda_gc = isempty(chisq) ? 1.0 : median(chisq) / 0.4549364
     summary = (
         total = n,
-        lambda_gc = lambda_gc,
-    )
+        lambda_gc = lambda_gc)
+
     return points, summary
 end
 
@@ -463,7 +570,11 @@ function qq_plot(result::GWASResult)
     scatter!(figure, xs, ys; color="#173f5f", markersize=4.2, markerstrokewidth=0, xlabel="expected -log10(p)", ylabel="observed -log10(p)", title="QQ plot")
     max_value = isempty(points) ? 1.0 : max(maximum(xs), maximum(ys))
     plot!(figure, [0.0, max_value], [0.0, max_value]; color="#7a7a7a", linestyle=:dash, linewidth=1.4)
-    return QQPlotResult(points, summary, figure)
+    result_plot = QQPlotResult(points, summary, figure)
+    _ctx = active_provenance_context()
+
+
+    return _plot_result_finalize(result_plot, _ctx, provenance_parent_ids(result), "qq_plot", NamedTuple())
 end
 
 function gwas_forest_plot(result::MetaAnalysisResult; threaded::Bool=true)
@@ -502,9 +613,12 @@ function gwas_forest_plot(result::MetaAnalysisResult; threaded::Bool=true)
     summary = (
         total = length(selected),
         study_count = result.study_count,
-        random_effects = result.method == "random_effects",
-    )
-    return ForestPlotResult(selected, summary, figure)
+        random_effects = result.method == "random_effects")
+    result_plot = ForestPlotResult(selected, summary, figure)
+    _ctx = active_provenance_context()
+
+
+    return _plot_result_finalize(result_plot, _ctx, provenance_parent_ids(result), "gwas_forest_plot", (threaded=threaded,))
 end
 
 end

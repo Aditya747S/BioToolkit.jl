@@ -1,5 +1,21 @@
+# ==============================================================================
+# structure.jl — Macromolecular structure analysis
+#
+# Provides PDB/mmCIF I/O, atom/residue/chain/model hierarchy, Kabsch
+# superposition, RMSD computation, KD-tree spatial queries, DSSP secondary
+# structure, hydrogen bond detection, and Ramachandran analysis.
+#
+# References:
+#   - Kabsch (1976) Acta Cryst A32:922-923 (optimal rotation)
+#   - Kabsch (1978) Acta Cryst A34:827-828 (algorithm W)
+#   - Ramachandran et al. (1963) JMB 7(1):95-99 (Ramachandran plot)
+#   - Kabsch & Sander (1983) Biopolymers 22(12):2577-2637 (DSSP)
+# ==============================================================================
+
 using Printf
 using Statistics
+using SHA
+using ..BioToolkit: AbstractAnalysisResult, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_container_provenance!, register_provenance!
 
 export Atom, Residue, Chain, Model, Structure, SuperpositionResult, AtomKDTree, DSSPEntry
 export read_pdb, read_mmcif, write_pdb, write_mmcif
@@ -81,11 +97,15 @@ end
 
 AtomSelectionPolicy(; altloc::Symbol=:highest_occupancy, occupancy::Symbol=:highest, insertion_code::Symbol=:keep) = AtomSelectionPolicy(altloc, occupancy, insertion_code)
 
-struct SuperpositionResult
+struct SuperpositionResult <: AbstractAnalysisResult
     rotation::Matrix{Float64}
     translation::Vector{Float64}
     rmsd::Float64
+    provenance::ResultProvenance
 end
+
+SuperpositionResult(rotation, translation, rmsd) =
+    SuperpositionResult(rotation, translation, rmsd, provenance_record("SuperpositionResult", "structure"))
 
 mutable struct KDTreeNode{T}
     point::NTuple{3,Float64}
@@ -123,17 +143,21 @@ struct HydrogenBond
     angle::Float64
 end
 
-Structure(id::AbstractString; metadata::AbstractDict=Dict{String,String}()) = Structure(String(id), Model[], Dict{String,String}(string(key) => string(value) for (key, value) in metadata))
+Structure(id::String; metadata::AbstractDict=Dict{String,String}()) = Structure(String(id), Model[], Dict{String,String}(string(key) => string(value) for (key, value) in metadata))
 Model(id::Integer) = Model(Int(id), Chain[])
-Chain(id::AbstractString) = Chain(String(id), Residue[])
-Residue(name::AbstractString, seqnum::Integer, insertion_code::Char=' '; secondary_structure::Union{Missing,Char}=missing, accessibility::Union{Missing,Real}=missing, atoms::AbstractVector{Atom}=Atom[]) = Residue(String(name), Int(seqnum), insertion_code, secondary_structure, accessibility === missing ? missing : Float64(accessibility), Vector{Atom}(atoms))
-Residue(name::AbstractString, seqnum::Integer, insertion_code::Char, atoms::AbstractVector{Atom}) = Residue(String(name), Int(seqnum), insertion_code, missing, missing, Vector{Atom}(atoms))
-Atom(serial::Integer, name::AbstractString, x::Real, y::Real, z::Real; altloc::Char=' ', element::AbstractString="", occupancy::Real=1.0, bfactor::Real=0.0, charge::AbstractString="", hetatm::Bool=false) = Atom(Int(serial), String(name), altloc, String(element), Float64(x), Float64(y), Float64(z), Float64(occupancy), Float64(bfactor), String(charge), Bool(hetatm))
+Chain(id::String) = Chain(String(id), Residue[])
+Residue(name::String, seqnum::Integer, insertion_code::Char=' '; secondary_structure::Union{Missing,Char}=missing, accessibility::Union{Missing,Real}=missing, atoms::AbstractVector{Atom}=Atom[]) = Residue(String(name), Int(seqnum), insertion_code, secondary_structure, accessibility === missing ? missing : Float64(accessibility), Vector{Atom}(atoms))
+Residue(name::String, seqnum::Integer, insertion_code::Char, atoms::AbstractVector{Atom}) = Residue(String(name), Int(seqnum), insertion_code, missing, missing, Vector{Atom}(atoms))
+Atom(serial::Integer, name::String, x::Real, y::Real, z::Real; altloc::Char=' ', element::String="", occupancy::Real=1.0, bfactor::Real=0.0, charge::String="", hetatm::Bool=false) = Atom(Int(serial), String(name), altloc, String(element), Float64(x), Float64(y), Float64(z), Float64(occupancy), Float64(bfactor), String(charge), Bool(hetatm))
 
 function _metadata_append!(metadata::Dict{String,String}, key::AbstractString, value::AbstractString)
     existing = get(metadata, String(key), "")
     metadata[String(key)] = isempty(existing) ? String(value) : string(existing, "\n", value)
     return metadata
+end
+
+function _metadata_push_line!(metadata::Dict{String,String}, key::String, value::String)
+    _metadata_append!(metadata, key, strip(String(value)))
 end
 
 function _metadata_push_line!(metadata::Dict{String,String}, key::AbstractString, value::AbstractString)
@@ -150,8 +174,20 @@ Base.show(io::IO, residue::Residue) = print(io, "Residue(", residue.name, residu
 Base.show(io::IO, chain::Chain) = print(io, "Chain(", chain.id, ", residues=", length(chain.residues), ")")
 Base.show(io::IO, model::Model) = print(io, "Model(", model.id, ", chains=", length(model.chains), ")")
 Base.show(io::IO, structure::Structure) = print(io, "Structure(", structure.id, ", models=", length(structure.models), ")")
-Base.show(io::IO, result::SuperpositionResult) = print(io, "SuperpositionResult(rmsd=", round(result.rmsd, digits=4), ")")
+Base.show(io::IO, result::SuperpositionResult) = print(io, analysis_result_summary(result))
 Base.show(io::IO, tree::AtomKDTree) = print(io, "AtomKDTree(", tree.root === nothing ? 0 : 1, ")")
+
+# ─── Provenance helper ──────────────────────────────────────────────────────────
+
+"""
+    _register_structure_result!(_ctx, result, label; parents=String[], parameters=NamedTuple())
+
+Register a structure-domain provenance node with meaningful context parameters.
+Returns `result` unchanged (pass-through for composability).
+"""
+function _register_structure_result!(_ctx, result, label::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters::NamedTuple=NamedTuple())
+    return provenance_result!(_ctx, result, label; parents=parents, parameters=parameters)
+end
 
 structure_models(structure::Structure) = structure.models
 structure_chains(model::Model) = model.chains
@@ -167,7 +203,8 @@ function structure_atoms(structure::Structure)
             end
         end
     end
-    return atoms
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, atoms, "structure_atoms"; parameters=(n_atoms=length(atoms),))
 end
 
 const _AA3_TO1 = Dict{String,Char}(
@@ -185,6 +222,7 @@ const _POLAR_RESIDUES = Set(["ASN", "GLN", "SER", "THR", "CYS", "TYR", "HIS"])
 const _WATER_RESIDUES = Set(["HOH", "H2O", "WAT", "DOD", "TIP", "SOL", "OH2"])
 
 function residue_one_letter(residue::Residue)
+
     return get(_AA3_TO1, uppercase(residue.name), 'X')
 end
 
@@ -193,22 +231,25 @@ function sequence_from_structure(chain::Chain)
     for residue in chain.residues
         print(io, residue_one_letter(residue))
     end
-    return String(take!(io))
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, AASeq(String(take!(io))), "sequence_from_structure"; parameters=(chain_id=chain.id,))
 end
 
 function sequence_from_structure(structure::Structure; model_index::Int=1)
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
-    return join(sequence_from_structure(chain) for chain in structure.models[model_index].chains)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, AASeq(join(String(sequence_from_structure(chain)) for chain in structure.models[model_index].chains)), "sequence_from_structure")
 end
 
 function structure_sequences(structure::Structure)
-    sequences = Dict{String,String}()
+    sequences = Dict{String,AASeq}()
     for model in structure.models
         for chain in model.chains
             sequences[string(model.id, ":", chain.id)] = sequence_from_structure(chain)
         end
     end
-    return sequences
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, sequences, "structure_sequences"; parameters=(n_sequences=length(sequences),))
 end
 
 const _ATOMIC_MASS = Dict{String,Float64}(
@@ -222,8 +263,7 @@ const _ATOMIC_MASS = Dict{String,Float64}(
     "F" => 18.998,
     "CL" => 35.45,
     "BR" => 79.904,
-    "I" => 126.904,
-)
+    "I" => 126.904)
 
 function _atom_element_symbol(atom::Atom)
     element = uppercase(strip(atom.element))
@@ -238,7 +278,8 @@ function atomic_mass(atom::Atom)
         isempty(cleaned) && return 12.0
         element = uppercase(string(cleaned[1]))
     end
-    return get(_ATOMIC_MASS, element, 12.0)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, get(_ATOMIC_MASS, element, 12.0), "atomic_mass")
 end
 
 function _entity_atoms(entity)
@@ -265,7 +306,8 @@ function center_of_mass(entity)
         z += atom.z * mass
     end
     total_mass == 0 && return (x=0.0, y=0.0, z=0.0)
-    return (x=x / total_mass, y=y / total_mass, z=z / total_mass)
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, (x=x / total_mass, y=y / total_mass, z=z / total_mass), "center_of_mass"; parameters=(total_mass=total_mass, n_atoms=length(atoms)))
 end
 
 function bounding_box(entity)
@@ -285,7 +327,8 @@ function bounding_box(entity)
         min_z = min(min_z, atom.z)
         max_z = max(max_z, atom.z)
     end
-    return (min=(min_x, min_y, min_z), max=(max_x, max_y, max_z))
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (min=(min_x, min_y, min_z), max=(max_x, max_y, max_z)), "bounding_box")
 end
 
 function radius_of_gyration(entity)
@@ -303,7 +346,8 @@ function radius_of_gyration(entity)
         weighted_sum += mass * (dx * dx + dy * dy + dz * dz)
     end
     total_mass == 0 && return 0.0
-    return sqrt(weighted_sum / total_mass)
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, sqrt(weighted_sum / total_mass), "radius_of_gyration"; parameters=(n_atoms=length(atoms), total_mass=total_mass))
 end
 
 function _pairwise_distance_matrix(points::AbstractVector{<:Any}; threaded::Bool=true)
@@ -338,19 +382,20 @@ end
 
 function atom_distance_matrix(atoms::AbstractVector{Atom}; threaded::Bool=true)
     points = [(atom.x, atom.y, atom.z) for atom in atoms]
-    return _pairwise_distance_matrix(points; threaded=threaded)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, _pairwise_distance_matrix(points; threaded=threaded), "atom_distance_matrix")
 end
 
 atom_distance_matrix(structure::Structure; threaded::Bool=true) = atom_distance_matrix(structure_atoms(structure); threaded=threaded)
 
-function _residue_reference_point(residue::Residue; atom_name::AbstractString="CA")
+function _residue_reference_point(residue::Residue; atom_name::String="CA")
     atom = _residue_atom(residue, atom_name)
     atom !== nothing && return atom_coordinates(atom)
     isempty(residue.atoms) && return nothing
     return _residue_center(residue)
 end
 
-function residue_distance_matrix(chain::Chain; atom_name::AbstractString="CA", threaded::Bool=true)
+function residue_distance_matrix(chain::Chain; atom_name::String="CA", threaded::Bool=true)
     labels = String[]
     points = NTuple{3,Float64}[]
     for residue in chain.residues
@@ -360,10 +405,11 @@ function residue_distance_matrix(chain::Chain; atom_name::AbstractString="CA", t
         push!(points, point)
     end
     matrix = _pairwise_distance_matrix(points; threaded=threaded)
-    return (matrix=matrix, labels=labels)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (matrix=matrix, labels=labels), "residue_distance_matrix")
 end
 
-function residue_distance_matrix(structure::Structure; model_index::Int=1, atom_name::AbstractString="CA", threaded::Bool=true)
+function residue_distance_matrix(structure::Structure; model_index::Int=1, atom_name::String="CA", threaded::Bool=true)
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     labels = String[]
     points = NTuple{3,Float64}[]
@@ -376,7 +422,8 @@ function residue_distance_matrix(structure::Structure; model_index::Int=1, atom_
         end
     end
     matrix = _pairwise_distance_matrix(points; threaded=threaded)
-    return (matrix=matrix, labels=labels)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (matrix=matrix, labels=labels), "residue_distance_matrix")
 end
 
 function chain_contact_matrix(structure::Structure; model_index::Int=1, cutoff::Real=8.0)
@@ -391,7 +438,8 @@ function chain_contact_matrix(structure::Structure; model_index::Int=1, cutoff::
         matrix[left, right] += 1
         matrix[right, left] += 1
     end
-    return (matrix=matrix, labels=labels)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (matrix=matrix, labels=labels), "chain_contact_matrix")
 end
 
 function structure_summary(structure::Structure; model_index::Int=1)
@@ -425,8 +473,7 @@ function structure_summary(structure::Structure; model_index::Int=1)
         residue_counts=residue_counts,
         center_of_mass=com,
         radius_of_gyration=rog,
-        bounding_box=bbox,
-    )
+        bounding_box=bbox)
 end
 
 function chain_summary(chain::Chain; structure::Union{Nothing,Structure}=nothing, model_index::Int=1)
@@ -453,12 +500,12 @@ function chain_summary(chain::Chain; structure::Union{Nothing,Structure}=nothing
         disulfide_count=structure === nothing ? 0 : count(bond -> bond.left_chain == chain.id || bond.right_chain == chain.id, disulfide_bonds(structure; model_index=model_index)),
         buried_surface_area=buried_area,
         center_of_mass=isempty(atoms) ? nothing : center_of_mass(atoms),
-        radius_of_gyration=isempty(atoms) ? nothing : radius_of_gyration(atoms),
-    )
+        radius_of_gyration=isempty(atoms) ? nothing : radius_of_gyration(atoms))
 end
 
 function residue_bfactor(residue::Residue)
     isempty(residue.atoms) && return missing
+
     return mean(atom.bfactor for atom in residue.atoms)
 end
 
@@ -470,7 +517,8 @@ function residue_bfactors(structure::Structure; model_index::Int=1)
             push!(values, (chain=chain.id, residue=residue.name, seqnum=residue.seqnum, bfactor=residue_bfactor(residue), secondary_structure=residue.secondary_structure, accessibility=residue.accessibility))
         end
     end
-    return values
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, values, "residue_bfactors"; parameters=(n_residues=length(values),))
 end
 
 function flexible_residues(structure::Structure; percentile::Real=90, model_index::Int=1)
@@ -478,7 +526,8 @@ function flexible_residues(structure::Structure; percentile::Real=90, model_inde
     numeric = Float64[entry.bfactor for entry in entries if entry.bfactor !== missing]
     isempty(numeric) && return typeof(entries)([])
     threshold = sort(numeric)[clamp(ceil(Int, length(numeric) * percentile / 100), 1, length(numeric))]
-    return [entry for entry in entries if entry.bfactor !== missing && entry.bfactor >= threshold]
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, [entry for entry in entries if entry.bfactor !== missing && entry.bfactor >= threshold], "flexible_residues")
 end
 
 function residue_property(residue::Residue, property::Symbol)
@@ -492,22 +541,26 @@ function residue_property(residue::Residue, property::Symbol)
 end
 
 function is_protein_residue(residue::Residue)
+
     return uppercase(residue.name) in keys(_AA3_TO1)
 end
 
 function is_water_residue(residue::Residue)
+
     return uppercase(residue.name) in _WATER_RESIDUES
 end
 
 function is_hetero_residue(residue::Residue)
+
     return !is_protein_residue(residue)
 end
 
 function is_ligand_residue(residue::Residue)
+
     return is_hetero_residue(residue) && !is_water_residue(residue)
 end
 
-function _selection_compare(left::Real, operator::AbstractString, right::Real)
+function _selection_compare(left::Real, operator::String, right::Real)
     operator == "<" && return left < right
     operator == "<=" && return left <= right
     operator == ">" && return left > right
@@ -517,7 +570,7 @@ function _selection_compare(left::Real, operator::AbstractString, right::Real)
     throw(ArgumentError("unsupported comparison operator: $(operator)"))
 end
 
-function _selection_tokens(selector::AbstractString)
+function _selection_tokens(selector::String)
     tokens = String[]
     buffer = IOBuffer()
     function flush_buffer!()
@@ -540,7 +593,7 @@ function _selection_tokens(selector::AbstractString)
     return tokens
 end
 
-function _selection_leaf_matches(chain::Chain, residue::Residue, clause::AbstractString, atom::Union{Nothing,Atom}=nothing)
+function _selection_leaf_matches(chain::Chain, residue::Residue, clause::String, atom::Union{Nothing,Atom}=nothing)
     cleaned = lowercase(strip(String(clause)))
     isempty(cleaned) && return true
     cleaned in ("protein", "water", "ligand", "hetero") && return (
@@ -670,11 +723,11 @@ function _selection_parse_or(tokens::Vector{String}, index::Int, chain::Chain, r
     return value, next_index
 end
 
-function _selection_matches(chain::Chain, residue::Residue, selector::AbstractString)
+function _selection_matches(chain::Chain, residue::Residue, selector::String)
     return _selection_matches(chain, residue, selector, nothing)
 end
 
-function _selection_matches(chain::Chain, residue::Residue, selector::AbstractString, atom::Union{Nothing,Atom})
+function _selection_matches(chain::Chain, residue::Residue, selector::String, atom::Union{Nothing,Atom})
     tokens = _selection_tokens(selector)
     value, next_index = _selection_parse_or(tokens, 1, chain, residue, atom)
     next_index <= length(tokens) && throw(ArgumentError("unexpected trailing tokens in selection expression"))
@@ -778,11 +831,11 @@ function collapse_altlocs(structure::Structure; policy::AtomSelectionPolicy=Atom
 end
 
 
-function _residue_selector_matches(chain::Chain, residue::Residue, selector::AbstractString)
+function _residue_selector_matches(chain::Chain, residue::Residue, selector::String)
     return _selection_matches(chain, residue, selector, nothing)
 end
 
-function select_residues(chain::Chain; selector::Union{Nothing,AbstractString}=nothing, property::Symbol=:hydrophobic)
+function select_residues(chain::Chain; selector::Union{Nothing,String}=nothing, property::Symbol=:hydrophobic)
     selected = Residue[]
     for residue in chain.residues
         if selector === nothing
@@ -801,20 +854,22 @@ function select_residues(chain::Chain; selector::Union{Nothing,AbstractString}=n
             _residue_selector_matches(chain, residue, selector) && push!(selected, residue)
         end
     end
-    return selected
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, selected, "select_residues"; parameters=(n_selected=length(selected),))
 end
 
-function select_residues(structure::Structure; selector::Union{Nothing,AbstractString}=nothing, property::Symbol=:hydrophobic, model_index::Int=1, chain_id::Union{Nothing,AbstractString}=nothing)
+function select_residues(structure::Structure; selector::Union{Nothing,String}=nothing, property::Symbol=:hydrophobic, model_index::Int=1, chain_id::Union{Nothing,String}=nothing)
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     selected = Residue[]
     for chain in structure.models[model_index].chains
         chain_id !== nothing && chain.id != String(chain_id) && continue
         append!(selected, select_residues(chain; selector=selector, property=property))
     end
-    return selected
+    _ctx = active_provenance_context()
+    return _register_structure_result!(_ctx, selected, "select_residues"; parameters=(n_selected=length(selected),))
 end
 
-function select_atoms(structure::Structure; selector::Union{Nothing,AbstractString}=nothing, model_index::Int=1, policy::AtomSelectionPolicy=AtomSelectionPolicy(), chain_id::Union{Nothing,AbstractString}=nothing)
+function select_atoms(structure::Structure; selector::Union{Nothing,String}=nothing, model_index::Int=1, policy::AtomSelectionPolicy=AtomSelectionPolicy(), chain_id::Union{Nothing,String}=nothing)
     atoms = Atom[]
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     for chain in structure.models[model_index].chains
@@ -885,8 +940,7 @@ const _VDW_RADIUS = Dict{String,Float64}(
     "CA" => 2.31,
     "ZN" => 1.39,
     "FE" => 1.56,
-    "CU" => 1.40,
-)
+    "CU" => 1.40)
 const _MAX_VDW_RADIUS = maximum(values(_VDW_RADIUS))
 const _FIBONACCI_CACHE = Dict{Int,Vector{NTuple{3,Float64}}}()
 
@@ -915,6 +969,11 @@ function _fibonacci_sphere_points(samples::Int)
     end
 end
 
+function _atom_radii(atoms::AbstractVector{Atom}, probe::Real)
+    probe > 0 || throw(ArgumentError("probe radius must be positive"))
+    return Dict{Atom,Float64}(atom => _atom_vdw_radius(atom) + Float64(probe) for atom in atoms)
+end
+
 function _model_atoms(structure::Structure, model_index::Int)
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     atoms = Atom[]
@@ -927,17 +986,20 @@ function _model_atoms(structure::Structure, model_index::Int)
 end
 
 function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}, points::AbstractVector{NTuple{3,Float64}}; probe::Real=1.4)
+    return _atom_sasa(atom, atoms, _atom_radii(atoms, probe), points; probe=probe)
+end
+
+function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}, radii::Dict{Atom,Float64}, points::AbstractVector{NTuple{3,Float64}}; probe::Real=1.4)
     radius = _atom_vdw_radius(atom) + Float64(probe)
-    candidate_radii = Float64[_atom_vdw_radius(other) + Float64(probe) for other in atoms]
     accessible = 0
     for point in points
         px = atom.x + point[1] * radius
         py = atom.y + point[2] * radius
         pz = atom.z + point[3] * radius
         blocked = false
-        for (other_index, other) in pairs(atoms)
+        for other in atoms
             other === atom && continue
-            other_radius = candidate_radii[other_index]
+            other_radius = radii[other]
             dx = px - other.x
             dy = py - other.y
             dz = pz - other.z
@@ -951,6 +1013,12 @@ function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}, points::AbstractVec
     return 4 * pi * radius * radius * (accessible / length(points))
 end
 
+function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}, radii::Dict{Atom,Float64}, tree::AtomKDTree, points::AbstractVector{NTuple{3,Float64}}; probe::Real=1.4)
+    search_radius = _atom_vdw_radius(atom) + Float64(probe) + Float64(probe) + _MAX_VDW_RADIUS
+    candidates = atoms_within_radius(tree, atom; radius=search_radius)
+    return _atom_sasa(atom, candidates, radii, points; probe=probe)
+end
+
 function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}; probe::Real=1.4, samples::Int=96)
     return _atom_sasa(atom, atoms, _fibonacci_sphere_points(samples); probe=probe)
 end
@@ -958,7 +1026,7 @@ end
 function _atom_sasa(atom::Atom, atoms::AbstractVector{Atom}, tree::AtomKDTree, points::AbstractVector{NTuple{3,Float64}}; probe::Real=1.4)
     search_radius = _atom_vdw_radius(atom) + Float64(probe) + Float64(probe) + _MAX_VDW_RADIUS
     candidates = atoms_within_radius(tree, atom; radius=search_radius)
-    return _atom_sasa(atom, candidates, points; probe=probe)
+    return _atom_sasa(atom, candidates, _atom_radii(candidates, probe), points; probe=probe)
 end
 
 function atom_sasa(atom::Atom, structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
@@ -966,7 +1034,9 @@ function atom_sasa(atom::Atom, structure::Structure; probe::Real=1.4, samples::I
     isempty(atoms) && return 0.0
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
-    return _atom_sasa(atom, atoms, tree, points; probe=probe)
+    radii = _atom_radii(atoms, probe)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, _atom_sasa(atom, atoms, radii, tree, points; probe=probe), "atom_sasa")
 end
 
 function residue_sasa(residue::Residue, structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
@@ -974,14 +1044,18 @@ function residue_sasa(residue::Residue, structure::Structure; probe::Real=1.4, s
     atoms = _model_atoms(structure, model_index)
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
-    return sum(_atom_sasa(atom, atoms, tree, points; probe=probe) for atom in residue.atoms)
+    radii = _atom_radii(atoms, probe)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum(_atom_sasa(atom, atoms, radii, tree, points; probe=probe) for atom in residue.atoms), "residue_sasa")
 end
 
 function chain_sasa(chain::Chain, structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
     atoms = _model_atoms(structure, model_index)
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
-    return sum(sum(_atom_sasa(atom, atoms, tree, points; probe=probe) for atom in residue.atoms) for residue in chain.residues)
+    radii = _atom_radii(atoms, probe)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum(sum(_atom_sasa(atom, atoms, radii, tree, points; probe=probe) for atom in residue.atoms) for residue in chain.residues), "chain_sasa")
 end
 
 function structure_sasa(structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
@@ -989,7 +1063,9 @@ function structure_sasa(structure::Structure; probe::Real=1.4, samples::Int=96, 
     isempty(atoms) && return 0.0
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
-    return sum(_atom_sasa(atom, atoms, tree, points; probe=probe) for atom in atoms)
+    radii = _atom_radii(atoms, probe)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum(_atom_sasa(atom, atoms, radii, tree, points; probe=probe) for atom in atoms), "structure_sasa")
 end
 
 function sasa_profile(structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
@@ -997,10 +1073,11 @@ function sasa_profile(structure::Structure; probe::Real=1.4, samples::Int=96, mo
     atoms = _model_atoms(structure, model_index)
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
+    radii = _atom_radii(atoms, probe)
     entries = NamedTuple{(:chain, :residue, :seqnum, :sasa, :relative_accessibility, :kind), Tuple{String, String, Int, Float64, Float64, Symbol}}[]
     for chain in structure.models[model_index].chains
         for residue in chain.residues
-            sasa = sum(_atom_sasa(atom, atoms, tree, points; probe=probe) for atom in residue.atoms)
+            sasa = sum(_atom_sasa(atom, atoms, radii, tree, points; probe=probe) for atom in residue.atoms)
             max_sasa = sum(4 * pi * (_atom_vdw_radius(atom) + Float64(probe))^2 for atom in residue.atoms)
             kind = is_water_residue(residue) ? :water : (is_ligand_residue(residue) ? :ligand : :protein)
             push!(entries, (
@@ -1009,11 +1086,11 @@ function sasa_profile(structure::Structure; probe::Real=1.4, samples::Int=96, mo
                 seqnum=residue.seqnum,
                 sasa=sasa,
                 relative_accessibility=max_sasa == 0 ? 0.0 : sasa / max_sasa,
-                kind=kind,
-            ))
+                kind=kind))
         end
     end
-    return entries
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, entries, "sasa_profile")
 end
 
 function _isolated_chain_structure(chain::Chain)
@@ -1031,17 +1108,21 @@ function residue_free_sasa(residue::Residue, chain::Chain; probe::Real=1.4, samp
     end
     tree = build_atom_kdtree(atoms)
     points = _fibonacci_sphere_points(samples)
-    return sum(_atom_sasa(atom, atoms, tree, points; probe=probe) for atom in residue.atoms)
+    radii = _atom_radii(atoms, probe)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum(_atom_sasa(atom, atoms, radii, tree, points; probe=probe) for atom in residue.atoms), "residue_free_sasa")
 end
 
 function buried_surface_area(residue::Residue, chain::Chain, structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
     free_sasa = residue_free_sasa(residue, chain; probe=probe, samples=samples)
     complex_sasa = residue_sasa(residue, structure; probe=probe, samples=samples, model_index=model_index)
-    return max(0.0, free_sasa - complex_sasa)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, max(0.0, free_sasa - complex_sasa), "buried_surface_area")
 end
 
 function buried_surface_area(chain::Chain, structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
-    return sum(buried_surface_area(residue, chain, structure; probe=probe, samples=samples, model_index=model_index) for residue in chain.residues)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum(buried_surface_area(residue, chain, structure; probe=probe, samples=samples, model_index=model_index) for residue in chain.residues), "buried_surface_area")
 end
 
 function buried_surface_area(structure::Structure; probe::Real=1.4, samples::Int=96, model_index::Int=1)
@@ -1050,7 +1131,8 @@ function buried_surface_area(structure::Structure; probe::Real=1.4, samples::Int
     for chain in structure.models[model_index].chains
         total += buried_surface_area(chain, structure; probe=probe, samples=samples, model_index=model_index)
     end
-    return total
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, total, "buried_surface_area")
 end
 
 function _residue_contact_counts(structure::Structure; model_index::Int=1, cutoff::Real=8.0)
@@ -1093,11 +1175,11 @@ function interface_profile(structure::Structure; probe::Real=1.4, samples::Int=9
                 free_sasa=free_sasa,
                 buried_sasa=buried_sasa,
                 contact_count=contact_count,
-                is_interface=is_interface,
-            ))
+                is_interface=is_interface))
         end
     end
-    return profile
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, profile, "interface_profile")
 end
 
 function disulfide_bonds(structure::Structure; model_index::Int=1, cutoff::Real=2.2)
@@ -1130,11 +1212,11 @@ function disulfide_bonds(structure::Structure; model_index::Int=1, cutoff::Real=
                 right_residue=right_item.residue.name,
                 right_seqnum=right_item.residue.seqnum,
                 right_insertion_code=right_item.residue.insertion_code,
-                distance=sqrt(distance2),
-            ))
+                distance=sqrt(distance2)))
         end
     end
-    return pairs
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, pairs, "disulfide_bonds")
 end
 
 function _residue_center(residue::Residue)
@@ -1194,7 +1276,8 @@ function _residue_contact_pairs(residues::AbstractVector{Residue}; cutoff::Real=
 end
 
 function residue_contacts(chain::Chain; cutoff::Real=8.0)
-    return _residue_contact_pairs(chain.residues; cutoff=cutoff)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, _residue_contact_pairs(chain.residues; cutoff=cutoff), "residue_contacts")
 end
 
 function residue_contacts(structure::Structure; cutoff::Real=8.0, model_index::Int=1)
@@ -1221,10 +1304,10 @@ function residue_contacts(structure::Structure; cutoff::Real=8.0, model_index::I
             right_residue=right_item.residue.name,
             right_seqnum=right_item.residue.seqnum,
             right_insertion_code=right_item.residue.insertion_code,
-            distance=pair.distance,
-        ))
+            distance=pair.distance))
     end
-    return pairs
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, pairs, "residue_contacts")
 end
 
 function contact_map(chain::Chain; cutoff::Real=8.0)
@@ -1233,7 +1316,8 @@ function contact_map(chain::Chain; cutoff::Real=8.0)
         matrix[pair.left, pair.right] = true
         matrix[pair.right, pair.left] = true
     end
-    return matrix
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, matrix, "contact_map")
 end
 
 function contact_map(structure::Structure; cutoff::Real=8.0, model_index::Int=1)
@@ -1264,7 +1348,8 @@ function contact_map(structure::Structure; cutoff::Real=8.0, model_index::Int=1)
         matrix[right_index, left_index] = true
     end
 
-    return (matrix=matrix, labels=labels)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (matrix=matrix, labels=labels), "contact_map")
 end
 
 function interface_residues(structure::Structure; cutoff::Real=8.0, model_index::Int=1, minimum_buried_sasa::Real=1.0)
@@ -1281,13 +1366,15 @@ function interface_residues(structure::Structure; cutoff::Real=8.0, model_index:
             (chain.id, residue.seqnum, residue.insertion_code) in marked && push!(residues, residue)
         end
     end
-    return residues
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, residues, "interface_residues")
 end
 
 function calculate_interface_residues(chain_a::Chain, chain_b::Chain; probe::Real=1.4, samples::Int=96, cutoff::Real=8.0, minimum_buried_sasa::Real=1.0)
     structure = Structure("interface", [Model(1, [chain_a, chain_b])], Dict{String,String}())
     profile = interface_profile(structure; probe=probe, samples=samples, model_index=1, cutoff=cutoff, minimum_buried_sasa=minimum_buried_sasa)
-    return [entry for entry in profile if entry.is_interface]
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, [entry for entry in profile if entry.is_interface], "calculate_interface_residues")
 end
 
 function residues_within_radius(chain::Chain, ligand::Residue; radius::Real=5.0)
@@ -1303,7 +1390,8 @@ function residues_within_radius(chain::Chain, ligand::Residue; radius::Real=5.0)
         end
     end
 
-    return hits
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hits, "residues_within_radius")
 end
 
 function residues_within_radius(structure::Structure, ligand::Residue; radius::Real=5.0, model_index::Int=1)
@@ -1312,21 +1400,29 @@ function residues_within_radius(structure::Structure, ligand::Residue; radius::R
     for chain in structure.models[model_index].chains
         append!(hits, residues_within_radius(chain, ligand; radius=radius))
     end
-    return hits
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hits, "residues_within_radius")
 end
 
-function _dssp_char(value::AbstractString, default::Char=' ')
+function _dssp_char(value::String, default::Char=' ')
     isempty(value) && return default
     return first(value)
 end
 
-function read_dssp(filepath::AbstractString)
-    open(filepath, "r") do io
-        return read_dssp(io)
+function read_dssp(filepath::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_dssp(io)
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_dssp(IOBuffer(raw_bytes); _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_dssp(io::IO)
+function read_dssp(io::IO; provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_dssp", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     entries = DSSPEntry[]
     in_table = false
     for raw_line in eachline(io)
@@ -1348,6 +1444,7 @@ function read_dssp(io::IO)
         insertion_code = _dssp_char(_pdb_field(line, 11, 11), ' ')
         push!(entries, DSSPEntry(chain_id, seqnum, insertion_code, amino_acid, secondary_structure, accessibility))
     end
+    _ctx !== nothing && register_provenance!(_ctx, "read_dssp"; parents=String[], parameters=(source=provenance_source, entry_count=length(entries), hash=provenance_hash))
     return entries
 end
 
@@ -1365,6 +1462,11 @@ function annotate_dssp!(structure::Structure, entries::AbstractVector{DSSPEntry}
         residue.secondary_structure = entry.secondary_structure == ' ' ? missing : entry.secondary_structure
         residue.accessibility = entry.accessibility
     end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        update_provenance!(structure.metadata; source="annotate_dssp!", notes=["annotated DSSP secondary structure"], parameters=(model_index=model_index, entry_count=length(entries)))
+        register_provenance!(_ctx, "annotate_dssp!"; parents=provenance_parent_ids(structure), parameters=(model_index=model_index, entry_count=length(entries)))
+    end
     return structure
 end
 
@@ -1372,7 +1474,7 @@ function _atom_name(atom::Atom)
     return uppercase(strip(atom.name))
 end
 
-function _residue_atom(residue::Residue, names::Vararg{AbstractString})
+function _residue_atom(residue::Residue, names::Vararg{String})
     target_names = Set(uppercase(strip(String(name))) for name in names)
     for atom in residue.atoms
         _atom_name(atom) in target_names && return atom
@@ -1380,7 +1482,7 @@ function _residue_atom(residue::Residue, names::Vararg{AbstractString})
     return nothing
 end
 
-function _residue_center_atom(residue::Residue, names::Vararg{AbstractString})
+function _residue_center_atom(residue::Residue, names::Vararg{String})
     atom = _residue_atom(residue, names...)
     atom === nothing && return nothing
     return atom
@@ -1447,12 +1549,12 @@ function hydrogen_bonds(structure::Structure; model_index::Int=1, cutoff::Real=3
                     acceptor_item.residue.insertion_code,
                     acceptor_o.name,
                     sqrt(distance2),
-                    min(donor_angle, acceptor_angle),
-                ))
+                    min(donor_angle, acceptor_angle)))
             end
         end
     end
-    return bonds
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, bonds, "hydrogen_bonds")
 end
 
 function hydrogen_bonds(chain::Chain; cutoff::Real=3.5, angle_cutoff::Real=120)
@@ -1460,10 +1562,11 @@ function hydrogen_bonds(chain::Chain; cutoff::Real=3.5, angle_cutoff::Real=120)
     model = Model(1)
     push!(model.chains, chain)
     push!(structure.models, model)
-    return hydrogen_bonds(structure; model_index=1, cutoff=cutoff, angle_cutoff=angle_cutoff)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hydrogen_bonds(structure; model_index=1, cutoff=cutoff, angle_cutoff=angle_cutoff), "hydrogen_bonds")
 end
 
-function ramachandran_region(phi::Real, psi::Real; residue_name::AbstractString="ALA")
+function ramachandran_region(phi::Real, psi::Real; residue_name::String="ALA")
     isfinite(phi) && isfinite(psi) || return :unknown
     residue = uppercase(String(residue_name))
     if residue == "PRO"
@@ -1490,7 +1593,8 @@ function ramachandran_region(phi::Real, psi::Real; residue_name::AbstractString=
     if residue == "GLY"
         return :glycine_allowed
     end
-    return :loop
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, :loop, "ramachandran_region")
 end
 
 function ramachandran_profile(chain::Chain)
@@ -1501,7 +1605,8 @@ function ramachandran_profile(chain::Chain)
         region = ismissing(torsions.phi) || ismissing(torsions.psi) ? :unknown : ramachandran_region(torsions.phi, torsions.psi; residue_name=residue.name)
         push!(profile, (index=index, residue=residue.name, phi=torsions.phi, psi=torsions.psi, region=region))
     end
-    return profile
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, profile, "ramachandran_profile")
 end
 
 function ramachandran_profile(structure::Structure; model_index::Int=1)
@@ -1512,7 +1617,8 @@ function ramachandran_profile(structure::Structure; model_index::Int=1)
             push!(profile, (chain=chain.id, index=entry.index, residue=entry.residue, phi=entry.phi, psi=entry.psi, region=entry.region))
         end
     end
-    return profile
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, profile, "ramachandran_profile")
 end
 
 const _CHI_DEFINITIONS = Dict{String,Vector{NTuple{4,String}}}(
@@ -1533,8 +1639,7 @@ const _CHI_DEFINITIONS = Dict{String,Vector{NTuple{4,String}}}(
     "THR" => [("N", "CA", "CB", "OG1")],
     "TRP" => [("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")],
     "TYR" => [("N", "CA", "CB", "CG"), ("CA", "CB", "CG", "CD1")],
-    "VAL" => [("N", "CA", "CB", "CG1")],
-)
+    "VAL" => [("N", "CA", "CB", "CG1")])
 
 function _chi_angle(residue::Residue, atoms::NTuple{4,String})
     atom1 = _residue_atom(residue, atoms[1])
@@ -1554,7 +1659,8 @@ function chi_angles(residue::Residue)
         index > 4 && break
         chi_values[index] = _chi_angle(residue, atoms)
     end
-    return (chi1=chi_values[1], chi2=chi_values[2], chi3=chi_values[3], chi4=chi_values[4])
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (chi1=chi_values[1], chi2=chi_values[2], chi3=chi_values[3], chi4=chi_values[4]), "chi_angles")
 end
 
 function rotamer_label(angle::Real)
@@ -1563,7 +1669,8 @@ function rotamer_label(angle::Real)
     abs(abs(normalized) - 180) <= 60 && return :trans
     normalized >= 0 && normalized <= 120 && return :gauche_plus
     normalized < 0 && normalized >= -120 && return :gauche_minus
-    return :other
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, :other, "rotamer_label")
 end
 
 function rotamer_state(residue::Residue)
@@ -1576,8 +1683,7 @@ function rotamer_state(residue::Residue)
         chi1_label=ismissing(chis.chi1) ? missing : rotamer_label(chis.chi1),
         chi2_label=ismissing(chis.chi2) ? missing : rotamer_label(chis.chi2),
         chi3_label=ismissing(chis.chi3) ? missing : rotamer_label(chis.chi3),
-        chi4_label=ismissing(chis.chi4) ? missing : rotamer_label(chis.chi4),
-    )
+        chi4_label=ismissing(chis.chi4) ? missing : rotamer_label(chis.chi4))
 end
 
 function rotamer_statistics(chain::Chain)
@@ -1586,8 +1692,7 @@ function rotamer_statistics(chain::Chain)
         :gauche_plus => 0,
         :gauche_minus => 0,
         :other => 0,
-        :unknown => 0,
-    )
+        :unknown => 0)
     total = 0
     with_chi1 = 0
     for residue in chain.residues
@@ -1602,7 +1707,8 @@ function rotamer_statistics(chain::Chain)
         total += 1
     end
     fractions = Dict(symbol => (total == 0 ? 0.0 : count / total) for (symbol, count) in counts)
-    return (total=total, with_chi1=with_chi1, counts=counts, fractions=fractions)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (total=total, with_chi1=with_chi1, counts=counts, fractions=fractions), "rotamer_statistics")
 end
 
 function rotamer_statistics(structure::Structure; model_index::Int=1)
@@ -1613,8 +1719,7 @@ function rotamer_statistics(structure::Structure; model_index::Int=1)
         :gauche_plus => 0,
         :gauche_minus => 0,
         :other => 0,
-        :unknown => 0,
-    )
+        :unknown => 0)
     total = 0
     with_chi1 = 0
     for chain in structure.models[model_index].chains
@@ -1627,7 +1732,8 @@ function rotamer_statistics(structure::Structure; model_index::Int=1)
         end
     end
     fractions = Dict(symbol => (total == 0 ? 0.0 : count / total) for (symbol, count) in overall_counts)
-    return (total=total, with_chi1=with_chi1, counts=overall_counts, fractions=fractions, chains=chain_stats)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (total=total, with_chi1=with_chi1, counts=overall_counts, fractions=fractions, chains=chain_stats), "rotamer_statistics")
 end
 
 function _residue_node_label(chain::String, residue::Residue)
@@ -1692,7 +1798,8 @@ function structure_contact_graph(structure::Structure; model_index::Int=1, cutof
         push!(hbond_edges, (source=source, target=target, distance=bond.distance, angle=bond.angle))
     end
 
-    return (nodes=nodes, layout=layout, generic_edges=generic_edges, hydrogen_bond_edges=hbond_edges, model=model)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (nodes=nodes, layout=layout, generic_edges=generic_edges, hydrogen_bond_edges=hbond_edges, model=model), "structure_contact_graph")
 end
 
 function _structure_secondary_structure_color(value::Union{Missing,Char})
@@ -1731,14 +1838,16 @@ function plot_contact_graph!(axis, structure::Structure; model_index::Int=1, cut
     Makie.scatter!(axis, xs, ys; markersize=node_size, color=node_colors, strokecolor=:white, strokewidth=1.5)
     Makie.text!(axis, xs, ys; text=labels, align=(:center, :center), fontsize=10, color=:black)
     axis.aspect = Makie.DataAspect()
-    return graph
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, graph, "plot_contact_graph!")
 end
 
-function plot_contact_graph(structure::Structure; kwargs...)
+function plot_contact_graph(structure::Structure, kwargs...)
     fig = Makie.Figure()
     axis = Makie.Axis(fig[1, 1]; title="Residue contact graph", xlabel="graph x", ylabel="graph y")
     plot_contact_graph!(axis, structure; kwargs...)
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_contact_graph")
 end
 
 function plot_contact_map!(axis, structure::Structure; model_index::Int=1, cutoff::Real=8.0, hbond_cutoff::Real=3.5)
@@ -1774,14 +1883,16 @@ function plot_contact_map!(axis, structure::Structure; model_index::Int=1, cutof
     axis.xticklabelrotation = π / 4
     axis.xlabel = "residues"
     axis.ylabel = "residues"
-    return graph
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, graph, "plot_contact_map!")
 end
 
-function plot_contact_map(structure::Structure; kwargs...)
+function plot_contact_map(structure::Structure, kwargs...)
     fig = Makie.Figure()
     axis = Makie.Axis(fig[1, 1]; title="Residue contact map")
     plot_contact_map!(axis, structure; kwargs...)
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_contact_map")
 end
 
 function _residue_color(residue::Residue)
@@ -1915,14 +2026,16 @@ function plot_structure_atoms!(axis, structure::Structure; model_index::Int=1, a
         end
     end
     Makie.meshscatter!(axis, xs, ys, zs; markersize=atom_size, color=colors)
-    return axis
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, axis, "plot_structure_atoms!")
 end
 
-function plot_structure_atoms(structure::Structure; kwargs...)
+function plot_structure_atoms(structure::Structure, kwargs...)
     fig = Makie.Figure()
     axis = Makie.Axis3(fig[1, 1]; title="Atom cloud")
     plot_structure_atoms!(axis, structure; kwargs...)
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_structure_atoms")
 end
 
 function plot_backbone_trace!(axis, structure::Structure; model_index::Int=1, line_width::Real=4)
@@ -1938,14 +2051,16 @@ function plot_backbone_trace!(axis, structure::Structure; model_index::Int=1, li
         Makie.lines!(axis, xs, ys, zs; color=first(colors), linewidth=line_width)
         Makie.scatter!(axis, xs, ys, zs; color=colors, markersize=line_width + 2)
     end
-    return axis
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, axis, "plot_backbone_trace!")
 end
 
-function plot_backbone_trace(structure::Structure; kwargs...)
+function plot_backbone_trace(structure::Structure, kwargs...)
     fig = Makie.Figure()
     axis = Makie.Axis3(fig[1, 1]; title="Backbone trace")
     plot_backbone_trace!(axis, structure; kwargs...)
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_backbone_trace")
 end
 
 function _ribbon_segment_points(chain::Chain)
@@ -1975,10 +2090,11 @@ function plot_chain_ribbon!(axis, chain::Chain; ribbon_width::Real=10, point_siz
         end
     end
     Makie.scatter!(axis, coords[:, 1], coords[:, 2], coords[:, 3]; color=colors, markersize=point_size)
-    return axis
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, axis, "plot_chain_ribbon!")
 end
 
-function plot_chain_ribbon(structure::Structure; model_index::Int=1, chain_id::Union{Nothing,AbstractString}=nothing, kwargs...)
+function plot_chain_ribbon(structure::Structure; model_index::Int=1, chain_id::Union{Nothing,String}=nothing, kwargs...)
     1 <= model_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     fig = Makie.Figure()
     axis = Makie.Axis3(fig[1, 1]; title="Chain ribbon")
@@ -1987,7 +2103,8 @@ function plot_chain_ribbon(structure::Structure; model_index::Int=1, chain_id::U
         chain_id !== nothing && chain.id != String(chain_id) && continue
         plot_chain_ribbon!(axis, chain; kwargs...)
     end
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_chain_ribbon")
 end
 
 function residue_pick_hooks(structure::Structure; model_index::Int=1)
@@ -2008,17 +2125,18 @@ function residue_pick_hooks(structure::Structure; model_index::Int=1)
         end
     end
 
-    function resolve_node(node_id::AbstractString)
+    function resolve_node(node_id::String)
         entry = get(residue_lookup, String(node_id), nothing)
         entry === nothing && return nothing
         return (chain=entry[1], seqnum=entry[2], insertion_code=entry[3], residue=entry[4])
     end
 
-    function pick_callback(node_id::AbstractString)
+    function pick_callback(node_id::String)
         return resolve_node(node_id)
     end
 
-    return (lookup=residue_lookup, resolve=resolve_node, on_pick=pick_callback)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (lookup=residue_lookup, resolve=resolve_node, on_pick=pick_callback), "residue_pick_hooks")
 end
 
 function connect_residue_picking!(axis, structure::Structure; model_index::Int=1, on_pick=nothing, cutoff::Real=8.0, hbond_cutoff::Real=3.5)
@@ -2046,7 +2164,8 @@ function connect_residue_picking!(axis, structure::Structure; model_index::Int=1
         end
     catch
     end
-    return hooks
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hooks, "connect_residue_picking!")
 end
 
 function plot_structure_viewer(structure::Structure; model_index::Int=1, atom_size::Real=8, ribbon_width::Real=5, on_pick=nothing)
@@ -2058,10 +2177,11 @@ function plot_structure_viewer(structure::Structure; model_index::Int=1, atom_si
     end
     plot_structure_atoms!(axis, structure; model_index=model_index, atom_size=atom_size)
     connect_residue_picking!(axis, structure; model_index=model_index, on_pick=on_pick)
-    return fig
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, fig, "plot_structure_viewer")
 end
 
-function _svg_escape(text::AbstractString)
+function _svg_escape(text::String)
     escaped = replace(String(text), "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", '"' => "&quot;")
     return escaped
 end
@@ -2111,14 +2231,16 @@ function contact_map_svg(structure::Structure; model_index::Int=1, cutoff::Real=
     end
 
     println(io, "</svg>")
-    return String(take!(io))
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, String(take!(io)), "contact_map_svg")
 end
 
-function write_contact_map_svg(filepath::AbstractString, structure::Structure; kwargs...)
+function write_contact_map_svg(filepath::String, structure::Structure; kwargs...)
     open(filepath, "w") do io
         write(io, contact_map_svg(structure; kwargs...))
     end
-    return filepath
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, filepath, "write_contact_map_svg")
 end
 
 function structure_contact_mermaid(structure::Structure; model_index::Int=1, cutoff::Real=8.0, hbond_cutoff::Real=3.5)
@@ -2153,14 +2275,16 @@ function structure_contact_mermaid(structure::Structure; model_index::Int=1, cut
         push!(lines, string("    ", left, " -.-> ", right))
     end
 
-    return join(lines, "\n")
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, join(lines, "\n"), "structure_contact_mermaid")
 end
 
-function write_structure_mermaid(filepath::AbstractString, structure::Structure; kwargs...)
+function write_structure_mermaid(filepath::String, structure::Structure; kwargs...)
     open(filepath, "w") do io
         write(io, structure_contact_mermaid(structure; kwargs...))
     end
-    return filepath
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, filepath, "write_structure_mermaid")
 end
 
 function _pdb_field(line::AbstractString, start_index::Int, stop_index::Int)
@@ -2183,34 +2307,35 @@ function _ensure_model!(structure::Structure, model_map::Dict{Int,Model}, model_
     return model
 end
 
-function _ensure_chain!(model::Model, chain_map::Dict{String,Chain}, chain_id::AbstractString)
-    key = String(chain_id)
+function _ensure_chain!(model::Model, chain_map::Dict{String,Chain}, chain_id::String)
+    key = chain_id isa String ? chain_id : String(chain_id)
     chain = get(chain_map, key, nothing)
     chain !== nothing && return chain
-    chain = Chain(key)
+    chain = Chain(chain_id)
     push!(model.chains, chain)
     chain_map[key] = chain
     return chain
 end
 
-function _ensure_residue!(chain::Chain, residue_map::Dict{Tuple{String,Int,Char,String},Residue}, residue_name::AbstractString, seqnum::Int, insertion_code::Char)
-    key = (chain.id, seqnum, insertion_code, String(residue_name))
+function _ensure_residue!(chain::Chain, residue_map::Dict{Tuple{String,Int,Char,String},Residue}, residue_name::String, seqnum::Int, insertion_code::Char)
+    key_name = residue_name isa String ? residue_name : String(residue_name)
+    key = (chain.id, seqnum, insertion_code, key_name)
     residue = get(residue_map, key, nothing)
     residue !== nothing && return residue
-    residue = Residue(String(residue_name), seqnum, insertion_code)
+    residue = Residue(residue_name, seqnum, insertion_code)
     push!(chain.residues, residue)
     residue_map[key] = residue
     return residue
 end
 
-function _atom_element(atom_name::AbstractString, raw_element::AbstractString)
+function _atom_element(atom_name::String, raw_element::String)
     isempty(raw_element) || return uppercase(raw_element)
     cleaned = filter(isletter, atom_name)
     isempty(cleaned) && return ""
     return uppercase(String(cleaned[1:min(length(cleaned), 2)]))
 end
 
-function _pdb_atom_from_line(line::AbstractString)
+function _pdb_atom_from_line(line::String)
     record_name = _pdb_field(line, 1, 6)
     record_name in ("ATOM", "HETATM") || return nothing
 
@@ -2243,7 +2368,7 @@ end
 
 const _PDB_METADATA_RECORDS = Set(["HEADER", "TITLE", "COMPND", "SOURCE", "KEYWDS", "EXPDTA", "AUTHOR", "REMARK", "JRNL"])
 
-function _capture_pdb_metadata!(metadata::Dict{String,String}, line::AbstractString)
+function _capture_pdb_metadata!(metadata::Dict{String,String}, line::String)
     record = uppercase(_pdb_field(line, 1, 6))
     if record in _PDB_METADATA_RECORDS
         payload = strip(_pdb_field(line, 11, lastindex(line)))
@@ -2253,13 +2378,20 @@ function _capture_pdb_metadata!(metadata::Dict{String,String}, line::AbstractStr
     return false
 end
 
-function read_pdb(filepath::AbstractString)
-    open(filepath, "r") do io
-        return read_pdb(io; structure_id=splitext(basename(filepath))[1])
+function read_pdb(filepath::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_pdb(io; structure_id=splitext(basename(filepath))[1])
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_pdb(IOBuffer(raw_bytes); structure_id=splitext(basename(filepath))[1], _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_pdb(io::IO; structure_id::AbstractString="structure")
+function read_pdb(io::IO; structure_id::String="structure", provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_pdb", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     structure = Structure(structure_id)
     model_map = Dict{Int,Model}()
     chain_maps = Dict{Int,Dict{String,Chain}}()
@@ -2301,6 +2433,10 @@ function read_pdb(io::IO; structure_id::AbstractString="structure")
     end
 
     isempty(structure.models) && push!(structure.models, Model(1))
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_pdb"; parents=String[], parameters=(source=provenance_source, structure_id=structure.id, model_count=length(structure.models), hash=provenance_hash))
+        register_container_provenance!(_ctx, structure, "read_pdb"; parents=[root.id], parameters=(source=provenance_source, structure_id=structure.id, model_count=length(structure.models)), provenance_hash=provenance_hash)
+    end
     return structure
 end
 
@@ -2363,7 +2499,7 @@ function _mmcif_first_index(lookup::Dict{String,Int}, keys::Vector{String})
     return 0
 end
 
-function _mmcif_value(row::AbstractVector{<:AbstractString}, lookup::Dict{String,Int}, keys::Vector{String}, default::String="")
+function _mmcif_value(row::AbstractVector{<:String}, lookup::Dict{String,Int}, keys::Vector{String}, default::String="")
     for key in keys
         index = get(lookup, key, 0)
         index > 0 && index <= length(row) && return row[index]
@@ -2371,18 +2507,25 @@ function _mmcif_value(row::AbstractVector{<:AbstractString}, lookup::Dict{String
     return default
 end
 
-function _mmcif_value(row::AbstractVector{<:AbstractString}, index::Int, default::String="")
+function _mmcif_value(row::AbstractVector{<:String}, index::Int, default::String="")
     index > 0 && index <= length(row) && return row[index]
     return default
 end
 
-function read_mmcif(filepath::AbstractString)
-    open(filepath, "r") do io
-        return read_mmcif(io; structure_id=splitext(basename(filepath))[1])
+function read_mmcif(filepath::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_mmcif(io; structure_id=splitext(basename(filepath))[1])
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_mmcif(IOBuffer(raw_bytes); structure_id=splitext(basename(filepath))[1], _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_mmcif(io::IO; structure_id::AbstractString="structure")
+function read_mmcif(io::IO; structure_id::String="structure", provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_mmcif", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lines = collect(eachline(io))
     structure = Structure(structure_id)
     model_map = Dict{Int,Model}()
@@ -2454,23 +2597,23 @@ function read_mmcif(io::IO; structure_id::AbstractString="structure")
                     chain_map = get!(chain_maps, current_model_id, Dict{String,Chain}())
                     residue_map = get!(residue_maps, current_model_id, Dict{Tuple{String,Int,Char,String},Residue}())
 
-                    atom_name = String(_mmcif_value(row, atom_name_index, ""))
-                    residue_name = String(_mmcif_value(row, residue_name_index, ""))
-                    chain_id = String(_mmcif_value(row, chain_id_index, " "))
-                    seqnum_value = String(_mmcif_value(row, seqnum_index, "0"))
+                    atom_name = _mmcif_value(row, atom_name_index, "")
+                    residue_name = _mmcif_value(row, residue_name_index, "")
+                    chain_id = _mmcif_value(row, chain_id_index, " ")
+                    seqnum_value = _mmcif_value(row, seqnum_index, "0")
                     seqnum = something(tryparse(Int, seqnum_value), 0)
-                    insertion_code_value = String(_mmcif_value(row, insertion_code_index, " "))
+                    insertion_code_value = _mmcif_value(row, insertion_code_index, " ")
                     insertion_code = isempty(insertion_code_value) ? ' ' : first(insertion_code_value)
-                    altloc_value = String(_mmcif_value(row, altloc_index, "."))
+                    altloc_value = _mmcif_value(row, altloc_index, ".")
                     altloc = isempty(altloc_value) || altloc_value in (".", "?") ? ' ' : first(altloc_value)
                     x = something(tryparse(Float64, _mmcif_value(row, x_index, "0.0")), 0.0)
                     y = something(tryparse(Float64, _mmcif_value(row, y_index, "0.0")), 0.0)
                     z = something(tryparse(Float64, _mmcif_value(row, z_index, "0.0")), 0.0)
                     occupancy = something(tryparse(Float64, _mmcif_value(row, occupancy_index, "1.0")), 1.0)
                     bfactor = something(tryparse(Float64, _mmcif_value(row, bfactor_index, "0.0")), 0.0)
-                    element = String(_mmcif_value(row, element_index, ""))
-                    hetatm = uppercase(String(_mmcif_value(row, group_index, "ATOM"))) == "HETATM"
-                    charge = String(_mmcif_value(row, charge_index, ""))
+                    element = _mmcif_value(row, element_index, "")
+                    hetatm = uppercase(_mmcif_value(row, group_index, "ATOM")) == "HETATM"
+                    charge = _mmcif_value(row, charge_index, "")
                     serial = something(tryparse(Int, _mmcif_value(row, serial_index, "0")), 0)
                     atom = Atom(serial, atom_name, altloc, element, x, y, z, occupancy, bfactor, charge, hetatm)
                     chain = _ensure_chain!(current_model, chain_map, chain_id)
@@ -2505,12 +2648,21 @@ function read_mmcif(io::IO; structure_id::AbstractString="structure")
     isempty(raw_blocks) || _metadata_block!(structure.metadata, "mmcif:raw_blocks", join(raw_blocks, "\n"))
 
     isempty(structure.models) && push!(structure.models, Model(1))
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_mmcif"; parents=String[], parameters=(source=provenance_source, structure_id=structure.id, model_count=length(structure.models), hash=provenance_hash))
+        register_container_provenance!(_ctx, structure, "read_mmcif"; parents=[root.id], parameters=(source=provenance_source, structure_id=structure.id, model_count=length(structure.models)), provenance_hash=provenance_hash)
+    end
     return structure
 end
 
-function write_pdb(filepath::AbstractString, structure::Structure)
+function write_pdb(filepath::String, structure::Structure)
     open(filepath, "w") do io
         write_pdb(io, structure)
+    end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(filepath)))
+        register_provenance!(_ctx, "write_pdb"; parents=provenance_parent_ids(structure), parameters=(output=filepath, structure_id=structure.id, model_count=length(structure.models), hash=provenance_hash))
     end
     return filepath
 end
@@ -2553,12 +2705,19 @@ function write_pdb(io::IO, structure::Structure)
         end
     end
     println(io, "END")
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "write_pdb"; parents=provenance_parent_ids(structure), parameters=(output="IO", structure_id=structure.id, model_count=length(structure.models)))
     return nothing
 end
 
-function write_mmcif(filepath::AbstractString, structure::Structure)
+function write_mmcif(filepath::String, structure::Structure)
     open(filepath, "w") do io
         write_mmcif(io, structure)
+    end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(filepath)))
+        register_provenance!(_ctx, "write_mmcif"; parents=provenance_parent_ids(structure), parameters=(output=filepath, structure_id=structure.id, model_count=length(structure.models), hash=provenance_hash))
     end
     return filepath
 end
@@ -2626,6 +2785,8 @@ function write_mmcif(io::IO, structure::Structure)
         end
     end
     println(io, "#")
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "write_mmcif"; parents=provenance_parent_ids(structure), parameters=(output="IO", structure_id=structure.id, model_count=length(structure.models)))
     return nothing
 end
 
@@ -2638,7 +2799,8 @@ function coordinate_matrix(atoms::AbstractVector{Atom})
         points[index, 2] = atom.y
         points[index, 3] = atom.z
     end
-    return points
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, points, "coordinate_matrix")
 end
 
 coordinate_matrix(structure::Structure) = coordinate_matrix(structure_atoms(structure))
@@ -2656,7 +2818,7 @@ function _centroid(points::AbstractMatrix)
     return centroid
 end
 
-function kabsch(reference::AbstractMatrix, mobile::AbstractMatrix)
+function kabsch(reference::AbstractMatrix, mobile::AbstractMatrix; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     size(reference, 2) == 3 && size(mobile, 2) == 3 || throw(ArgumentError("coordinates must be N×3 matrices"))
     size(reference, 1) == size(mobile, 1) || throw(ArgumentError("point sets must have the same length"))
     npoints = size(reference, 1)
@@ -2675,7 +2837,9 @@ function kabsch(reference::AbstractMatrix, mobile::AbstractMatrix)
     translation = reference_centroid .- vec(mobile_centroid' * rotation)
     aligned = mobile * rotation .+ translation'
     rmsd_value = sqrt(sum((reference .- aligned) .^ 2) / npoints)
-    return SuperpositionResult(rotation, translation, rmsd_value), aligned
+    result = SuperpositionResult(rotation, translation, rmsd_value)
+    _ctx !== nothing && register_provenance!(_ctx, "kabsch"; parents=String[], parameters=(point_count=npoints, rmsd=rmsd_value))
+    return result, aligned
 end
 
 function _coordinates(entity)
@@ -2685,11 +2849,14 @@ function _coordinates(entity)
     throw(ArgumentError("unsupported coordinate container"))
 end
 
-function rmsd(reference, mobile; superpose::Bool=true)
+function rmsd(reference, mobile; superpose::Bool=true, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     reference_points = _coordinates(reference)
     mobile_points = _coordinates(mobile)
     if superpose
-        result, _ = kabsch(reference_points, mobile_points)
+        result, _ = kabsch(reference_points, mobile_points; _ctx=_ctx)
+    if _ctx !== nothing
+        register_provenance!(_ctx, "rmsd"; parents=provenance_parent_ids(reference, mobile), parameters=(superpose=superpose, rmsd=result.rmsd))
+        end
         return result.rmsd
     end
     size(reference_points) == size(mobile_points) || throw(ArgumentError("point sets must have the same shape"))
@@ -2702,7 +2869,9 @@ function rmsd(reference, mobile; superpose::Bool=true)
         dz = reference_points[row, 3] - mobile_points[row, 3]
         total += dx * dx + dy * dy + dz * dz
     end
-    return sqrt(total / count)
+    value = sqrt(total / count)
+    _ctx !== nothing && register_provenance!(_ctx, "rmsd"; parents=provenance_parent_ids(reference, mobile), parameters=(superpose=superpose, point_count=count, rmsd=value))
+    return value
 end
 
 function _apply_transform!(atoms::AbstractVector{Atom}, rotation::Matrix{Float64}, translation::Vector{Float64})
@@ -2717,17 +2886,19 @@ function _apply_transform!(atoms::AbstractVector{Atom}, rotation::Matrix{Float64
     return atoms
 end
 
-function superpose(reference, mobile)
-    result, _ = kabsch(_coordinates(reference), _coordinates(mobile))
+function superpose(reference, mobile; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result, _ = kabsch(_coordinates(reference), _coordinates(mobile); _ctx=_ctx)
+    _ctx !== nothing && register_provenance!(_ctx, "superpose"; parents=provenance_parent_ids(reference, mobile), parameters=(rmsd=result.rmsd))
     return result
 end
 
-function superpose!(reference, mobile)
+function superpose!(reference, mobile; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     reference_points = _coordinates(reference)
     mobile_points = _coordinates(mobile)
-    result, _ = kabsch(reference_points, mobile_points)
+    result, _ = kabsch(reference_points, mobile_points; _ctx=_ctx)
     mobile isa Structure && _apply_transform!(structure_atoms(mobile), result.rotation, result.translation)
     mobile isa AbstractVector{Atom} && _apply_transform!(mobile, result.rotation, result.translation)
+    _ctx !== nothing && register_provenance!(_ctx, "superpose!"; parents=provenance_parent_ids(reference, mobile), parameters=(rmsd=result.rmsd))
     return result
 end
 
@@ -2741,7 +2912,7 @@ function _model_atoms(model::Model)
     return atoms
 end
 
-function _selected_model_atoms(model::Model; atom_selector::Union{Symbol,AbstractString}=Symbol("CA"))
+function _selected_model_atoms(model::Model; atom_selector::Union{Symbol,String}=Symbol("CA"))
     atoms = Atom[]
     normalized = atom_selector isa Symbol ? atom_selector : Symbol(uppercase(String(atom_selector)))
     for chain in model.chains
@@ -2762,7 +2933,7 @@ function _selected_model_atoms(model::Model; atom_selector::Union{Symbol,Abstrac
     return atoms
 end
 
-function superpose_models!(structure::Structure; reference_index::Int=1, atom_selector::Union{Symbol,AbstractString}=Symbol("CA"))
+function superpose_models!(structure::Structure; reference_index::Int=1, atom_selector::Union{Symbol,String}=Symbol("CA"), prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     1 <= reference_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     reference_model = structure.models[reference_index]
     reference_points = coordinate_matrix(_selected_model_atoms(reference_model; atom_selector=atom_selector))
@@ -2772,14 +2943,15 @@ function superpose_models!(structure::Structure; reference_index::Int=1, atom_se
         mobile_points = coordinate_matrix(_selected_model_atoms(model; atom_selector=atom_selector))
         common = min(size(reference_points, 1), size(mobile_points, 1))
         common == 0 && continue
-        result, _ = kabsch(reference_points[1:common, :], mobile_points[1:common, :])
+        result, _ = kabsch(reference_points[1:common, :], mobile_points[1:common, :]; _ctx=_ctx)
         _apply_transform!(_model_atoms(model), result.rotation, result.translation)
         push!(results, (model_id=model.id, rmsd=result.rmsd))
     end
+    _ctx !== nothing && register_provenance!(_ctx, "superpose_models!"; parents=provenance_parent_ids(structure), parameters=(reference_index=reference_index, atom_selector=atom_selector, model_count=length(structure.models), result_count=length(results)))
     return results
 end
 
-function ensemble_rmsd_matrix(structure::Structure; atom_selector::Union{Symbol,AbstractString}=Symbol("CA"), superpose::Bool=true)
+function ensemble_rmsd_matrix(structure::Structure; atom_selector::Union{Symbol,String}=Symbol("CA"), superpose::Bool=true, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     count = length(structure.models)
     labels = [string("model ", model.id) for model in structure.models]
     matrix = zeros(Float64, count, count)
@@ -2792,14 +2964,16 @@ function ensemble_rmsd_matrix(structure::Structure; atom_selector::Union{Symbol,
                 matrix[j, i] = NaN
                 continue
             end
-            matrix[i, j] = superpose ? kabsch(selected[i][1:common, :], selected[j][1:common, :])[1].rmsd : rmsd(selected[i][1:common, :], selected[j][1:common, :]; superpose=false)
+            matrix[i, j] = superpose ? kabsch(selected[i][1:common, :], selected[j][1:common, :]; _ctx=_ctx)[1].rmsd : rmsd(selected[i][1:common, :], selected[j][1:common, :]; superpose=false, _ctx=_ctx)
             matrix[j, i] = matrix[i, j]
         end
     end
-    return (matrix=matrix, labels=labels, atom_selector=atom_selector)
+    result = (matrix=matrix, labels=labels, atom_selector=atom_selector)
+    _ctx !== nothing && register_provenance!(_ctx, "ensemble_rmsd_matrix"; parents=provenance_parent_ids(structure), parameters=(atom_selector=atom_selector, superpose=superpose, model_count=count))
+    return result
 end
 
-function trajectory_statistics(structure::Structure; reference_index::Int=1, atom_selector::Union{Symbol,AbstractString}=Symbol("CA"))
+function trajectory_statistics(structure::Structure; reference_index::Int=1, atom_selector::Union{Symbol,String}=Symbol("CA"), prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     1 <= reference_index <= length(structure.models) || throw(ArgumentError("model index out of bounds"))
     reference = structure.models[reference_index]
     reference_points = coordinate_matrix(_selected_model_atoms(reference; atom_selector=atom_selector))
@@ -2811,20 +2985,21 @@ function trajectory_statistics(structure::Structure; reference_index::Int=1, ato
         common = min(size(reference_points, 1), size(selected, 1))
         common == 0 && push!(per_model, (model_id=model.id, rmsd=NaN))
         common == 0 && continue
-        push!(per_model, (model_id=model.id, rmsd=rmsd(reference_points[1:common, :], selected[1:common, :]; superpose=true)))
+        push!(per_model, (model_id=model.id, rmsd=rmsd(reference_points[1:common, :], selected[1:common, :]; superpose=true, _ctx=_ctx)))
     end
     rmsd_values = [entry.rmsd for entry in per_model if isfinite(entry.rmsd)]
-    return (
+    result = (
         reference_model=reference.id,
         atom_selector=atom_selector,
         model_count=length(structure.models),
         per_model=per_model,
         mean_rmsd=isempty(rmsd_values) ? NaN : mean(rmsd_values),
-        max_rmsd=isempty(rmsd_values) ? NaN : maximum(rmsd_values),
-    )
+        max_rmsd=isempty(rmsd_values) ? NaN : maximum(rmsd_values))
+    _ctx !== nothing && register_provenance!(_ctx, "trajectory_statistics"; parents=provenance_parent_ids(structure), parameters=(reference_index=reference_index, atom_selector=atom_selector, model_count=length(structure.models)))
+    return result
 end
 
-function _atom_lookup(residue::Residue, name::AbstractString)
+function _atom_lookup(residue::Residue, name::String)
     for atom in residue.atoms
         strip(atom.name) == strip(name) && return atom
     end
@@ -2840,7 +3015,8 @@ function torsion_angle(p1, p2, p3, p4)
     norm_v2 = norm(v2)
     norm_v2 == 0 && return NaN
     m1 = cross(n1, v2 ./ norm_v2)
-    return atan(dot(m1, n2), dot(n1, n2)) * 180 / π
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, atan(dot(m1, n2), dot(n1, n2)) * 180 / π, "torsion_angle")
 end
 
 function phi_psi(chain::Chain, residue_index::Int)
@@ -2865,7 +3041,8 @@ function phi_psi(chain::Chain, residue_index::Int)
         next_n !== nothing && (psi = torsion_angle(atom_coordinates(residue_n), atom_coordinates(residue_ca), atom_coordinates(residue_c), atom_coordinates(next_n)))
     end
 
-    return (phi=phi, psi=psi)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (phi=phi, psi=psi), "phi_psi")
 end
 
 function backbone_torsions(chain::Chain)
@@ -2874,7 +3051,8 @@ function backbone_torsions(chain::Chain)
         torsions = phi_psi(chain, index)
         values[index] = (index=index, phi=torsions.phi, psi=torsions.psi)
     end
-    return values
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, values, "backbone_torsions")
 end
 
 function _kd_build(points::Vector{Atom}, depth::Int)
@@ -2890,13 +3068,15 @@ function _kd_build(points::Vector{Atom}, depth::Int)
 end
 
 function build_atom_kdtree(atoms::AbstractVector{Atom})
-    return AtomKDTree(_kd_build(Vector{Atom}(atoms), 1))
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, AtomKDTree(_kd_build(Vector{Atom}(atoms), 1)), "build_atom_kdtree")
 end
 
 build_atom_kdtree(structure::Structure) = build_atom_kdtree(structure_atoms(structure))
 
 function _radius_search!(matches::Vector{Atom}, node::Union{Nothing,KDTreeNode{Atom}}, point::NTuple{3,Float64}, radius2::Float64)
     node === nothing && return matches
+    radius = sqrt(radius2)
     dx = point[1] - node.point[1]
     dy = point[2] - node.point[2]
     dz = point[3] - node.point[3]
@@ -2904,10 +3084,10 @@ function _radius_search!(matches::Vector{Atom}, node::Union{Nothing,KDTreeNode{A
         push!(matches, node.payload)
     end
     axis_delta = point[node.axis] - node.point[node.axis]
-    if axis_delta <= sqrt(radius2)
+    if axis_delta <= radius
         _radius_search!(matches, node.left, point, radius2)
     end
-    if axis_delta >= -sqrt(radius2)
+    if axis_delta >= -radius
         _radius_search!(matches, node.right, point, radius2)
     end
     return matches
@@ -2916,7 +3096,8 @@ end
 function atoms_within_radius(tree::AtomKDTree, point::NTuple{3,Real}; radius::Real=5.0)
     matches = Atom[]
     _radius_search!(matches, tree.root, (Float64(point[1]), Float64(point[2]), Float64(point[3])), Float64(radius)^2)
-    return matches
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, matches, "atoms_within_radius")
 end
 
 atoms_within_radius(structure::Structure, point::NTuple{3,Real}; radius::Real=5.0) = atoms_within_radius(build_atom_kdtree(structure), point; radius=radius)
@@ -2991,10 +3172,18 @@ function structure_geometry(structure::Structure; bond_cutoff::Real=1.9)
         end
     end
 
-    return (positions=positions, colors=colors, bonds=bonds, chains=chains, residues=residues)
+    result = (positions=positions, colors=colors, bonds=bonds, chains=chains, residues=residues)
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "structure_geometry"; parents=provenance_parent_ids(structure), parameters=(bond_cutoff=bond_cutoff, atom_count=length(atoms), bond_count=length(bonds)))
+    return result
 end
 
-structure_pointcloud(structure::Structure) = (points=coordinate_matrix(structure), colors=[_element_color(atom.element) for atom in structure_atoms(structure)])
+function structure_pointcloud(structure::Structure)
+    result = (points=coordinate_matrix(structure), colors=[_element_color(atom.element) for atom in structure_atoms(structure)])
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "structure_pointcloud"; parents=provenance_parent_ids(structure), parameters=(atom_count=size(result.points, 1)))
+    return result
+end
 
 function _structure_to_temp_pdb(input::Structure)
     temp_path, io = mktemp(suffix=".pdb")
@@ -3006,7 +3195,7 @@ function _structure_to_temp_pdb(input::Structure)
     return temp_path
 end
 
-function _structure_input_path(input::AbstractString)
+function _structure_input_path(input::String)
     return input
 end
 
@@ -3014,21 +3203,30 @@ function _structure_input_path(input::Structure)
     return _structure_to_temp_pdb(input)
 end
 
-function run_dssp(input::Union{AbstractString,Structure}; command::AbstractString="mkdssp", args::AbstractVector{<:AbstractString}=String[])
+function run_dssp(input::Union{String,Structure}; command::String="mkdssp", args::AbstractVector{<:String}=String[])
     input_path = _structure_input_path(input)
     try
         cmd = Cmd(vcat(String(command), String.(collect(args)), String(input_path)))
-        return read(cmd, String)
+        output = read(cmd, String)
+        if _ctx !== nothing
+            provenance_hash = input isa String && isfile(input_path) ? bytes2hex(sha256(read(input_path))) : nothing
+            register_provenance!(_ctx, "run_dssp"; parents=provenance_parent_ids(input), parameters=(command=String(command), input=String(input_path), args=String.(collect(args)), output_length=length(output), hash=provenance_hash))
+        end
+        return output
     finally
         input isa Structure && isfile(input_path) && rm(input_path, force=true)
     end
 end
 
-function run_pdb2pqr(input::Union{AbstractString,Structure}, output_path::AbstractString; command::AbstractString="pdb2pqr30", args::AbstractVector{<:AbstractString}=String[])
+function run_pdb2pqr(input::Union{String,Structure}, output_path::String; command::String="pdb2pqr30", args::AbstractVector{<:String}=String[])
     input_path = _structure_input_path(input)
     try
         cmd = Cmd(vcat(String(command), String.(collect(args)), String(input_path), String(output_path)))
         run(cmd)
+        if _ctx !== nothing
+            provenance_hash = isfile(output_path) ? bytes2hex(sha256(read(output_path))) : nothing
+            register_provenance!(_ctx, "run_pdb2pqr"; parents=provenance_parent_ids(input), parameters=(command=String(command), input=String(input_path), output=String(output_path), args=String.(collect(args)), hash=provenance_hash))
+        end
         return output_path
     finally
         input isa Structure && isfile(input_path) && rm(input_path, force=true)

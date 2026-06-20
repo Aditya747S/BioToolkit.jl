@@ -49,6 +49,7 @@ END
         tree = BioToolkit.build_atom_kdtree(structure)
         neighbors = BioToolkit.atoms_within_radius(tree, BioToolkit.structure_atoms(structure)[1]; radius=2.5)
         @test !isempty(neighbors)
+        @test_throws ArgumentError BioToolkit.structure_sasa(structure; probe=0.0)
 
         geometry = BioToolkit.structure_geometry(structure)
         @test size(geometry.positions) == (6, 3)
@@ -139,8 +140,11 @@ END
     structure = BioToolkit.Structure("example")
     push!(structure.models, model)
 
+    @test BioToolkit.sequence_from_structure(chain) isa BioToolkit.AASeq
     @test BioToolkit.sequence_from_structure(chain) == "AGS"
+    @test BioToolkit.sequence_from_structure(structure; model_index=1) isa BioToolkit.AASeq
     @test BioToolkit.sequence_from_structure(structure; model_index=1) == "AGSK"
+    @test BioToolkit.structure_sequences(structure)["1:A"] isa BioToolkit.AASeq
     @test BioToolkit.structure_sequences(structure)["1:A"] == "AGS"
     @test BioToolkit.residue_property(chain.residues[1], :hydrophobic)
     @test BioToolkit.residue_property(chain.residues[3], :polar)

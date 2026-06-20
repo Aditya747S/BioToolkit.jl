@@ -1,6 +1,12 @@
 using DataFrames
+using .BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id
 
 export AbstractFeatureLocation, FeatureLocationLite, CompoundFeatureLocation, SeqFeatureLite, AnnotatedSeqRecord, feature_spans, feature_bounds, feature_start, feature_stop, parse_feature_location, SangerTrace
+
+@inline function _register_annotation_result!(_explicit_ctx, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    _ctx = active_provenance_context(_explicit_ctx)
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
 
 """
     AbstractFeatureLocation
@@ -52,8 +58,8 @@ end
 Mutable annotated sequence record with metadata, per-letter annotations, and
 feature storage.
 """
-mutable struct AnnotatedSeqRecord
-    sequence::String
+mutable struct AnnotatedSeqRecord{A <: BioAlphabet}
+    sequence::BioSequence{A}
     identifier::String
     name::String
     description::String
@@ -68,7 +74,7 @@ end
 Chromatogram-style Sanger sequencing trace with signal arrays and qualities.
 """
 struct SangerTrace
-    sequence::String
+    sequence::BioSequence{DNAAlphabet}
     qualities::Vector{UInt8}
     trace_a::Vector{UInt16}
     trace_c::Vector{UInt16}
@@ -89,14 +95,14 @@ FeatureLocationLite(start::Integer, stop::Integer; strand::Integer=1, partial_st
 
 Construct a compound feature location from a list of child locations.
 """
-CompoundFeatureLocation(operator::AbstractString, parts::AbstractVector{<:AbstractFeatureLocation}; strand::Integer=1) = CompoundFeatureLocation(String(operator), AbstractFeatureLocation[part for part in parts], Int8(strand))
+CompoundFeatureLocation(operator::String, parts::AbstractVector{<:AbstractFeatureLocation}; strand::Integer=1) = CompoundFeatureLocation(String(operator), AbstractFeatureLocation[part for part in parts], Int8(strand))
 
 """
     SeqFeatureLite(feature_type, location; qualifiers=..., id="")
 
 Construct a lightweight feature record from a type string and location.
 """
-function SeqFeatureLite(feature_type::AbstractString, location::AbstractFeatureLocation; qualifiers::AbstractDict=Dict{String,Vector{String}}(), id::AbstractString="")
+function SeqFeatureLite(feature_type::String, location::AbstractFeatureLocation; qualifiers::AbstractDict=Dict{String,Vector{String}}(), id::String="")
     return SeqFeatureLite(String(feature_type), location, Dict{String,Vector{String}}(qualifiers), String(id))
 end
 
@@ -106,22 +112,32 @@ end
 Construct a mutable annotated record from raw sequence and associated metadata.
 """
 function AnnotatedSeqRecord(
-    sequence::AbstractString;
-    identifier::AbstractString="",
-    name::AbstractString=identifier,
-    description::AbstractString=name,
+    sequence::BioSequence{A};
+    identifier::String="",
+    name::String=identifier,
+    description::String=name,
     annotations::AbstractDict=Dict{Symbol,Any}(),
     letter_annotations::AbstractDict=Dict{Symbol,Any}(),
     features::AbstractVector{SeqFeatureLite}=SeqFeatureLite[],
-)
+) where {A <: BioAlphabet}
     feature_vector = features isa Vector{SeqFeatureLite} ? features : SeqFeatureLite[feature for feature in features]
-    return AnnotatedSeqRecord(
-        String(sequence),
+    normalized_letter_annotations = Dict{Symbol,Any}(letter_annotations)
+    for (key, value) in normalized_letter_annotations
+        if value isa String
+            length(value) == length(sequence) || throw(ArgumentError("letter annotation '$key' length $(length(value)) must match sequence length $(length(sequence))"))
+        elseif value isa AbstractVector
+            length(value) == length(sequence) || throw(ArgumentError("letter annotation '$key' length $(length(value)) must match sequence length $(length(sequence))"))
+        end
+    end
+    annotations_copy = Dict{Symbol,Any}(annotations)
+    ensure_provenance_id!(annotations_copy)
+    return AnnotatedSeqRecord{A}(
+        sequence,
         String(identifier),
         String(name),
         String(description),
-        Dict{Symbol,Any}(annotations),
-        Dict{Symbol,Any}(letter_annotations),
+        annotations_copy,
+        normalized_letter_annotations,
         feature_vector,
     )
 end
@@ -131,7 +147,7 @@ end
 
 Return the sequence length of an annotated record in code units.
 """
-Base.length(record::AnnotatedSeqRecord) = ncodeunits(record.sequence)
+Base.length(record::AnnotatedSeqRecord) = length(record.sequence)
 
 """
     Base.show(io, location)
@@ -168,7 +184,7 @@ end
 Render a compact summary for an annotated sequence record.
 """
 function Base.show(io::IO, record::AnnotatedSeqRecord)
-    print(io, "AnnotatedSeqRecord(", record.identifier, ", ", length(record.sequence), " bp, features=", length(record.features), ")")
+    print(io, "AnnotatedSeqRecord(", record.identifier, ", ", length(record), " bp, features=", length(record.features), ", ", container_provenance_summary(record), ")")
 end
 
 """
@@ -176,8 +192,12 @@ end
 
 Return the genomic span covered by a feature location.
 """
-function feature_spans(location::FeatureLocationLite)
-    return [(location.start, location.stop)]
+function feature_spans(location::FeatureLocationLite; prov_ctx=nothing)
+    result = [(location.start, location.stop)]
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, result, "feature_spans"; parents=String[], parameters=(kind="FeatureLocationLite", span_count=length(result)))
 end
 
 """
@@ -185,8 +205,12 @@ end
 
 Return the spans covered by each part of a compound feature location.
 """
-function feature_spans(location::CompoundFeatureLocation)
-    return [feature_bounds(part) for part in location.parts]
+function feature_spans(location::CompoundFeatureLocation; prov_ctx=nothing)
+    result = [feature_bounds(part) for part in location.parts]
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, result, "feature_spans"; parents=String[], parameters=(kind="CompoundFeatureLocation", span_count=length(result)))
 end
 
 """
@@ -202,7 +226,11 @@ feature_spans(feature::SeqFeatureLite) = feature_spans(feature.location)
 Return the first coordinate covered by a feature location.
 """
 function feature_start(location::AbstractFeatureLocation)
-    return feature_bounds(location)[1]
+    result = feature_bounds(location)[1]
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_start"; parents=String[], parameters=(start=result))
 end
 
 """
@@ -218,7 +246,11 @@ feature_start(feature::SeqFeatureLite) = feature_start(feature.location)
 Return the last coordinate covered by a feature location.
 """
 function feature_stop(location::AbstractFeatureLocation)
-    return feature_bounds(location)[2]
+    result = feature_bounds(location)[2]
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_stop"; parents=String[], parameters=(stop=result))
 end
 
 """
@@ -278,7 +310,7 @@ end
 
 Return the first qualifier value stored under `key`.
 """
-function feature_annotation(feature::SeqFeatureLite, key::AbstractString; default=nothing)
+function feature_annotation(feature::SeqFeatureLite, key::String; default=nothing)
     values = get(feature.qualifiers, String(key), nothing)
     values === nothing && return default
     isempty(values) && return default
@@ -352,6 +384,7 @@ function feature_overlaps(left::AbstractFeatureLocation, right::AbstractFeatureL
 
     left_start, left_stop = feature_bounds(left::FeatureLocationLite)
     right_start, right_stop = feature_bounds(right::FeatureLocationLite)
+
     return max(left_start, right_start) <= min(left_stop, right_stop)
 end
 
@@ -379,9 +412,8 @@ feature_overlaps(location::AbstractFeatureLocation, feature::SeqFeatureLite) = f
 
 Extract the subsequence covered by a feature location.
 """
-function feature_extract(sequence::AbstractString, location::AbstractFeatureLocation)
-    return feature_sequence(sequence, location)
-end
+feature_extract(sequence::BioSequence, location::AbstractFeatureLocation) = feature_sequence(sequence, location)
+feature_extract(sequence, location::AbstractFeatureLocation) = feature_sequence(BioSequence{DNAAlphabet}(String(sequence)), location)
 
 """
     feature_extract(record, feature)
@@ -395,11 +427,21 @@ feature_extract(record::AnnotatedSeqRecord, feature::SeqFeatureLite) = feature_s
 
 Slice a sequence record while preserving annotation metadata where possible.
 """
-function feature_slice(record::SeqRecordLite, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false)
+function feature_slice(record::SeqRecordLite{A}, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false) where {A <: BioAlphabet}
     slice_start <= slice_stop || throw(ArgumentError("slice_start must be <= slice_stop"))
     start_index = max(1, Int(slice_start))
     stop_index = min(lastindex(record.sequence), Int(slice_stop))
-    start_index > stop_index && return SeqRecordLite("")
+    if start_index > stop_index
+        result = SeqRecordLite(
+            BioSequence{A}(UInt8[]; validate=false);
+            identifier=record.identifier,
+            name=record.name,
+            description=record.description,
+            annotations=copy(record.annotations),
+            letter_annotations=Dict{Symbol,Any}(),
+        )
+        return _register_annotation_result!(_ctx, result, "feature_slice"; parents=provenance_parent_ids(record), parameters=(slice_start=slice_start, slice_stop=slice_stop, reverse_complemented=reverse_complemented, empty=true))
+    end
 
     sliced_sequence = record.sequence[start_index:stop_index]
     if reverse_complemented
@@ -411,7 +453,7 @@ function feature_slice(record::SeqRecordLite, slice_start::Integer, slice_stop::
         sliced_letter_annotations[key] = _slice_letter_annotation(value, start_index, stop_index; reverse_complemented=reverse_complemented)
     end
 
-    return SeqRecordLite(
+    result = SeqRecordLite(
         sliced_sequence;
         identifier=record.identifier,
         name=record.name,
@@ -419,6 +461,10 @@ function feature_slice(record::SeqRecordLite, slice_start::Integer, slice_stop::
         annotations=copy(record.annotations),
         letter_annotations=sliced_letter_annotations,
     )
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_slice"; parents=provenance_parent_ids(record), parameters=(slice_start=slice_start, slice_stop=slice_stop, reverse_complemented=reverse_complemented, empty=false))
 end
 
 """
@@ -427,6 +473,7 @@ end
 Slice an annotated record and remap its features into the sliced coordinate system.
 """
 function feature_slice(record::AnnotatedSeqRecord, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false)
+
     return slice_annotated_record(record, slice_start, slice_stop; reverse_complemented=reverse_complemented)
 end
 
@@ -436,6 +483,7 @@ end
 Slice a GenBank record via its annotated-record representation.
 """
 function feature_slice(record::GenBankRecord, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false)
+
     return feature_slice(annotate_genbank_record(record), slice_start, slice_stop; reverse_complemented=reverse_complemented)
 end
 
@@ -486,7 +534,6 @@ function slice_feature_location(location::FeatureLocationLite, slice_start::Inte
         relative_start, relative_stop = slice_length - relative_stop + 1, slice_length - relative_start + 1
         return FeatureLocationLite(relative_start, relative_stop; strand=-location.strand, partial_start=location.partial_start || clipped_start > location.start, partial_stop=location.partial_stop || clipped_stop < location.stop)
     end
-
     return FeatureLocationLite(relative_start, relative_stop; strand=location.strand, partial_start=location.partial_start || clipped_start > location.start, partial_stop=location.partial_stop || clipped_stop < location.stop)
 end
 
@@ -517,6 +564,7 @@ Remap a feature record into a sliced coordinate system.
 function slice_feature(feature::SeqFeatureLite, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false)
     sliced_location = slice_feature_location(feature.location, slice_start, slice_stop; reverse_complemented=reverse_complemented)
     sliced_location === nothing && return nothing
+
     return SeqFeatureLite(feature.feature_type, sliced_location, feature.qualifiers, feature.id)
 end
 
@@ -526,7 +574,7 @@ end
 Slice per-letter annotations in the same span as the parent record.
 """
 function _slice_letter_annotation(value, slice_start::Int, slice_stop::Int; reverse_complemented::Bool=false)
-    value isa AbstractString || return value
+    value isa String || return value
     lastindex(value) < slice_stop && return value
     sliced = value[slice_start:slice_stop]
     return reverse_complemented ? reverse(sliced) : sliced
@@ -537,11 +585,22 @@ end
 
 Slice an annotated record while preserving metadata and remapping features.
 """
-function slice_annotated_record(record::AnnotatedSeqRecord, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false)
+function slice_annotated_record(record::AnnotatedSeqRecord{A}, slice_start::Integer, slice_stop::Integer; reverse_complemented::Bool=false) where {A <: BioAlphabet}
     slice_start <= slice_stop || throw(ArgumentError("slice_start must be <= slice_stop"))
     start_index = max(1, Int(slice_start))
-    stop_index = min(lastindex(record.sequence), Int(slice_stop))
-    start_index > stop_index && return AnnotatedSeqRecord("")
+    stop_index = min(length(record.sequence), Int(slice_stop))
+    if start_index > stop_index
+        result = AnnotatedSeqRecord(
+            BioSequence{A}(UInt8[]; validate=false);
+            identifier=record.identifier,
+            name=record.name,
+            description=record.description,
+            annotations=copy(record.annotations),
+            letter_annotations=Dict{Symbol,Any}(),
+            features=SeqFeatureLite[],
+        )
+        return _register_annotation_result!(_ctx, result, "slice_annotated_record"; parents=provenance_parent_ids(record), parameters=(slice_start=slice_start, slice_stop=slice_stop, reverse_complemented=reverse_complemented, empty=true))
+    end
 
     sliced_sequence = record.sequence[start_index:stop_index]
     if reverse_complemented
@@ -561,7 +620,7 @@ function slice_annotated_record(record::AnnotatedSeqRecord, slice_start::Integer
         sliced_letter_annotations[key] = _slice_letter_annotation(value, start_index, stop_index; reverse_complemented=reverse_complemented)
     end
 
-    return AnnotatedSeqRecord(
+    result = AnnotatedSeqRecord(
         sliced_sequence;
         identifier=record.identifier,
         name=record.name,
@@ -570,6 +629,10 @@ function slice_annotated_record(record::AnnotatedSeqRecord, slice_start::Integer
         letter_annotations=sliced_letter_annotations,
         features=sliced_features,
     )
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "slice_annotated_record"; parents=provenance_parent_ids(record), parameters=(slice_start=slice_start, slice_stop=slice_stop, reverse_complemented=reverse_complemented, empty=false))
 end
 
 Base.getindex(record::AnnotatedSeqRecord, range::UnitRange{<:Integer}) = slice_annotated_record(record, first(range), last(range))
@@ -580,6 +643,7 @@ Base.getindex(record::AnnotatedSeqRecord, range::UnitRange{<:Integer}) = slice_a
 Return a reverse-complemented annotated record with remapped features.
 """
 function reverse_complement(record::AnnotatedSeqRecord)
+
     return slice_annotated_record(record, 1, length(record.sequence); reverse_complemented=true)
 end
 
@@ -589,7 +653,7 @@ end
 Return a short text summary of a feature record.
 """
 function feature_summary(feature::SeqFeatureLite)
-    return (
+    result = (
         feature_type = feature.feature_type,
         identifier = feature_identifier(feature),
         strand = feature_strand(feature),
@@ -598,6 +662,10 @@ function feature_summary(feature::SeqFeatureLite)
         spans = feature_spans(feature),
         qualifiers = feature_annotations(feature),
     )
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_summary"; parents=provenance_parent_ids(feature), parameters=(feature_type=feature.feature_type, identifier=feature.id))
 end
 
 """
@@ -639,6 +707,7 @@ function select_features(
     strand=nothing,
     qualifier_key=nothing,
     qualifier_value=nothing,
+    prov_ctx=nothing,
 )
     selected = SeqFeatureLite[]
     for feature in record.features
@@ -671,7 +740,10 @@ function select_features(
         push!(selected, feature)
     end
 
-    return selected
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, selected, "select_features"; parents=provenance_parent_ids(record), parameters=(feature_count=length(selected), feature_type=feature_type === nothing ? "all" : string(feature_type), has_region=region !== nothing))
 end
 
 features_at(record::AnnotatedSeqRecord, position::Integer) = select_features(record; region=position)
@@ -682,6 +754,7 @@ features_at(record::AnnotatedSeqRecord, position::Integer) = select_features(rec
 Return the features in a record that overlap a query location.
 """
 function features_overlapping(record::AnnotatedSeqRecord, region::AbstractFeatureLocation)
+
     return select_features(record; region=region)
 end
 
@@ -691,6 +764,7 @@ end
 Return the features in a record that overlap a coordinate interval.
 """
 function features_overlapping(record::AnnotatedSeqRecord, start::Integer, stop::Integer)
+
     return select_features(record; region=(start, stop))
 end
 
@@ -699,8 +773,12 @@ end
 
 Convert annotated features into a tabular DataFrame.
 """
-function feature_table(record::AnnotatedSeqRecord)
-    return [feature_summary(feature) for feature in record.features]
+function feature_table(record::AnnotatedSeqRecord; prov_ctx=nothing)
+    result = [feature_summary(feature) for feature in record.features]
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, result, "feature_table"; parents=provenance_parent_ids(record), parameters=(row_count=length(result)))
 end
 
 """
@@ -796,11 +874,15 @@ end
 
 Parse a GenBank- or GFF-style feature location string into a typed location.
 """
-function parse_feature_location(location::AbstractString)
+function parse_feature_location(location::AbstractString; prov_ctx=nothing)
     key = String(location)
-    return get!(_FEATURE_LOCATION_CACHE, key) do
+    result = get!(_FEATURE_LOCATION_CACHE, key) do
         _parse_feature_location_uncached(key)
     end
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, result, "parse_feature_location"; parents=String[], parameters=(location=key, location_type=string(typeof(result))))
 end
 
 """
@@ -809,7 +891,11 @@ end
 Return the outer coordinate bounds for a simple feature location.
 """
 function feature_bounds(location::FeatureLocationLite)
-    return location.start, location.stop
+    result = (location.start, location.stop)
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_bounds"; parents=String[], parameters=(kind="FeatureLocationLite", start=location.start, stop=location.stop))
 end
 
 """
@@ -825,7 +911,11 @@ function feature_bounds(location::CompoundFeatureLocation)
         push!(starts, start)
         push!(stops, stop)
     end
-    return minimum(starts), maximum(stops)
+    result = (minimum(starts), maximum(stops))
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_bounds"; parents=String[], parameters=(kind="CompoundFeatureLocation", start=result[1], stop=result[2]))
 end
 
 """
@@ -851,12 +941,18 @@ end
 
 Extract the sequence segment covered by a simple feature location.
 """
-function feature_sequence(sequence::AbstractString, location::FeatureLocationLite)
-    start = max(1, location.start)
-    stop = min(lastindex(sequence), location.stop)
-    start > stop && return ""
+function feature_sequence(sequence::BioSequence, location::FeatureLocationLite)
+    lower = min(location.start, location.stop)
+    upper = max(location.start, location.stop)
+    start = max(1, lower)
+    stop = min(length(sequence), upper)
+    start > stop && return BioSequence{alphabet(sequence)}(UInt8[]; validate=false)
     subsequence = sequence[start:stop]
-    return location.strand == -1 ? reverse_complement(subsequence) : subsequence
+    result = location.strand == -1 ? reverse_complement(subsequence) : subsequence
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_sequence"; parents=provenance_parent_ids(sequence), parameters=(kind="FeatureLocationLite", length=length(result), strand=location.strand))
 end
 
 """
@@ -864,9 +960,16 @@ end
 
 Extract the sequence segments covered by a compound feature location.
 """
-function feature_sequence(sequence::AbstractString, location::CompoundFeatureLocation)
-    extracted = join(feature_sequence(sequence, part) for part in location.parts)
-    return location.strand == -1 ? reverse_complement(extracted) : extracted
+function feature_sequence(sequence::BioSequence, location::CompoundFeatureLocation)
+    alphabet_type = alphabet(sequence)
+    parts = [feature_sequence(sequence, part) for part in location.parts]
+    isempty(parts) && return BioSequence{alphabet_type}(UInt8[]; validate=false)
+    concatenated = BioSequence{alphabet_type}(vcat((part.data for part in parts)...); validate=false)
+    result = location.strand == -1 ? reverse_complement(concatenated) : concatenated
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "feature_sequence"; parents=provenance_parent_ids(sequence), parameters=(kind="CompoundFeatureLocation", length=length(result), strand=location.strand))
 end
 
 """
@@ -914,7 +1017,7 @@ end
 Convert parsed GFF records into lightweight feature records.
 """
 function annotate_gff_records(records::AbstractVector{GffRecord})
-    return AnnotatedSeqRecord[
+    result = AnnotatedSeqRecord[
         AnnotatedSeqRecord(
             "";
             identifier=record.chrom,
@@ -931,6 +1034,10 @@ function annotate_gff_records(records::AbstractVector{GffRecord})
             features=[SeqFeatureLite(record)],
         ) for record in records
     ]
+    _ctx = active_provenance_context()
+
+
+    return _register_annotation_result!(_ctx, result, "annotate_gff_records"; parents=provenance_parent_ids(records), parameters=(record_count=length(result)))
 end
 
 """
@@ -938,7 +1045,7 @@ end
 
 Convert a parsed GenBank record into an annotated sequence record.
 """
-function annotate_genbank_record(record::GenBankRecord)
+function annotate_genbank_record(record::GenBankRecord; prov_ctx=nothing)
     annotations = Dict{Symbol,Any}(
         :accessions => record.accession == "" ? String[] : [record.accession],
         :version => record.version,
@@ -951,7 +1058,7 @@ function annotate_genbank_record(record::GenBankRecord)
     @inbounds for index in eachindex(record.features)
         features[index] = SeqFeatureLite(record.features[index])
     end
-    return AnnotatedSeqRecord(
+    result = AnnotatedSeqRecord(
         record.sequence;
         identifier=record.accession == "" ? record.locus : record.accession,
         name=record.locus,
@@ -959,6 +1066,10 @@ function annotate_genbank_record(record::GenBankRecord)
         annotations=annotations,
         features=features,
     )
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return _register_annotation_result!(_ctx, result, "annotate_genbank_record"; parents=provenance_parent_ids(record), parameters=(feature_count=length(features), identifier=result.identifier))
 end
 
 """
@@ -966,8 +1077,12 @@ end
 
 Convert parsed GenBank records into annotated sequence records.
 """
-function annotate_genbank_records(records::AbstractVector{GenBankRecord})
-    return AnnotatedSeqRecord[annotate_genbank_record(record) for record in records]
+function annotate_genbank_records(records::AbstractVector{GenBankRecord}; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    result = AnnotatedSeqRecord[annotate_genbank_record(record; prov_ctx=_ctx) for record in records]
+
+
+    return _register_annotation_result!(_ctx, result, "annotate_genbank_records"; parents=provenance_parent_ids(records), parameters=(record_count=length(result)))
 end
 
 """
@@ -976,6 +1091,7 @@ end
 Extract the sequence for a feature stored on an annotated record.
 """
 function feature_sequence(record::AnnotatedSeqRecord, feature::SeqFeatureLite)
+
     return feature_sequence(record.sequence, feature.location)
 end
 
@@ -986,6 +1102,7 @@ Extract the sequence for a feature on a parsed GenBank record.
 """
 function feature_sequence(record::GenBankRecord, feature::GenBankFeature)
     parsed_location = feature.parsed_location === nothing ? parse_feature_location(feature.location) : feature.parsed_location
+
     return feature_sequence(record.sequence, parsed_location)
 end
 
@@ -1064,7 +1181,7 @@ end
 
 Rank a predicted variant effect by severity.
 """
-function _variant_effect_rank(effect::AbstractString)
+function _variant_effect_rank(effect::String)
     lowered = lowercase(String(effect))
     return get(Dict(
         "stop-gain" => 6,
@@ -1098,7 +1215,7 @@ end
 
 Return the strand-aware transcript base for a genomic nucleotide.
 """
-function _transcript_base(base::Char, strand::AbstractString)
+function _transcript_base(base::Char, strand::String)
     return strand == "-" ? _complement_base(base) : uppercase(base)
 end
 
@@ -1107,36 +1224,37 @@ end
 
 Compute a codon-level consequence for a variant intersecting a coding feature.
 """
-function _codon_effect(variant_ref::AbstractString, variant_alt::AbstractString, genomic_sequence::AbstractString, feature::GffRecord, pos::Integer)
+function _codon_effect(variant_ref::BioSequence{DNAAlphabet}, variant_alt::BioSequence{DNAAlphabet}, genomic_sequence::BioSequence{DNAAlphabet}, feature::GffRecord, pos::Integer)
     coding_sequence = feature_sequence(genomic_sequence, FeatureLocationLite(feature.start, feature.stop; strand=feature.strand == "-" ? -1 : 1))
-    coding_sequence = uppercase(coding_sequence)
-    coding_sequence = feature.strand == "-" ? reverse_complement(coding_sequence) : coding_sequence
 
     cdna_position = feature.strand == "-" ? feature.stop - Int(pos) + 1 : Int(pos) - feature.start + 1
     cdna_position < 1 && return (effect = "Coding", codon_ref = "", codon_alt = "")
     codon_start = 3 * div(cdna_position - 1, 3) + 1
-    codon_start + 2 > lastindex(coding_sequence) && return (effect = "Coding", codon_ref = "", codon_alt = "")
+    codon_start + 2 > length(coding_sequence) && return (effect = "Coding", codon_ref = "", codon_alt = "")
 
     ref_codon = coding_sequence[codon_start:codon_start+2]
-    codon_vector = collect(ref_codon)
+    codon_bytes = copy(ref_codon.data)
     codon_index = cdna_position - codon_start + 1
-    alt_base = _transcript_base(first(variant_alt), feature.strand)
-    codon_vector[codon_index] = alt_base
-    alt_codon = String(codon_vector)
+    length(variant_alt) == 0 && return (effect = "Coding", codon_ref = String(ref_codon), codon_alt = String(ref_codon))
+    alt_base = _transcript_base(Char(variant_alt.data[1]), feature.strand)
+    codon_bytes[codon_index] = UInt8(alt_base)
+    alt_codon = BioSequence{DNAAlphabet}(codon_bytes; validate=false)
+    ref_codon_text = String(ref_codon)
+    alt_codon_text = String(alt_codon)
 
     ref_aa = translate_dna(ref_codon; stop_at_stop=true)
     alt_aa = translate_dna(alt_codon; stop_at_stop=true)
     if ref_aa != alt_aa
-        if alt_aa == "*"
-            return (effect = "Stop-Gain", codon_ref = ref_codon, codon_alt = alt_codon)
-        elseif ref_aa == "*"
-            return (effect = "Stop-Loss", codon_ref = ref_codon, codon_alt = alt_codon)
+        if String(alt_aa) == "*"
+            return (effect = "Stop-Gain", codon_ref = ref_codon_text, codon_alt = alt_codon_text)
+        elseif String(ref_aa) == "*"
+            return (effect = "Stop-Loss", codon_ref = ref_codon_text, codon_alt = alt_codon_text)
         else
-            return (effect = "Missense", codon_ref = ref_codon, codon_alt = alt_codon)
+            return (effect = "Missense", codon_ref = ref_codon_text, codon_alt = alt_codon_text)
         end
     end
 
-    return (effect = "Synonymous", codon_ref = ref_codon, codon_alt = alt_codon)
+    return (effect = "Synonymous", codon_ref = ref_codon_text, codon_alt = alt_codon_text)
 end
 
 """
@@ -1147,8 +1265,8 @@ Compute the predicted consequence of a variant for a single annotated feature.
 function _feature_consequence(variant, feature::GffRecord; reference_sequences=nothing)
     chrom = String(_variant_field(variant, :chrom))
     position = Int(_variant_field(variant, :pos))
-    variant_ref = uppercase(String(_variant_field(variant, :ref)))
-    variant_alt = uppercase(String(_variant_field(variant, :alt)))
+    variant_ref = BioSequence{DNAAlphabet}(uppercase(String(_variant_field(variant, :ref))))
+    variant_alt = BioSequence{DNAAlphabet}(uppercase(String(_variant_field(variant, :alt))))
 
     (position < _feature_start(feature) || position > _feature_stop(feature)) && return nothing
 
@@ -1161,7 +1279,8 @@ function _feature_consequence(variant, feature::GffRecord; reference_sequences=n
         return (gene=gene, feature_type=_feature_type(feature), consequence="Intron", codon_ref="", codon_alt="")
     elseif occursin("cds", feature_type) || occursin("coding", feature_type)
         if reference_sequences !== nothing && haskey(reference_sequences, chrom)
-            sequence = String(reference_sequences[chrom])
+            sequence_entry = reference_sequences[chrom]
+            sequence = sequence_entry isa BioSequence ? BioSequence{DNAAlphabet}(sequence_entry.data; validate=false) : BioSequence{DNAAlphabet}(String(sequence_entry))
             codon_effect = _codon_effect(variant_ref, variant_alt, sequence, feature, position)
             return (gene=gene, feature_type=_feature_type(feature), consequence=codon_effect.effect, codon_ref=codon_effect.codon_ref, codon_alt=codon_effect.codon_alt)
         end
@@ -1176,7 +1295,8 @@ end
 
 Annotate variants against gene features and return their predicted consequences.
 """
-function annotate_variants(variant_records::AbstractVector, gene_features::AbstractVector; reference_sequences=nothing)
+function annotate_variants(variant_records::AbstractVector, gene_features::AbstractVector; reference_sequences=nothing, prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
     annotations = NamedTuple[]
     for variant in variant_records
         best = (gene="", feature_type="", consequence="Intergenic", codon_ref="", codon_alt="")
@@ -1210,5 +1330,5 @@ function annotate_variants(variant_records::AbstractVector, gene_features::Abstr
         ))
     end
 
-    return annotations
+    return _register_annotation_result!(_ctx, annotations, "annotate_variants"; parents=provenance_parent_ids(variant_records, gene_features), parameters=(variant_count=length(variant_records), feature_count=length(gene_features), annotation_count=length(annotations)))
 end

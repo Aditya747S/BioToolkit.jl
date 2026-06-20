@@ -25,7 +25,7 @@ SQ   Sequence 30 BP; 10 A; 10 C; 10 G; 0 T; 0 OTHER;
         records = BioToolkit.read_embl(tmp_embl)
         @test length(records) == 1
         @test records[1].identifier == "XYZ123;"
-        @test records[1].sequence == "aaaaaaaaaaccccccccccgggggggggg"
+        @test records[1].sequence == BioToolkit.DNASeq("AAAAAAAAAACCCCCCCCCCGGGGGGGGGG")
         @test records[1].annotations[:accession] == "AC123456;"
         @test length(records[1].features) == 2
         @test records[1].features[1].feature_type == "source"
@@ -59,7 +59,7 @@ end
     enzyme = BioToolkit.restriction_enzyme("EcoRI")
     hits = BioToolkit.find_restriction_sites("TTTGAATTCTTT", enzyme)
     @test length(hits) == 1
-    @test hits[1].cut_position == 5
+    @test hits[1].cut_position == 4
     @test BioToolkit.restriction_sites("TTTGAATTCTTT", enzyme) == hits
     @test BioToolkit.digest_sequence("TTTGAATTCTTT", "EcoRI") == ["TTTG", "AATTCTTT"]
     @test occursin("EcoRI", sprint(show, enzyme))
@@ -80,6 +80,48 @@ end
     @test entrez_post_result.webenv == "NCBI-WEBENV-123"
     @test BioToolkit.entrez_post_ids(entrez_post_result) == ["321", "654"]
     @test occursin("EntrezPostResult", sprint(show, entrez_post_result))
+
+    download_ctx = BioToolkit.ProvenanceContext()
+    url_dir = mktempdir()
+    fake_url_fetcher(source, destination) = (write(destination, "source=$(source)\n"); destination)
+    url_result = BioToolkit.download_database("https://example.org/databases/example.tsv"; download_dir=url_dir, fetcher=fake_url_fetcher, prov_ctx=download_ctx)
+    @test url_result.db == "url"
+    @test length(url_result.paths) == 1
+    @test isfile(url_result.paths[1])
+    @test occursin("example.org", read(url_result.paths[1], String))
+    @test BioToolkit.container_provenance_id(url_result) !== nothing
+
+    entrez_dir = mktempdir()
+    fake_entrez_fetch(db, ids; rettype="fasta", retmode="text", kwargs...) = ">$(db):$(join(ids, ","))\nACGT\n"
+    entrez_result = BioToolkit.download_database(:entrez, "nuccore", ["NM_0001", "NM_0002"]; download_dir=entrez_dir, filename="records.fasta", fetcher=fake_entrez_fetch, prov_ctx=download_ctx)
+    @test entrez_result.db == "entrez"
+    @test length(entrez_result.paths) == 1
+    @test occursin("ACGT", read(entrez_result.paths[1], String))
+    @test BioToolkit.container_provenance_id(entrez_result) !== nothing
+
+    entrez_search_result = BioToolkit.EntrezSearchResult("nuccore", "test", ["NM_0001"], 1, nothing, nothing, Dict{String,Any}())
+    entrez_search_download = BioToolkit.download_database(:entrez, entrez_search_result; download_dir=mktempdir(), filename="search_records.fasta", fetcher=fake_entrez_fetch, prov_ctx=download_ctx)
+    @test occursin("ACGT", read(entrez_search_download.paths[1], String))
+
+    tcga_hits = [Dict("file_id" => "FILE1", "file_name" => "counts.tsv", "cases" => [Dict("submitter_id" => "S1")])]
+    tcga_dir = mktempdir()
+    fake_tcga_fetch(source, destination) = (write(destination, "gene\tcount\nTP53\t1\n"); destination)
+    tcga_result = BioToolkit.download_database(:tcga, tcga_hits; base_url="https://example.org/gdc", download_dir=tcga_dir, fetcher=fake_tcga_fetch, prov_ctx=download_ctx)
+    @test tcga_result.db == "tcga"
+    @test length(tcga_result.paths) == 1
+    @test occursin("TP53", read(tcga_result.paths[1], String))
+    @test BioToolkit.container_provenance_id(tcga_result) !== nothing
+
+    tcga_ctx = BioToolkit.ProvenanceContext()
+    tcga_downloads = BioToolkit.tcga_download_files(tcga_hits; base_url="https://example.org/gdc", download_dir=mktempdir(), fetcher=fake_tcga_fetch, prov_ctx=tcga_ctx)
+    @test length(tcga_downloads.file_paths) == 1
+    @test tcga_downloads.sample_ids == ["S1"]
+
+    tcga_query_result = (; hits=tcga_hits)
+    tcga_query_download = BioToolkit.download_database(:tcga, tcga_query_result; base_url="https://example.org/gdc", download_dir=mktempdir(), fetcher=fake_tcga_fetch, prov_ctx=download_ctx)
+    @test tcga_query_download.db == "tcga"
+    @test occursin("tcga_download_files", BioToolkit.export_provenance_json(tcga_ctx))
+    @test occursin("download_database", BioToolkit.export_provenance_json(download_ctx))
 
     pathway_text = """
 ENTRY       map00010                      Pathway

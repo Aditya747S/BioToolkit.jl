@@ -1,17 +1,44 @@
+# ==============================================================================
+# align.jl — Pairwise and codon-aware sequence alignment
+#
+# Implements Needleman-Wunsch (global) and Smith-Waterman (local) alignment
+# with both linear and affine gap penalty models.  The affine gap model uses
+# the Gotoh (1982) three-matrix formulation with separate gap-open and
+# gap-extend scores.
+#
+# Functions accept Vector{UInt8} and BioSequence typed inputs via multiple
+# dispatch.
+#
+# References:
+#   - Needleman & Wunsch (1970) JMB 48(3):443-453
+#   - Smith & Waterman (1981) JMB 147(1):195-197
+#   - Gotoh (1982) JMB 162(3):705-708 (affine gap extension)
+#   - Henikoff & Henikoff (1992) PNAS 89(22):10915-10919 (BLOSUM matrices)
+# ==============================================================================
+
 """
-    PairwiseAlignmentResult
+    PairwiseAlignmentResult{A <: BioAlphabet}
 
 Result object returned by the pairwise alignment routines. It stores the aligned
-left and right sequences, the final score, the number of exact matches, and the
-identity fraction.
+left and right sequences as `BioSequence{A}`, the final score, the number of
+exact matches, and the identity fraction.
 """
-struct PairwiseAlignmentResult
-    left::String
-    right::String
+struct PairwiseAlignmentResult{A <: BioAlphabet} <: AbstractAnalysisResult
+    left::BioSequence{A}
+    right::BioSequence{A}
     score::Int
     matches::Int
     identity::Float64
+    metadata::Dict{Symbol,Any}
 end
+
+function PairwiseAlignmentResult(left::BioSequence{A}, right::BioSequence{A}, score::Integer, matches::Integer, identity::Real; metadata::AbstractDict=Dict{Symbol,Any}()) where {A <: BioAlphabet}
+    metadata_copy = Dict{Symbol,Any}(metadata)
+    ensure_provenance_id!(metadata_copy)
+    return PairwiseAlignmentResult{A}(left, right, Int(score), Int(matches), Float64(identity), metadata_copy)
+end
+
+analysis_result_fields(::Type{PairwiseAlignmentResult{A}}) where {A} = (:left, :right, :score, :matches, :identity)
 
 """
     AbstractPairwiseScoring
@@ -34,7 +61,8 @@ end
     SubstitutionMatrix
 
 General substitution-matrix container with alphabet lookup tables, score
-storage, and a fallback score for unknown symbols.
+storage. Unknown symbols are rejected during alignment instead of being scored
+silently.
 """
 struct SubstitutionMatrix
     alphabet::Vector{UInt8}
@@ -57,6 +85,8 @@ end
     CodonSubstitutionMatrix
 
 Substitution matrix specialized for codon tokens encoded as packed byte values.
+Unknown codon tokens are rejected during alignment instead of being scored
+silently.
 """
 struct CodonSubstitutionMatrix
     alphabet::Vector{UInt8}
@@ -162,15 +192,13 @@ const _STANDARD_SUBSTITUTION_MATRIX_TEXT = Dict{String,String}(
 include("substitution_matrices_data.jl")
 merge!(_STANDARD_SUBSTITUTION_MATRIX_TEXT, _BIOPYTHON_NAMED_SUBSTITUTION_MATRIX_TEXT)
 
-const _STANDARD_SUBSTITUTION_MATRIX_CACHE = Dict{String,SubstitutionMatrix}()
-
 """
     _normalize_substitution_matrix_name(name)
 
 Normalize a matrix name by uppercasing it and removing spacing and separator
 characters.
 """
-@inline function _normalize_substitution_matrix_name(name::AbstractString)
+@inline function _normalize_substitution_matrix_name(name::String)
     return replace(uppercase(strip(name)), r"[\s._-]+" => "")
 end
 
@@ -179,7 +207,7 @@ end
 
 Parse a standard amino-acid substitution matrix from its textual representation.
 """
-function _parse_standard_substitution_matrix(spec::AbstractString; threaded::Bool=true)
+function _parse_standard_substitution_matrix(spec::String; threaded::Bool=true)
     lines = filter(!isempty, Base.split(chomp(spec), '\n'))
     length(lines) >= 2 || throw(ArgumentError("substitution matrix spec must include a header and at least one row"))
 
@@ -208,7 +236,41 @@ function _parse_standard_substitution_matrix(spec::AbstractString; threaded::Boo
         end
     end
 
-    return SubstitutionMatrix(alphabet, scores; default=minimum(scores))
+    alphabet_bytes = collect(codeunits(alphabet))
+    lookup_table = fill(0, 256)
+    lookup = Dict{UInt8,Int}()
+
+    for (index, byte) in enumerate(alphabet_bytes)
+        _register_casefold_lookup!(lookup_table, lookup, byte, index)
+    end
+
+    return SubstitutionMatrix(alphabet_bytes, scores, lookup, lookup_table, minimum(scores))
+end
+
+@inline function _register_casefold_lookup!(lookup_table::Vector{Int}, lookup::Dict{UInt8,Int}, byte::UInt8, index::Int)
+    lookup_table[Int(byte) + 1] = index
+    lookup[byte] = index
+    if 0x41 <= byte <= 0x5a
+        lower = byte + 0x20
+        lookup_table[Int(lower) + 1] = index
+        lookup[lower] = index
+    elseif 0x61 <= byte <= 0x7a
+        upper = byte - 0x20
+        lookup_table[Int(upper) + 1] = index
+        lookup[upper] = index
+    end
+end
+
+const _STANDARD_SUBSTITUTION_MATRIX_CACHE = let cache = Dict{String,SubstitutionMatrix}()
+    for (matrix_name, matrix_spec) in _STANDARD_SUBSTITUTION_MATRIX_TEXT
+        normalized_name = replace(uppercase(strip(matrix_name)), r"[\s._-]+" => "")
+        try
+            cache[normalized_name] = _parse_standard_substitution_matrix(matrix_spec; threaded=false)
+        catch err
+            err isa ArgumentError || rethrow()
+        end
+    end
+    cache
 end
 
 const _CODON_DECODE_TABLE = let table = Vector{String}(undef, 64)
@@ -276,7 +338,7 @@ end
 
 Parse a codon substitution matrix from its textual table form.
 """
-function _parse_codon_substitution_matrix(spec::AbstractString; threaded::Bool=true)
+function _parse_codon_substitution_matrix(spec::String; threaded::Bool=true)
     lines = filter(!isempty, Base.split(chomp(spec), '\n'))
     length(lines) >= 2 || throw(ArgumentError("substitution matrix spec must include a header and at least one row"))
 
@@ -325,10 +387,19 @@ function _parse_codon_substitution_matrix(spec::AbstractString; threaded::Bool=t
     return CodonSubstitutionMatrix(alphabet, scores, lookup, lookup_table, minimum(scores))
 end
 
+const _STANDARD_CODON_SUBSTITUTION_MATRIX_CACHE = Dict{String,CodonSubstitutionMatrix}(
+    "SCHNEIDER" => _parse_codon_substitution_matrix(_STANDARD_SUBSTITUTION_MATRIX_TEXT["SCHNEIDER"]; threaded=false),
+)
+
 const _PAIRWISE_STATE_MATCH = UInt8(0x01)
 const _PAIRWISE_STATE_GAP_LEFT = UInt8(0x02)
 const _PAIRWISE_STATE_GAP_RIGHT = UInt8(0x03)
 const _PAIRWISE_TRACE_NONE = UInt8(0x00)
+const _PAIRWISE_AFFINE_NEGATIVE_INFINITY = typemin(Int) ÷ 4
+
+@inline function _pairwise_affine_transition(score::Int, penalty::Int)
+    return score == _PAIRWISE_AFFINE_NEGATIVE_INFINITY ? _PAIRWISE_AFFINE_NEGATIVE_INFINITY : score + penalty
+end
 
 """
     Base.show(io, result)
@@ -336,24 +407,22 @@ const _PAIRWISE_TRACE_NONE = UInt8(0x00)
 Render a compact summary of a `PairwiseAlignmentResult`.
 """
 function Base.show(io::IO, result::PairwiseAlignmentResult)
-    print(
-        io,
-        "PairwiseAlignmentResult(score=",
-        result.score,
-        ", matches=",
-        result.matches,
-        ", identity=",
-        round(result.identity, digits=4),
-        ")",
-    )
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
+end
+
+function Base.show(io::IO, ::MIME"text/plain", result::PairwiseAlignmentResult)
+    print(io, analysis_result_summary(result), " | ", container_provenance_summary(result))
 end
 
 """
     SubstitutionMatrix(alphabet; match=1, mismatch=-1, default=mismatch, threaded=true)
 
 Build a simple square substitution matrix from an alphabet string.
+
+ASCII letters are registered in both cases, so lowercase sequence input does not
+silently fall through to the fallback score.
 """
-function SubstitutionMatrix(alphabet::AbstractString; match::Int=1, mismatch::Int=-1, default::Int=mismatch, threaded::Bool=true)
+function SubstitutionMatrix(alphabet::String; match::Int=1, mismatch::Int=-1, default::Int=mismatch, threaded::Bool=true)
     alphabet_bytes = collect(codeunits(alphabet))
     scores = Matrix{Int}(undef, length(alphabet_bytes), length(alphabet_bytes))
     lookup_table = fill(0, 256)
@@ -374,7 +443,10 @@ function SubstitutionMatrix(alphabet::AbstractString; match::Int=1, mismatch::In
         end
     end
 
-    lookup = Dict{UInt8,Int}(byte => index for (index, byte) in pairs(alphabet_bytes))
+    lookup = Dict{UInt8,Int}()
+    @inbounds for (index, byte) in pairs(alphabet_bytes)
+        _register_casefold_lookup!(lookup_table, lookup, byte, index)
+    end
     return SubstitutionMatrix(alphabet_bytes, scores, lookup, lookup_table, default)
 end
 
@@ -383,11 +455,10 @@ end
 
 Wrap an explicit square score matrix for the given alphabet.
 """
-function SubstitutionMatrix(alphabet::AbstractString, scores::AbstractMatrix{<:Integer}; default::Int=0, threaded::Bool=true)
+function SubstitutionMatrix(alphabet::String, scores::AbstractMatrix{<:Integer}; default::Int=0, threaded::Bool=true)
     alphabet_bytes = collect(codeunits(alphabet))
     size(scores, 1) == length(alphabet_bytes) || throw(ArgumentError("score matrix row count must match alphabet length"))
     size(scores, 2) == length(alphabet_bytes) || throw(ArgumentError("score matrix column count must match alphabet length"))
-    lookup = Dict{UInt8,Int}(byte => index for (index, byte) in pairs(alphabet_bytes))
     lookup_table = fill(0, 256)
     if threaded && length(alphabet_bytes) > 1 && Threads.nthreads() > 1
         Threads.@threads for index in eachindex(alphabet_bytes)
@@ -399,6 +470,10 @@ function SubstitutionMatrix(alphabet::AbstractString, scores::AbstractMatrix{<:I
             lookup_table[Int(byte) + 1] = index
         end
     end
+    lookup = Dict{UInt8,Int}()
+    @inbounds for (index, byte) in pairs(alphabet_bytes)
+        _register_casefold_lookup!(lookup_table, lookup, byte, index)
+    end
     return SubstitutionMatrix(alphabet_bytes, Matrix{Int}(scores), lookup, lookup_table, default)
 end
 
@@ -407,21 +482,21 @@ end
 
 Convenience alias for `SubstitutionMatrix(alphabet; kwargs...)`.
 """
-substitution_matrix(alphabet::AbstractString; kwargs...) = SubstitutionMatrix(alphabet; kwargs...)
+substitution_matrix(alphabet::String; kwargs...) = SubstitutionMatrix(alphabet; kwargs...)
 
 """
     substitution_matrix(alphabet, scores; kwargs...)
 
 Convenience alias for `SubstitutionMatrix(alphabet, scores; kwargs...)`.
 """
-substitution_matrix(alphabet::AbstractString, scores::AbstractMatrix{<:Integer}; kwargs...) = SubstitutionMatrix(alphabet, scores; kwargs...)
+substitution_matrix(alphabet::String, scores::AbstractMatrix{<:Integer}; kwargs...) = SubstitutionMatrix(alphabet, scores; kwargs...)
 
 """
     named_substitution_matrix(name)
 
 Load one of the built-in named substitution matrices or a DNA identity matrix.
 """
-function named_substitution_matrix(name::AbstractString)
+function named_substitution_matrix(name::String)
     normalized = _normalize_substitution_matrix_name(name)
     if normalized == "DNA" || normalized == "NUC" || normalized == "NUCLEOTIDE" || normalized == "IDENTITY"
         return SubstitutionMatrix("ACGT"; match=1, mismatch=-1, default=-1)
@@ -438,6 +513,9 @@ function named_substitution_matrix(name::AbstractString)
 
     parsed = _parse_standard_substitution_matrix(spec)
     _STANDARD_SUBSTITUTION_MATRIX_CACHE[normalized] = parsed
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "named_substitution_matrix";
+        parameters=(name=name,))
     return parsed
 end
 
@@ -467,14 +545,16 @@ available_named_substitution_matrices() = sort!(collect(keys(_STANDARD_SUBSTITUT
 
 Load a built-in codon substitution matrix by name.
 """
-function named_codon_substitution_matrix(name::AbstractString)
+function named_codon_substitution_matrix(name::String)
     normalized = _normalize_substitution_matrix_name(name)
     normalized == "SCHNEIDER" || throw(ArgumentError("unknown named codon substitution matrix: $name"))
 
-    spec = get(_STANDARD_SUBSTITUTION_MATRIX_TEXT, normalized, nothing)
-    spec === nothing && throw(ArgumentError("unknown named codon substitution matrix: $name"))
-
-    return _parse_codon_substitution_matrix(spec)
+    matrix = get(_STANDARD_CODON_SUBSTITUTION_MATRIX_CACHE, normalized, nothing)
+    matrix === nothing && throw(ArgumentError("unknown named codon substitution matrix: $name"))
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "named_codon_substitution_matrix";
+        parameters=(name=name,))
+    return matrix
 end
 
 """
@@ -490,7 +570,7 @@ named_codon_substitution_matrix(name::Symbol) = named_codon_substitution_matrix(
 Construct a codon-aware substitution matrix from an explicit codon alphabet and
 score matrix.
 """
-function codon_substitution_matrix(alphabet::AbstractString, scores::AbstractMatrix{<:Integer}; default::Int=0, threaded::Bool=true)
+function codon_substitution_matrix(alphabet::String, scores::AbstractMatrix{<:Integer}; default::Int=0, threaded::Bool=true)
     codon_tokens = Base.split(strip(alphabet))
     length(codon_tokens) == 64 || throw(ArgumentError("codon alphabet must contain exactly 64 codons"))
 
@@ -520,6 +600,9 @@ function codon_substitution_matrix(alphabet::AbstractString, scores::AbstractMat
 
     size(scores, 1) == 64 || throw(ArgumentError("codon score matrix row count must be 64"))
     size(scores, 2) == 64 || throw(ArgumentError("codon score matrix column count must be 64"))
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "codon_substitution_matrix";
+        parameters=(n_codons=64, default=default))
     return CodonSubstitutionMatrix(alphabet_codes, Matrix{Int}(scores), lookup, lookup_table, default)
 end
 
@@ -540,7 +623,9 @@ Score a nucleotide pair using a substitution matrix lookup.
 @inline function _pairwise_score(scoring::MatrixPairwiseScoring, left_byte::UInt8, right_byte::UInt8)
     left_index = scoring.matrix.lookup_table[Int(left_byte) + 1]
     right_index = scoring.matrix.lookup_table[Int(right_byte) + 1]
-    left_index == 0 || right_index == 0 ? scoring.matrix.default : scoring.matrix.scores[left_index, right_index]
+    left_index == 0 && throw(ArgumentError("unknown symbol in substitution-matrix alignment: '$(Char(left_byte))' (code $(Int(left_byte)))"))
+    right_index == 0 && throw(ArgumentError("unknown symbol in substitution-matrix alignment: '$(Char(right_byte))' (code $(Int(right_byte)))"))
+    return scoring.matrix.scores[left_index, right_index]
 end
 
 """
@@ -551,7 +636,9 @@ Score a codon pair using a codon substitution matrix lookup.
 @inline function _pairwise_score(scoring::CodonMatrixPairwiseScoring, left_token::UInt8, right_token::UInt8)
     left_index = left_token > 63 ? 0 : scoring.matrix.lookup_table[Int(left_token) + 1]
     right_index = right_token > 63 ? 0 : scoring.matrix.lookup_table[Int(right_token) + 1]
-    left_index == 0 || right_index == 0 ? scoring.matrix.default : scoring.matrix.scores[left_index, right_index]
+    left_index == 0 && throw(ArgumentError("unknown codon token in substitution-matrix alignment: $(Int(left_token))"))
+    right_index == 0 && throw(ArgumentError("unknown codon token in substitution-matrix alignment: $(Int(right_token))"))
+    return scoring.matrix.scores[left_index, right_index]
 end
 
 """
@@ -561,20 +648,67 @@ Resolve linear and affine gap penalties into explicit open and extend values.
 """
 @inline function _pairwise_gap_parameters(gap::Int, gap_open::Union{Nothing,Int}, gap_extend::Union{Nothing,Int})
     if gap_open === nothing && gap_extend === nothing
+        gap < 0 || throw(ArgumentError("gap penalty must be negative"))
         return gap, gap
     end
 
     open_score = gap_open === nothing ? something(gap_extend, gap) : gap_open
     extend_score = gap_extend === nothing ? something(gap_open, gap) : gap_extend
+    (open_score < 0 && extend_score < 0) || throw(ArgumentError("gap penalties must be negative"))
     return open_score, extend_score
+end
+
+"""
+    pairwise_align(left_seq, right_seq; kwargs...)
+
+Align two `BioSequence{A}` objects using linear or affine gap scoring.
+Returns a `PairwiseAlignmentResult{A}`.
+"""
+function pairwise_align(
+    left::BioSequence{A},
+    right::BioSequence{A};
+    kwargs...
+) where {A <: BioAlphabet}
+    result = _pairwise_align_dispatch(A, left.data, right.data; kwargs...)
+    return _pairwise_align_finalize(result;
+        parents=provenance_parent_ids(left, right), parameters=kwargs)
 end
 
 """
     pairwise_align(left_bytes, right_bytes; kwargs...)
 
-Align two byte sequences using linear or affine gap scoring.
+Align two byte sequences using linear or alphabet-less scoring.
+Returns a `PairwiseAlignmentResult{DNAAlphabet}` (defaulting to DNA for raw bytes).
 """
 function pairwise_align(
+    left_bytes::AbstractVector{UInt8},
+    right_bytes::AbstractVector{UInt8};
+    kwargs...
+)
+    result = _pairwise_align_dispatch(DNAAlphabet, left_bytes, right_bytes; kwargs...)
+    return _pairwise_align_finalize(result;
+        parents=provenance_parent_ids(left_bytes, right_bytes), parameters=kwargs)
+end
+
+# Removed pairwise_align(::AbstractString, ::AbstractString) - use BioSequence types instead
+function pairwise_align(left::AbstractString, right::AbstractString; kwargs...)
+    return pairwise_align(DNASeq(left; validate=false), DNASeq(right; validate=false); kwargs...)
+end
+
+@inline function _pairwise_align_finalize(result::PairwiseAlignmentResult;
+    parents::AbstractVector{<:AbstractString},
+    parameters)
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "pairwise_align";
+        parents=parents,
+        parameters=(score=result.score, identity=round(result.identity; digits=4),
+                    n_left=length(result.left), n_right=length(result.right)))
+    return provenance_result!(_ctx, result, "pairwise_align";
+        parents=parents, parameters=parameters)
+end
+
+function _pairwise_align_dispatch(
+    ::Type{A},
     left_bytes::AbstractVector{UInt8},
     right_bytes::AbstractVector{UInt8};
     match::Int=1,
@@ -584,48 +718,27 @@ function pairwise_align(
     gap_open::Union{Nothing,Int}=nothing,
     gap_extend::Union{Nothing,Int}=nothing,
     is_local::Bool=false,
-)
+) where {A <: BioAlphabet}
     scoring = substitution_matrix === nothing ? LinearPairwiseScoring(match, mismatch) : MatrixPairwiseScoring(substitution_matrix)
     if gap_open === nothing && gap_extend === nothing
-        return is_local ? _pairwise_align_local(left_bytes, right_bytes, scoring, gap) : _pairwise_align_global(left_bytes, right_bytes, scoring, gap)
+        gap < 0 || throw(ArgumentError("gap penalty must be negative"))
+        return is_local ? _pairwise_align_local(A, left_bytes, right_bytes, scoring, gap) : _pairwise_align_global(A, left_bytes, right_bytes, scoring, gap)
     end
 
     affine_gap_open, affine_gap_extend = _pairwise_gap_parameters(gap, gap_open, gap_extend)
-    return is_local ? _pairwise_align_affine_local(left_bytes, right_bytes, scoring, affine_gap_open, affine_gap_extend) : _pairwise_align_affine_global(left_bytes, right_bytes, scoring, affine_gap_open, affine_gap_extend)
+    return is_local ? _pairwise_align_affine_local(A, left_bytes, right_bytes, scoring, affine_gap_open, affine_gap_extend) : _pairwise_align_affine_global(A, left_bytes, right_bytes, scoring, affine_gap_open, affine_gap_extend)
 end
 
-"""
-    pairwise_align(left, right; kwargs...)
-
-String-based convenience wrapper for `pairwise_align`.
-"""
-function pairwise_align(
-    left::AbstractString,
-    right::AbstractString;
-    kwargs...
-)
-    # Using simple Arrays to avoid SubArray performance hits entirely inside DP
-    # For small sequences like local_search envelopes, direct views might be fine
-    # but the inner kernels accept AbstractVector{UInt8}. 
-    return pairwise_align(codeunits(left), codeunits(right); kwargs...)
-end
-
-"""
-    pairwise_align(left::SeqRecordLite, right::SeqRecordLite; kwargs...)
-
-Align the sequence payloads stored in two `SeqRecordLite` values.
-"""
 function pairwise_align(left::SeqRecordLite, right::SeqRecordLite; kwargs...)
-    return pairwise_align(left.sequence, right.sequence; kwargs...)
+    result = pairwise_align(left.sequence, right.sequence; kwargs...)
+    return _pairwise_align_finalize(result;
+        parents=provenance_parent_ids(left, right), parameters=kwargs)
 end
 
-"""
-    pairwise_align(left::FastqRecord, right::FastqRecord; kwargs...)
-
-Align the sequence payloads stored in two FASTQ records.
-"""
 function pairwise_align(left::FastqRecord, right::FastqRecord; kwargs...)
-    return pairwise_align(left.sequence, right.sequence; kwargs...)
+    result = pairwise_align(left.sequence, right.sequence; kwargs...)
+    return _pairwise_align_finalize(result;
+        parents=provenance_parent_ids(left, right), parameters=kwargs)
 end
 
 """
@@ -633,7 +746,7 @@ end
 
 Write a three-character codon into a preallocated byte buffer from the back.
 """
-@inline function _write_codon_token!(buffer::Vector{UInt8}, write_index::Int, codon::AbstractString)
+@inline function _write_codon_token!(buffer::Vector{UInt8}, write_index::Int, codon::String)
     codon_bytes = codeunits(codon)
     buffer[write_index - 2] = codon_bytes[1]
     buffer[write_index - 1] = codon_bytes[2]
@@ -696,11 +809,11 @@ function _pairwise_traceback_codon(
 
     left_start_index = left_write_index + 1
     right_start_index = right_write_index + 1
-    left_string = String(aligned_left[left_start_index:end])
-    right_string = String(aligned_right[right_start_index:end])
+    final_left = BioSequence{DNAAlphabet}(aligned_left[left_start_index:end]; validate=false)
+    final_right = BioSequence{DNAAlphabet}(aligned_right[right_start_index:end]; validate=false)
     identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
-    return PairwiseAlignmentResult(left_string, right_string, best_score, matches, identity)
+    return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
 end
 
 """
@@ -757,11 +870,11 @@ function _pairwise_traceback_codon_affine(
 
     left_start_index = left_write_index + 1
     right_start_index = right_write_index + 1
-    left_string = String(aligned_left[left_start_index:end])
-    right_string = String(aligned_right[right_start_index:end])
+    final_left = BioSequence{DNAAlphabet}(aligned_left[left_start_index:end]; validate=false)
+    final_right = BioSequence{DNAAlphabet}(aligned_right[right_start_index:end]; validate=false)
     identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
-    return PairwiseAlignmentResult(left_string, right_string, best_score, matches, identity)
+    return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
 end
 
 """
@@ -912,13 +1025,13 @@ function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8},
     gap_right_trace = zeros(UInt8, left_length + 1, right_length + 1)
 
     previous_match_scores[1] = 0
-    previous_gap_left_scores[1] = negative_infinity
-    previous_gap_right_scores[1] = negative_infinity
+    previous_gap_left_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
+    previous_gap_right_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
 
     @inbounds begin
         for i in 2:left_length + 1
-            from_match = previous_match_scores[i - 1] + gap_open
-            from_gap = previous_gap_left_scores[i - 1] + gap_extend
+            from_match = _pairwise_affine_transition(previous_match_scores[i - 1], gap_open)
+            from_gap = _pairwise_affine_transition(previous_gap_left_scores[i - 1], gap_extend)
             if from_match >= from_gap
                 previous_gap_left_scores[i] = from_match
                 gap_left_trace[i, 1] = _PAIRWISE_STATE_MATCH
@@ -929,11 +1042,11 @@ function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8},
         end
 
         for j in 2:right_length + 1
-            current_match_scores[1] = negative_infinity
-            current_gap_left_scores[1] = negative_infinity
+            current_match_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
+            current_gap_left_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
 
-            from_match = previous_match_scores[1] + gap_open
-            from_gap = previous_gap_right_scores[1] + gap_extend
+            from_match = _pairwise_affine_transition(previous_match_scores[1], gap_open)
+            from_gap = _pairwise_affine_transition(previous_gap_right_scores[1], gap_extend)
             if from_match >= from_gap
                 current_gap_right_scores[1] = from_match
                 gap_right_trace[1, j] = _PAIRWISE_STATE_MATCH
@@ -959,8 +1072,8 @@ function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8},
                 current_match_scores[i] = best_prev + _pairwise_score(scoring, left_token, right_token)
                 match_trace[i, j] = best_state
 
-                from_match = current_match_scores[i - 1] + gap_open
-                from_gap = current_gap_left_scores[i - 1] + gap_extend
+                from_match = _pairwise_affine_transition(current_match_scores[i - 1], gap_open)
+                from_gap = _pairwise_affine_transition(current_gap_left_scores[i - 1], gap_extend)
                 if from_match >= from_gap
                     current_gap_left_scores[i] = from_match
                     gap_left_trace[i, j] = _PAIRWISE_STATE_MATCH
@@ -969,8 +1082,8 @@ function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8},
                     gap_left_trace[i, j] = _PAIRWISE_STATE_GAP_LEFT
                 end
 
-                from_match = previous_match_scores[i] + gap_open
-                from_gap = previous_gap_right_scores[i] + gap_extend
+                from_match = _pairwise_affine_transition(previous_match_scores[i], gap_open)
+                from_gap = _pairwise_affine_transition(previous_gap_right_scores[i], gap_extend)
                 if from_match >= from_gap
                     current_gap_right_scores[i] = from_match
                     gap_right_trace[i, j] = _PAIRWISE_STATE_MATCH
@@ -1077,8 +1190,8 @@ function _pairwise_align_codon_affine_local(left_tokens::AbstractVector{UInt8}, 
                 current_match_scores[i] = 0
             end
 
-            from_match = current_match_scores[i - 1] + gap_open
-            from_gap = current_gap_left_scores[i - 1] + gap_extend
+            from_match = _pairwise_affine_transition(current_match_scores[i - 1], gap_open)
+            from_gap = _pairwise_affine_transition(current_gap_left_scores[i - 1], gap_extend)
             gap_score = 0
             gap_state = _PAIRWISE_TRACE_NONE
             if from_match > gap_score
@@ -1102,8 +1215,8 @@ function _pairwise_align_codon_affine_local(left_tokens::AbstractVector{UInt8}, 
                 current_gap_left_scores[i] = 0
             end
 
-            from_match = previous_match_scores[i] + gap_open
-            from_gap = previous_gap_right_scores[i] + gap_extend
+            from_match = _pairwise_affine_transition(previous_match_scores[i], gap_open)
+            from_gap = _pairwise_affine_transition(previous_gap_right_scores[i], gap_extend)
             gap_score = 0
             gap_state = _PAIRWISE_TRACE_NONE
             if from_match > gap_score
@@ -1150,10 +1263,13 @@ end
     pairwise_align_codons(left, right; kwargs...)
 
 Align two nucleotide strings in codon space, preserving triplet boundaries.
+
+The wrapper uppercases nucleotide input before codon packing for the same
+reason as `pairwise_align`.
 """
 function pairwise_align_codons(
-    left::AbstractString,
-    right::AbstractString;
+    left::BioSequence{DNAAlphabet},
+    right::BioSequence{DNAAlphabet};
     match::Int=1,
     mismatch::Int=-1,
     substitution_matrix::Union{Nothing,CodonSubstitutionMatrix}=nothing,
@@ -1162,15 +1278,32 @@ function pairwise_align_codons(
     gap_extend::Union{Nothing,Int}=nothing,
     is_local::Bool=false,
 )
-    left_tokens = _encode_codon_sequence(codeunits(left))
-    right_tokens = _encode_codon_sequence(codeunits(right))
-    scoring = substitution_matrix === nothing ? LinearPairwiseScoring(match, mismatch) : CodonMatrixPairwiseScoring(substitution_matrix)
-    if gap_open === nothing && gap_extend === nothing
-        return is_local ? _pairwise_align_codon_local(left_tokens, right_tokens, scoring, gap) : _pairwise_align_codon_global(left_tokens, right_tokens, scoring, gap)
+    left_tokens  = _encode_codon_sequence(left.data)
+    right_tokens = _encode_codon_sequence(right.data)
+    scoring = substitution_matrix === nothing ?
+        LinearPairwiseScoring(match, mismatch) : CodonMatrixPairwiseScoring(substitution_matrix)
+
+    result = if gap_open === nothing && gap_extend === nothing
+        is_local ? _pairwise_align_codon_local(left_tokens, right_tokens, scoring, gap) :
+                   _pairwise_align_codon_global(left_tokens, right_tokens, scoring, gap)
+    else
+        affine_gap_open, affine_gap_extend = _pairwise_gap_parameters(gap, gap_open, gap_extend)
+        is_local ? _pairwise_align_codon_affine_local(left_tokens, right_tokens, scoring, affine_gap_open, affine_gap_extend) :
+                   _pairwise_align_codon_affine_global(left_tokens, right_tokens, scoring, affine_gap_open, affine_gap_extend)
     end
 
-    affine_gap_open, affine_gap_extend = _pairwise_gap_parameters(gap, gap_open, gap_extend)
-    return is_local ? _pairwise_align_codon_affine_local(left_tokens, right_tokens, scoring, affine_gap_open, affine_gap_extend) : _pairwise_align_codon_affine_global(left_tokens, right_tokens, scoring, affine_gap_open, affine_gap_extend)
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "pairwise_align_codons";
+        parents=provenance_parent_ids(left, right),
+        parameters=(match=match, mismatch=mismatch, gap=gap,
+                    affine=gap_open !== nothing || gap_extend !== nothing,
+                    is_local=is_local))
+    return result
+end
+
+# Removed pairwise_align_codons(::AbstractString, ::AbstractString) - use DNASeq instead
+function pairwise_align_codons(left::AbstractString, right::AbstractString; kwargs...)
+    return pairwise_align_codons(DNASeq(left; validate=false), DNASeq(right; validate=false); kwargs...)
 end
 
 """
@@ -1216,11 +1349,11 @@ Backward-compatible alias for `smith_waterman`.
 local_align(left, right; kwargs...) = smith_waterman(left, right; kwargs...)
 
 """
-    _pairwise_align_global(left_bytes, right_bytes, scoring, gap)
+    _pairwise_align_global(::Type{A}, left_bytes, right_bytes, scoring, gap)
 
 Run global pairwise alignment with a linear gap model.
 """
-function _pairwise_align_global(left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
+function _pairwise_align_global(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A <: BioAlphabet}
     left_length = length(left_bytes)
     right_length = length(right_bytes)
 
@@ -1268,15 +1401,15 @@ function _pairwise_align_global(left_bytes::AbstractVector{UInt8}, right_bytes::
         end
     end
 
-    return _pairwise_traceback(left_bytes, right_bytes, nothing, trace, left_length + 1, right_length + 1, previous_scores[left_length + 1])
+    return _pairwise_traceback(A, left_bytes, right_bytes, nothing, trace, left_length + 1, right_length + 1, previous_scores[left_length + 1])
 end
 
 """
-    _pairwise_align_local(left_bytes, right_bytes, scoring, gap)
+    _pairwise_align_local(::Type{A}, left_bytes, right_bytes, scoring, gap)
 
 Run local pairwise alignment with a linear gap model.
 """
-function _pairwise_align_local(left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
+function _pairwise_align_local(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A <: BioAlphabet}
     left_length = length(left_bytes)
     right_length = length(right_bytes)
 
@@ -1338,28 +1471,28 @@ function _pairwise_align_local(left_bytes::AbstractVector{UInt8}, right_bytes::A
         end
     end
 
-    return _pairwise_traceback(left_bytes, right_bytes, scores, trace, best_i, best_j, best_score)
+    return _pairwise_traceback(A, left_bytes, right_bytes, scores, trace, best_i, best_j, best_score)
 end
 
 """
-    _pairwise_align_affine_global(left_bytes, right_bytes, scoring, gap_open, gap_extend)
+    _pairwise_align_affine_global(::Type{A}, left_bytes, right_bytes, scoring, gap_open, gap_extend)
 
 Run global pairwise alignment with an affine gap model.
 """
 function _pairwise_align_affine_global(
+    ::Type{A},
     left_bytes::AbstractVector{UInt8},
     right_bytes::AbstractVector{UInt8},
     scoring::AbstractPairwiseScoring,
     gap_open::Int,
     gap_extend::Int,
-)
+) where {A <: BioAlphabet}
     left_length = length(left_bytes)
     right_length = length(right_bytes)
-    negative_infinity = typemin(Int) ÷ 4
 
-    previous_match_scores = fill(negative_infinity, left_length + 1)
-    previous_gap_left_scores = fill(negative_infinity, left_length + 1)
-    previous_gap_right_scores = fill(negative_infinity, left_length + 1)
+    previous_match_scores = fill(_PAIRWISE_AFFINE_NEGATIVE_INFINITY, left_length + 1)
+    previous_gap_left_scores = fill(_PAIRWISE_AFFINE_NEGATIVE_INFINITY, left_length + 1)
+    previous_gap_right_scores = fill(_PAIRWISE_AFFINE_NEGATIVE_INFINITY, left_length + 1)
     current_match_scores = similar(previous_match_scores)
     current_gap_left_scores = similar(previous_gap_left_scores)
     current_gap_right_scores = similar(previous_gap_right_scores)
@@ -1369,13 +1502,13 @@ function _pairwise_align_affine_global(
     gap_right_trace = zeros(UInt8, left_length + 1, right_length + 1)
 
     previous_match_scores[1] = 0
-    previous_gap_left_scores[1] = negative_infinity
-    previous_gap_right_scores[1] = negative_infinity
+    previous_gap_left_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
+    previous_gap_right_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
 
     @inbounds begin
         for i in 2:left_length + 1
-            from_match = previous_match_scores[i - 1] + gap_open
-            from_gap = previous_gap_left_scores[i - 1] + gap_extend
+            from_match = _pairwise_affine_transition(previous_match_scores[i - 1], gap_open)
+            from_gap = _pairwise_affine_transition(previous_gap_left_scores[i - 1], gap_extend)
             if from_match >= from_gap
                 previous_gap_left_scores[i] = from_match
                 gap_left_trace[i, 1] = _PAIRWISE_STATE_MATCH
@@ -1386,11 +1519,11 @@ function _pairwise_align_affine_global(
         end
 
         for j in 2:right_length + 1
-            current_match_scores[1] = negative_infinity
-            current_gap_left_scores[1] = negative_infinity
+            current_match_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
+            current_gap_left_scores[1] = _PAIRWISE_AFFINE_NEGATIVE_INFINITY
 
-            from_match = previous_match_scores[1] + gap_open
-            from_gap = previous_gap_right_scores[1] + gap_extend
+            from_match = _pairwise_affine_transition(previous_match_scores[1], gap_open)
+            from_gap = _pairwise_affine_transition(previous_gap_right_scores[1], gap_extend)
             if from_match >= from_gap
                 current_gap_right_scores[1] = from_match
                 gap_right_trace[1, j] = _PAIRWISE_STATE_MATCH
@@ -1416,8 +1549,8 @@ function _pairwise_align_affine_global(
                 current_match_scores[i] = best_prev + _pairwise_score(scoring, left_byte, right_byte)
                 match_trace[i, j] = best_state
 
-                from_match = current_match_scores[i - 1] + gap_open
-                from_gap = current_gap_left_scores[i - 1] + gap_extend
+                from_match = _pairwise_affine_transition(current_match_scores[i - 1], gap_open)
+                from_gap = _pairwise_affine_transition(current_gap_left_scores[i - 1], gap_extend)
                 if from_match >= from_gap
                     current_gap_left_scores[i] = from_match
                     gap_left_trace[i, j] = _PAIRWISE_STATE_MATCH
@@ -1426,8 +1559,8 @@ function _pairwise_align_affine_global(
                     gap_left_trace[i, j] = _PAIRWISE_STATE_GAP_LEFT
                 end
 
-                from_match = previous_match_scores[i] + gap_open
-                from_gap = previous_gap_right_scores[i] + gap_extend
+                from_match = _pairwise_affine_transition(previous_match_scores[i], gap_open)
+                from_gap = _pairwise_affine_transition(previous_gap_right_scores[i], gap_extend)
                 if from_match >= from_gap
                     current_gap_right_scores[i] = from_match
                     gap_right_trace[i, j] = _PAIRWISE_STATE_MATCH
@@ -1455,6 +1588,7 @@ function _pairwise_align_affine_global(
     end
 
     return _pairwise_traceback_affine(
+        A,
         left_bytes,
         right_bytes,
         match_trace,
@@ -1468,17 +1602,18 @@ function _pairwise_align_affine_global(
 end
 
 """
-    _pairwise_align_affine_local(left_bytes, right_bytes, scoring, gap_open, gap_extend)
+    _pairwise_align_affine_local(::Type{A}, left_bytes, right_bytes, scoring, gap_open, gap_extend)
 
 Run local pairwise alignment with an affine gap model.
 """
 function _pairwise_align_affine_local(
+    ::Type{A},
     left_bytes::AbstractVector{UInt8},
     right_bytes::AbstractVector{UInt8},
     scoring::AbstractPairwiseScoring,
     gap_open::Int,
     gap_extend::Int,
-)
+) where {A <: BioAlphabet}
     left_length = length(left_bytes)
     right_length = length(right_bytes)
 
@@ -1486,7 +1621,7 @@ function _pairwise_align_affine_local(
     previous_match_scores = zeros(Int, left_length + 1)
     previous_gap_left_scores = zeros(Int, left_length + 1)
     previous_gap_right_scores = zeros(Int, left_length + 1)
-    
+
     current_match_scores = zeros(Int, left_length + 1)
     current_gap_left_scores = zeros(Int, left_length + 1)
     current_gap_right_scores = zeros(Int, left_length + 1)
@@ -1547,8 +1682,8 @@ function _pairwise_align_affine_local(
             end
 
             # Up: current_scores[i-1] means scores[i-1, j]
-            from_match = current_match_scores[i - 1] + gap_open
-            from_gap = current_gap_left_scores[i - 1] + gap_extend
+            from_match = _pairwise_affine_transition(current_match_scores[i - 1], gap_open)
+            from_gap = _pairwise_affine_transition(current_gap_left_scores[i - 1], gap_extend)
             gap_score = 0
             gap_state = _PAIRWISE_TRACE_NONE
             if from_match > gap_score
@@ -1606,6 +1741,7 @@ function _pairwise_align_affine_local(
     end
 
     return _pairwise_traceback_affine(
+        A,
         left_bytes,
         right_bytes,
         match_trace,
@@ -1619,11 +1755,12 @@ function _pairwise_align_affine_local(
 end
 
 """
-    _pairwise_traceback(...)
+    _pairwise_traceback(::Type{A}, left_bytes, right_bytes, scores, trace, i, j, best_score)
 
 Reconstruct a nucleotide alignment from standard traceback data.
 """
 function _pairwise_traceback(
+    ::Type{A},
     left_bytes::AbstractVector{UInt8},
     right_bytes::AbstractVector{UInt8},
     scores::Union{Nothing,Matrix{Int}},
@@ -1631,7 +1768,7 @@ function _pairwise_traceback(
     i::Int,
     j::Int,
     best_score::Int,
-)
+) where {A <: BioAlphabet}
     aligned_left = Vector{UInt8}(undef, length(left_bytes) + length(right_bytes))
     aligned_right = Vector{UInt8}(undef, length(left_bytes) + length(right_bytes))
     write_index = length(aligned_left)
@@ -1672,19 +1809,20 @@ function _pairwise_traceback(
     end
 
     start_index = write_index + 1
-    left_string = String(aligned_left[start_index:end])
-    right_string = String(aligned_right[start_index:end])
+    final_left = BioSequence{A}(aligned_left[start_index:end]; validate=false)
+    final_right = BioSequence{A}(aligned_right[start_index:end]; validate=false)
     identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
-    return PairwiseAlignmentResult(left_string, right_string, best_score, matches, identity)
+    return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
 end
 
 """
-    _pairwise_traceback_affine(...)
+    _pairwise_traceback_affine(::Type{A}, left_bytes, right_bytes, match_trace, gap_left_trace, gap_right_trace, i, j, start_state, best_score)
 
 Reconstruct a nucleotide alignment from affine-gap traceback data.
 """
 function _pairwise_traceback_affine(
+    ::Type{A},
     left_bytes::AbstractVector{UInt8},
     right_bytes::AbstractVector{UInt8},
     match_trace::Matrix{UInt8},
@@ -1694,7 +1832,7 @@ function _pairwise_traceback_affine(
     j::Int,
     start_state::UInt8,
     best_score::Int,
-)
+) where {A <: BioAlphabet}
     aligned_left = Vector{UInt8}(undef, length(left_bytes) + length(right_bytes))
     aligned_right = Vector{UInt8}(undef, length(left_bytes) + length(right_bytes))
     write_index = length(aligned_left)
@@ -1732,9 +1870,9 @@ function _pairwise_traceback_affine(
     end
 
     start_index = write_index + 1
-    left_string = String(aligned_left[start_index:end])
-    right_string = String(aligned_right[start_index:end])
+    final_left = BioSequence{A}(aligned_left[start_index:end]; validate=false)
+    final_right = BioSequence{A}(aligned_right[start_index:end]; validate=false)
     identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
-    return PairwiseAlignmentResult(left_string, right_string, best_score, matches, identity)
+    return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
 end

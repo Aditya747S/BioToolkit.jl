@@ -1,4 +1,29 @@
+# ==============================================================================
+# sequence.jl — Nucleotide sequence operations
+#
+# Provides high-performance DNA/RNA sequence manipulation: translation,
+# complementation, k-mer counting, GC analysis, and FASTA/FASTQ I/O.
+#
+# Functions use typed BioSequence inputs for biological sequence operations
+# (DNASeq/RNASeq/AASeq) for compile-time alphabet safety.
+# See biotypes.jl for the type hierarchy.
+#
+# Lookup tables use 256-element arrays indexed by raw byte value (+1 for
+# Julia 1-based indexing). This gives O(1) per-base translation with
+# excellent cache locality.
+#
+# References:
+#   - IUPAC nucleotide codes: Cornish-Bowden (1985) NAR 13(9):3021-3030
+#   - Codon adaptation index: Sharp & Li (1987) NAR 15(3):1281-1295
+#   - Wallace rule for Tm: Wallace et al. (1979) NAR 6(11):3543-3557
+#   - Molecular weights: Fasman (1975) Handbook of Biochemistry
+# ==============================================================================
+
 using Mmap
+
+@inline function _register_sequence_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
 
 const _DNA_CODE = fill(UInt8(255), 256)
 const _DNA_COMPLEMENT = fill(UInt8('N'), 256)
@@ -85,22 +110,23 @@ for (codon, amino_acid) in (
     ("TTC", 'F'), ("TTT", 'F'), ("TTA", 'L'), ("TTG", 'L'),
     ("TAC", 'Y'), ("TAT", 'Y'), ("TGC", 'C'), ("TGT", 'C'),
     ("TGG", 'W'),
-    ("TAA", '*'), ("TAG", '*'), ("TGA", '*'),
-)
+    ("TAA", '*'), ("TAG", '*'), ("TGA", '*'))
     b1 = UInt8(codon[1])
     b2 = UInt8(codon[2])
     b3 = UInt8(codon[3])
     code1 = Int(_DNA_CODE[Int(b1) + 1])
     code2 = Int(_DNA_CODE[Int(b2) + 1])
     code3 = Int(_DNA_CODE[Int(b3) + 1])
+    # Codon index: 6-bit value from three 2-bit base codes, plus 1 for Julia indexing.
+    # Layout: [code1:2bits][code2:2bits][code3:2bits] → 0..63, stored at positions 1..64.
     codon_index = ((code1 << 4) | (code2 << 2) | code3) + 1
-    # Bug fix: parentheses ensure the +1 is applied to the whole index, not just code3
     _CODON_TABLE[codon_index] = UInt8(amino_acid)
     _CODON_AA[codon_index] = UInt8(amino_acid)
     _CODON_TRIPLETS[codon_index] = codon
 end
 
-const _HAS_CUDA_SEQUENCE = false
+# GPU acceleration is available when the CUDA extension is loaded;
+# see lazy_gpu.jl for the dispatch mechanism.
 
 """
     _dna_code_byte(byte)
@@ -154,31 +180,42 @@ function _decode_kmer_key(key::Int, k::Int)
 end
 
 """
-    validate_dna(sequence)
+    validate_dna(sequence) -> Bool
 
-Return `true` when the sequence contains only supported DNA/IUPAC symbols.
+Return `true` for typed DNA/RNA sequences and `false` for non-nucleotide
+typed alphabets.
 """
-function validate_dna(sequence::AbstractString)
-    for byte in codeunits(sequence)
-        _IUPAC_DNA_VALID[Int(byte) + 1] || return false
-    end
-    return true
-end
+validate_dna(::BioSequence{DNAAlphabet}) = true
+validate_dna(::BioSequence{RNAAlphabet}) = true
+validate_dna(::BioSequence{AminoAcidAlphabet}) = false
+validate_dna(sequence::String) = isempty(sequence) || all(byte -> _IUPAC_DNA_VALID[Int(byte) + 1], codeunits(sequence))
+
+@inline _sequence_to_dna(sequence::AbstractString) = DNASeq(String(sequence); validate=false)
+@inline _sequence_to_aa(sequence::AbstractString) = AASeq(String(sequence); validate=false)
+
+# Removed validate_dna(::AbstractString) - use BioSequence types instead
 
 """
     FastqRecordStream
 
 Iterate over FASTQ records from an input stream.
 """
-mutable struct FastqRecordStream
+mutable struct FastqRecordStream{S}
     io::IO
     close_on_finish::Bool
     finished::Bool
+    sequence_type::Type{S}
 end
 
-Base.IteratorSize(::Type{FastqRecordStream}) = Base.SizeUnknown()
-Base.IteratorEltype(::Type{FastqRecordStream}) = Base.HasEltype()
-Base.eltype(::Type{FastqRecordStream}) = FastqRecord
+Base.IteratorSize(::Type{<:FastqRecordStream}) = Base.SizeUnknown()
+Base.IteratorEltype(::Type{<:FastqRecordStream}) = Base.HasEltype()
+
+_fastq_record_alphabet(::Type{<:BioSequence{A}}) where {A <: BioAlphabet} = A
+_fastq_record_alphabet(::Type) = DNAAlphabet
+
+_fastq_sequence(::Type{S}, text::String) where {S<:BioSequence} = S(text)
+
+Base.eltype(::Type{FastqRecordStream{S}}) where {S} = FastqRecord{_fastq_record_alphabet(S)}
 
 """
     Base.close(stream)
@@ -196,9 +233,9 @@ end
 
 Iterate over the next FASTQ record from a stream.
 """
-function Base.iterate(stream::FastqRecordStream)
+function Base.iterate(stream::FastqRecordStream{S}) where {S}
     stream.finished && return nothing
-    record = _read_fastq_record(stream.io)
+    record = _read_fastq_record(stream.io, stream.sequence_type)
     if record === nothing
         stream.close_on_finish && !stream.finished && close(stream)
         return nothing
@@ -211,26 +248,26 @@ end
 
 Continue FASTQ stream iteration.
 """
-function Base.iterate(stream::FastqRecordStream, ::Nothing)
+function Base.iterate(stream::FastqRecordStream{S}, ::Nothing) where {S}
     return iterate(stream)
 end
 
 """
-    each_fastq_record(path)
+    each_fastq_record(path; sequence_type=DNASeq)
 
 Create a FASTQ record iterator for a file path.
 """
-function each_fastq_record(path::AbstractString)
-    return FastqRecordStream(open(path, "r"), true, false)
+function each_fastq_record(path::String; sequence_type::Type{S}=DNASeq) where {S <: BioSequence}
+    return FastqRecordStream{S}(open(path, "r"), true, false, sequence_type)
 end
 
 """
-    each_fastq_record(io)
+    each_fastq_record(io; sequence_type=DNASeq)
 
 Create a FASTQ record iterator for an open IO stream.
 """
-function each_fastq_record(io::IO)
-    return FastqRecordStream(io, false, false)
+function each_fastq_record(io::IO; sequence_type::Type{S}=DNASeq) where {S <: BioSequence}
+    return FastqRecordStream{S}(io, false, false, sequence_type)
 end
 
 """
@@ -238,7 +275,7 @@ end
 
 Read a single FASTQ record from an IO stream.
 """
-function _read_fastq_record(io::IO)
+function _read_fastq_record(io::IO, sequence_type::Type{S}=DNASeq) where {S <: BioSequence}
     while !eof(io)
         header_line = strip(readline(io))
         isempty(header_line) && continue
@@ -256,7 +293,7 @@ function _read_fastq_record(io::IO)
             write(sequence_buffer, line)
         end
 
-        sequence = String(take!(sequence_buffer))
+        sequence = _fastq_sequence(sequence_type, uppercase(String(take!(sequence_buffer))))
         quality_buffer = IOBuffer()
         quality_length = 0
 
@@ -271,26 +308,25 @@ function _read_fastq_record(io::IO)
         quality = String(take!(quality_buffer))
         quality_length == length(sequence) || throw(ArgumentError("FASTQ sequence and quality lengths differ"))
 
-        return FastqRecord(identifier, description, sequence, quality)
+        return FastqRecord(String(identifier), String(description), sequence, quality)
     end
 
     return nothing
 end
 
 """
-    count_nucleotides(sequence)
+    count_nucleotides(sequence) -> NamedTuple{(:A,:C,:G,:T,:N), NTuple{5,Int}}
 
-Count canonical nucleotides and ambiguous bases in a sequence.
+Count canonical nucleotides (A, C, G, T) and ambiguous/non-canonical
+bases (N) in a nucleotide sequence.  Case-insensitive; IUPAC ambiguity
+codes (R, Y, S, W, K, M, B, D, H, V) are counted as N.
+
+Accepts typed `BioSequence` inputs.
 """
-function count_nucleotides(sequence::AbstractString)
-    counts = (A = 0, C = 0, G = 0, T = 0, N = 0)
-    a = 0
-    c = 0
-    g = 0
-    t = 0
-    n = 0
+function count_nucleotides(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    a = 0; c = 0; g = 0; t = 0; n = 0
 
-    for byte in codeunits(sequence)
+    @inbounds for byte in sequence.data
         code = _DNA_CODE[Int(byte) + 1]
         if code == 0
             a += 1
@@ -308,68 +344,78 @@ function count_nucleotides(sequence::AbstractString)
     return (A = a, C = c, G = g, T = t, N = n)
 end
 
+count_nucleotides(sequence::AbstractString) = count_nucleotides(_sequence_to_dna(sequence))
+
 """
     transcribe_dna(sequence)
 
 Transcribe DNA to RNA by replacing thymine with uracil.
 """
-function transcribe_dna(sequence::AbstractString)
-    length_sequence = ncodeunits(sequence)
-    length_sequence == 0 && return ""
+function transcribe_dna(sequence::BioSequence{DNAAlphabet})
+    length_sequence = length(sequence)
+    length_sequence == 0 && return RNASeq(UInt8[]; validate=false)
 
     buffer = Vector{UInt8}(undef, length_sequence)
 
-    GC.@preserve sequence buffer begin
-        source = pointer(sequence)
-
-        @inbounds for index in 1:length_sequence
-            byte = unsafe_load(source, index)
-            if byte == UInt8('a') || byte == UInt8('A')
-                buffer[index] = UInt8('A')
-            elseif byte == UInt8('c') || byte == UInt8('C')
-                buffer[index] = UInt8('C')
-            elseif byte == UInt8('g') || byte == UInt8('G')
-                buffer[index] = UInt8('G')
-            elseif byte == UInt8('t') || byte == UInt8('T') || byte == UInt8('u') || byte == UInt8('U')
+    @inbounds for index in eachindex(sequence.data)
+        byte = sequence.data[index]
+        if byte == UInt8('A')
+            buffer[index] = UInt8('A')
+        elseif byte == UInt8('C')
+            buffer[index] = UInt8('C')
+        elseif byte == UInt8('G')
+            buffer[index] = UInt8('G')
+        elseif byte == UInt8('T') || byte == UInt8('U')
+            buffer[index] = UInt8('U')
+        elseif byte == UInt8('N')
+            buffer[index] = UInt8('N')
+        else
+            buffer[index] = byte
+            if buffer[index] == UInt8('T')
                 buffer[index] = UInt8('U')
-            elseif byte == UInt8('n') || byte == UInt8('N')
-                buffer[index] = UInt8('N')
-            else
-                buffer[index] = byte <= 0x7f ? UInt8(byte & 0xdf) : byte
-                if buffer[index] == UInt8('T')
-                    buffer[index] = UInt8('U')
-                end
             end
         end
     end
 
-    return unsafe_string(pointer(buffer), length_sequence)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, RNASeq(buffer; validate=false), "transcribe_dna")
 end
+
+transcribe_dna(sequence::AbstractString) = String(transcribe_dna(_sequence_to_dna(sequence)))
 
 """
     reverse_complement(sequence)
 
-Return the reverse complement of a nucleotide string.
-"""
-function reverse_complement(sequence::AbstractString)
-    isempty(sequence) && return ""
+Return the reverse complement of a nucleotide string.  Uses the IUPAC
+complement table: A↔T, C↔G, R↔Y, S↔S, W↔W, K↔M, B↔V, D↔H, N↔N.
 
-    length_sequence = ncodeunits(sequence)
+Returns a typed `BioSequence`.
+"""
+function reverse_complement(sequence::BioSequence{DNAAlphabet})
+    isempty(sequence) && return DNASeq(UInt8[]; validate=false)
+
+    length_sequence = length(sequence)
     buffer = Vector{UInt8}(undef, length_sequence)
 
-    GC.@preserve sequence buffer begin
-        source = pointer(sequence)
-        complement = _DNA_COMPLEMENT
-        source_index = length_sequence
+    complement = _DNA_COMPLEMENT
+    source_index = length_sequence
 
-        @inbounds for destination_index in 1:length_sequence
-            buffer[destination_index] = complement[Int(unsafe_load(source, source_index)) + 1]
-            source_index -= 1
-        end
+    @inbounds for destination_index in 1:length_sequence
+        buffer[destination_index] = complement[Int(sequence.data[source_index]) + 1]
+        source_index -= 1
     end
-
-    return unsafe_string(pointer(buffer), length_sequence)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, DNASeq(buffer; validate=false), "reverse_complement")
 end
+
+function reverse_complement(seq::BioSequence{RNAAlphabet})
+    # Complement then swap T→U in result
+    rc = reverse_complement(DNASeq(seq.data; validate=false))
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, RNASeq(UInt8[b == UInt8('T') ? UInt8('U') : b for b in rc.data]; validate=false), "reverse_complement")
+end
+
+reverse_complement(sequence::AbstractString) = reverse_complement(codeunits(String(sequence)))
 
 """
     reverse_complement(bytes)
@@ -384,7 +430,8 @@ function reverse_complement(bytes::AbstractVector{UInt8})
 
     reverse_complement!(buffer, bytes)
 
-    return unsafe_string(pointer(buffer), length_sequence)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, unsafe_string(pointer(buffer), length_sequence), "reverse_complement")
 end
 
 """
@@ -404,7 +451,8 @@ function reverse_complement!(buffer::AbstractVector{UInt8}, bytes::AbstractVecto
         source_index -= 1
     end
 
-    return length_sequence
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, length_sequence, "reverse_complement!")
 end
 
 # Note: the Vector{UInt8} overload is intentionally removed — it was an exact duplicate
@@ -412,17 +460,23 @@ end
 # Julia's dispatch already selects the concrete method when called with Vector{UInt8}.
 
 """
-    gc_content(sequence)
+    gc_content(sequence) -> Float64
 
-Compute the GC fraction of a nucleotide sequence.
+Compute the GC fraction of a nucleotide sequence.  Only unambiguous bases
+(A, C, G, T/U) contribute to the denominator; the IUPAC ambiguity code
+`S` (strong: C or G) is counted as GC.  Other ambiguity codes are skipped.
+
+Returns 0.0 for empty sequences or sequences with no canonical bases.
+
+    Accepts typed `BioSequence` inputs.
 """
-function gc_content(sequence::AbstractString)
+function gc_content(sequence::BioSequence{A}) where {A <: BioAlphabet}
     isempty(sequence) && return 0.0
 
     gc = 0
     total = 0
 
-    for byte in codeunits(sequence)
+    @inbounds for byte in sequence.data
         if byte == UInt8('C') || byte == UInt8('c') || byte == UInt8('G') || byte == UInt8('g') || byte == UInt8('S') || byte == UInt8('s')
             gc += 1
             total += 1
@@ -434,8 +488,12 @@ function gc_content(sequence::AbstractString)
     end
 
     total == 0 && return 0.0
-    return gc / total
+    gc_val = gc / total
+    _ctx = active_provenance_context()
+    return _register_sequence_result!(_ctx, gc_val, "gc_content"; parameters=(n_bases=total, gc_fraction=gc_val))
 end
+
+gc_content(sequence::AbstractString) = gc_content(_sequence_to_dna(sequence))
 
 """
     melting_temp(sequence; rna=false, method=:wallace)
@@ -450,7 +508,7 @@ also accepted and counted as thymine-like bases.
 `method=:basic` uses the longer-oligo approximation
 `64.9 + 41 * (G + C - 16.4) / N` where `N` is the number of canonical bases.
 """
-function melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=:wallace)
+function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=:wallace) where {A <: BioAlphabet}
     isempty(sequence) && return 0.0
 
     a = 0
@@ -459,7 +517,7 @@ function melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=
     t = 0
     u = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in sequence.data
         ch = byte | 0x20
         if ch == UInt8('a')
             a += 1
@@ -489,6 +547,8 @@ function melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=
     return 64.9 + 41.0 * ((g + c) - 16.4) / canonical_bases
 end
 
+melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=:wallace) = melting_temp(_sequence_to_dna(sequence); rna=rna, method=method)
+
 """
     dna_molecular_weight(sequence; stranded=:single)
 
@@ -496,7 +556,7 @@ Estimate the molecular weight of a DNA or RNA sequence in Daltons.
 `stranded=:double` returns the weight of both strands combined.
 Ambiguous IUPAC bases are averaged across their canonical possibilities.
 """
-function dna_molecular_weight(sequence::AbstractString; stranded::Symbol=:single)
+function dna_molecular_weight(sequence::BioSequence{A}; stranded::Symbol=:single) where {A <: BioAlphabet}
     stranded === :single || stranded === :double || throw(ArgumentError("stranded must be :single or :double"))
 
     weight = _dna_molecular_weight_single(sequence)
@@ -504,19 +564,21 @@ function dna_molecular_weight(sequence::AbstractString; stranded::Symbol=:single
     return weight + _dna_molecular_weight_single(reverse_complement(sequence))
 end
 
+dna_molecular_weight(sequence::AbstractString; stranded::Symbol=:single) = dna_molecular_weight(_sequence_to_dna(sequence); stranded=stranded)
+
 """
     _dna_molecular_weight_single(sequence)
 
 Compute the molecular weight of a single nucleic acid strand.
 """
-function _dna_molecular_weight_single(sequence::AbstractString)
-    length_sequence = ncodeunits(sequence)
+function _dna_molecular_weight_single(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    length_sequence = length(sequence)
     length_sequence == 0 && return 0.0
 
     residue_mass = 0.0
     residue_count = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in sequence.data
         mass = _DNA_MW_RESIDUE[Int(byte) + 1]
         mass == 0.0 && throw(ArgumentError("unsupported base '$(Char(byte))' in dna_molecular_weight"))
         residue_mass += mass
@@ -545,13 +607,13 @@ end
 
 Count codon usage in a single sequence.
 """
-function codon_usage(sequence::AbstractString; frame::Integer=1, include_stop::Bool=true)
+function codon_usage(sequence::BioSequence{DNAAlphabet}; frame::Integer=1, include_stop::Bool=true)
     1 <= frame <= 3 || throw(ArgumentError("frame must be 1, 2, or 3"))
-    length_sequence = ncodeunits(sequence)
+    length_sequence = length(sequence)
     frame <= length_sequence || return Dict{String,Int}()
 
     counts = Dict{String,Int}()
-    bytes = codeunits(sequence)
+    bytes = sequence.data
 
     @inbounds for index in frame:3:(length_sequence - 2)
         codon_index = _codon_index(bytes[index], bytes[index + 1], bytes[index + 2])
@@ -562,7 +624,9 @@ function codon_usage(sequence::AbstractString; frame::Integer=1, include_stop::B
         counts[codon] = get(counts, codon, 0) + 1
     end
 
-    return counts
+    result = counts
+    _ctx = active_provenance_context()
+    return _register_sequence_result!(_ctx, result, "codon_usage"; parameters=(n_codons=sum(values(counts)), frame=Int(frame)))
 end
 
 """
@@ -570,22 +634,27 @@ end
 
 Count codon usage across a collection of sequences.
 """
-function codon_usage(sequence::AbstractVector{<:AbstractString}; frame::Integer=1, include_stop::Bool=true)
+function codon_usage(sequence::AbstractVector{<:BioSequence{DNAAlphabet}}; frame::Integer=1, include_stop::Bool=true)
     counts = Dict{String,Int}()
     for item in sequence
         for (codon, count) in codon_usage(item; frame=frame, include_stop=include_stop)
             counts[codon] = get(counts, codon, 0) + count
         end
     end
-    return counts
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, counts, "codon_usage")
 end
+
+codon_usage(sequence::AbstractString; frame::Integer=1, include_stop::Bool=true) = codon_usage(_sequence_to_dna(sequence); frame=frame, include_stop=include_stop)
+
+# Removed codon_usage(::AbstractVector{<:AbstractString}) - use Vector{DNASeq} instead
 
 """
     codon_usage_table(sequence; frame=1, include_stop=false)
 
 Return codon usage as a table for a single sequence.
 """
-function codon_usage_table(sequence::AbstractString; frame::Integer=1, include_stop::Bool=false)
+function codon_usage_table(sequence::BioSequence{DNAAlphabet}; frame::Integer=1, include_stop::Bool=false)
     counts = codon_usage(sequence; frame=frame, include_stop=include_stop)
     total = sum(values(counts))
     total == 0 && return Dict{String,Float64}()
@@ -594,7 +663,8 @@ function codon_usage_table(sequence::AbstractString; frame::Integer=1, include_s
     for (codon, count) in counts
         table[codon] = count / total
     end
-    return table
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, table, "codon_usage_table")
 end
 
 """
@@ -602,7 +672,7 @@ end
 
 Return codon usage as a table for multiple sequences.
 """
-function codon_usage_table(sequences::AbstractVector{<:AbstractString}; frame::Integer=1, include_stop::Bool=false)
+function codon_usage_table(sequences::AbstractVector{<:BioSequence{DNAAlphabet}}; frame::Integer=1, include_stop::Bool=false)
     counts = codon_usage(sequences; frame=frame, include_stop=include_stop)
     total = sum(values(counts))
     total == 0 && return Dict{String,Float64}()
@@ -611,8 +681,13 @@ function codon_usage_table(sequences::AbstractVector{<:AbstractString}; frame::I
     for (codon, count) in counts
         table[codon] = count / total
     end
-    return table
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, table, "codon_usage_table")
 end
+
+codon_usage_table(sequence::AbstractString; frame::Integer=1, include_stop::Bool=false) = codon_usage_table(_sequence_to_dna(sequence); frame=frame, include_stop=include_stop)
+
+# Removed codon_usage_table(::AbstractVector{<:AbstractString}) - use Vector{DNASeq} instead
 
 """
     relative_codon_adaptiveness(reference; frame=1, pseudocount=0.5)
@@ -641,7 +716,8 @@ function relative_codon_adaptiveness(reference; frame::Integer=1, pseudocount::R
         weights[codon] = denominator == 0.0 ? 0.0 : (get(counts, codon, 0) + pseudocount) / denominator
     end
 
-    return weights
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, weights, "relative_codon_adaptiveness")
 end
 
 """
@@ -649,14 +725,14 @@ end
 
 Compute the codon adaptation index for a coding sequence.
 """
-function codon_adaptation_index(sequence::AbstractString; reference, frame::Integer=1, pseudocount::Real=0.5)
+function codon_adaptation_index(sequence::BioSequence{DNAAlphabet}; reference, frame::Integer=1, pseudocount::Real=0.5)
     weights = relative_codon_adaptiveness(reference; frame=frame, pseudocount=pseudocount)
-    length_sequence = ncodeunits(sequence)
+    length_sequence = length(sequence)
     length_sequence < 3 && return 0.0
 
     log_sum = 0.0
     used = 0
-    bytes = codeunits(sequence)
+    bytes = sequence.data
 
     @inbounds for index in frame:3:(length_sequence - 2)
         codon_index = _codon_index(bytes[index], bytes[index + 1], bytes[index + 2])
@@ -671,26 +747,39 @@ function codon_adaptation_index(sequence::AbstractString; reference, frame::Inte
     end
 
     used == 0 && return 0.0
-    return exp(log_sum / used)
+    cai_val = exp(log_sum / used)
+    _ctx = active_provenance_context()
+    return _register_sequence_result!(_ctx, cai_val, "codon_adaptation_index"; parameters=(n_codons=used, frame=Int(frame), cai=cai_val))
 end
 
+codon_adaptation_index(sequence::AbstractString; reference, frame::Integer=1, pseudocount::Real=0.5) =
+    codon_adaptation_index(_sequence_to_dna(sequence); reference=reference, frame=frame, pseudocount=pseudocount)
+
+cai(sequence::BioSequence{DNAAlphabet}; reference, kwargs...) = codon_adaptation_index(sequence; reference=reference, kwargs...)
 cai(sequence::AbstractString; reference, kwargs...) = codon_adaptation_index(sequence; reference=reference, kwargs...)
 
 """
     translate_dna(sequence; stop_at_stop=false)
 
-Translate a DNA sequence into an amino-acid sequence.
+Translate a DNA/RNA coding sequence into a single-letter amino acid string
+using the standard genetic code (NCBI translation table 1).
+using ..BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id
+
+The input length must be a multiple of 3.  Stop codons (TAA, TAG, TGA)
+produce `'*'`.  When `stop_at_stop=true`, translation terminates at the
+first stop codon; otherwise stop codons are omitted from the output.
+
+Accepts typed `BioSequence{DNAAlphabet}` inputs and returns
+`BioSequence{AminoAcidAlphabet}`.
 """
-function translate_dna(sequence::AbstractString; stop_at_stop::Bool=false)
-    length_sequence = ncodeunits(sequence)
+function translate_dna(sequence::BioSequence{DNAAlphabet}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    length_sequence = length(sequence)
     length_sequence % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(length_sequence)"))
     buffer = Vector{UInt8}(undef, length_sequence ÷ 3)
-
-    GC.@preserve sequence buffer begin
-        written = _translate_dna_bytes!(buffer, pointer(sequence), length_sequence; stop_at_stop=stop_at_stop)
-        resize!(buffer, written)
-        return unsafe_string(pointer(buffer), written)
-    end
+    written = translate_dna!(buffer, sequence.data; stop_at_stop=stop_at_stop)
+    resize!(buffer, written)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, AASeq(buffer; validate=false), "translate_dna")
 end
 
 """
@@ -705,7 +794,8 @@ Translate encoded DNA bytes into an amino-acid byte buffer.
     index = 1
     out_index = 1
 
-    # Bug fix: codon table indexing now uses correct parenthesization
+    # Codon index: 6-bit value from three 2-bit base codes + 1 for Julia indexing.
+    # Ambiguous bases (code > 3) produce 'X' (unknown amino acid).
     @inbounds while index + 2 <= last
         code1 = code_table[Int(unsafe_load(source, index)) + 1]
         code2 = code_table[Int(unsafe_load(source, index + 1)) + 1]
@@ -735,8 +825,11 @@ function translate_dna(bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false)
     buffer = Vector{UInt8}(undef, last ÷ 3)
     written = translate_dna!(buffer, bytes; stop_at_stop=stop_at_stop)
     resize!(buffer, written)
-    return unsafe_string(pointer(buffer), written)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, unsafe_string(pointer(buffer), written), "translate_dna")
 end
+
+translate_dna(sequence::AbstractString; stop_at_stop::Bool=false) = translate_dna(codeunits(String(sequence)); stop_at_stop=stop_at_stop)
 
 """
     translate_dna!(buffer, bytes; stop_at_stop=false)
@@ -753,7 +846,6 @@ function translate_dna!(buffer::Vector{UInt8}, bytes::AbstractVector{UInt8}; sto
     index = 1
     out_index = 1
 
-    # Bug fix: codon table indexing now uses correct parenthesization
     @inbounds while index + 2 <= last
         code1 = code_table[Int(bytes[index]) + 1]
         code2 = code_table[Int(bytes[index + 1]) + 1]
@@ -769,7 +861,8 @@ function translate_dna!(buffer::Vector{UInt8}, bytes::AbstractVector{UInt8}; sto
         index += 3
     end
 
-    return out_index - 1
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, out_index - 1, "translate_dna!")
 end
 
 """
@@ -777,7 +870,7 @@ end
 
 Translate nucleotide bytes into a preallocated amino-acid buffer.
 """
-function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false)
+function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     last = length(bytes)
     last % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(last)"))
     length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
@@ -787,8 +880,8 @@ function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UIn
     index = 1
     out_index = 1
 
-    # Bug fix: previous version had inverted logic (wrote stop codons when stop_at_stop
-    # was true, and skipped them when stop_at_stop was false). Fixed below.
+    # When stop_at_stop=true, halt at the first stop codon without emitting it.
+    # When stop_at_stop=false, skip stop codons and continue translating.
     @inbounds while index + 2 <= last
         code1 = code_table[Int(bytes[index]) + 1]
         code2 = code_table[Int(bytes[index + 1]) + 1]
@@ -805,7 +898,8 @@ function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UIn
         index += 3
     end
 
-    return out_index - 1
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, out_index - 1, "translate_dna!")
 end
 
 """
@@ -813,10 +907,11 @@ end
 
 Translate nucleotide bytes into a preallocated amino-acid buffer.
 """
-function translate_dna!(buffer::Vector{UInt8}, bytes::Vector{UInt8}; stop_at_stop::Bool=false)
+function translate_dna!(buffer::Vector{UInt8}, bytes::Vector{UInt8}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     last = length(bytes)
     length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
     GC.@preserve bytes begin
+
         return _translate_dna_bytes!(buffer, pointer(bytes), last; stop_at_stop=stop_at_stop)
     end
 end
@@ -867,7 +962,14 @@ function hamming_distance(left::AbstractVector{UInt8}, right::AbstractVector{UIn
         end
     end
 
-    return distance
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, distance, "hamming_distance")
+end
+
+# Removed hamming_distance(::AbstractString, ::AbstractString) - use BioSequence types instead
+function hamming_distance(left::AbstractString, right::AbstractString; use_cuda::Bool=false)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hamming_distance(DNASeq(left; validate=false), DNASeq(right; validate=false); use_cuda=use_cuda), "hamming_distance")
 end
 
 """
@@ -875,10 +977,9 @@ end
 
 Find open reading frames in a nucleotide sequence.
 """
-function find_orfs(sequence::AbstractString; min_aa::Integer=0)
-    upper = uppercase(sequence)
-    bytes = codeunits(upper)
-    proteins = String[]
+function find_orfs(sequence::BioSequence{DNAAlphabet}; min_aa::Integer=0)
+    bytes = sequence.data
+    proteins = AASeq[]
 
     for frame in 1:3
         window_length = length(bytes) - frame + 1
@@ -887,44 +988,52 @@ function find_orfs(sequence::AbstractString; min_aa::Integer=0)
         complete_length == 0 && continue
         frame_bytes = bytes[frame:frame + complete_length - 1]
 
-        protein = translate_dna(frame_bytes; stop_at_stop=false)
+        protein = AASeq(translate_dna(frame_bytes; stop_at_stop=false); validate=false)
         if length(protein) >= min_aa
             push!(proteins, protein)
         end
 
-        reverse_protein = translate_dna(reverse_complement(frame_bytes); stop_at_stop=false)
+        reverse_protein = AASeq(translate_dna(reverse_complement(frame_bytes); stop_at_stop=false); validate=false)
         if length(reverse_protein) >= min_aa
             push!(proteins, reverse_protein)
         end
     end
 
-    return proteins
+    _ctx = active_provenance_context()
+    return _register_sequence_result!(_ctx, proteins, "find_orfs"; parameters=(n_orfs=length(proteins), min_aa=Int(min_aa), sequence_length=length(sequence.data)))
 end
+
+find_orfs(sequence::AbstractString; min_aa::Integer=0) = find_orfs(_sequence_to_dna(sequence); min_aa=min_aa)
 
 """
     protein_search(sequence, motif)
 
 Search for a protein motif in a translated nucleotide sequence.
 """
-function protein_search(sequence::AbstractString, motif::AbstractString)
+function protein_search(sequence::BioSequence{DNAAlphabet}, motif::BioSequence{AminoAcidAlphabet})
     proteins = find_orfs(sequence)
-    hits = String[]
+    hits = AASeq[]
 
     for protein in proteins
-        occursin(motif, protein) && push!(hits, protein)
+        occursin(String(motif), String(protein)) && push!(hits, protein)
     end
 
-    return hits
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, hits, "protein_search")
 end
+
+protein_search(sequence::AbstractString, motif::BioSequence{AminoAcidAlphabet}) = protein_search(_sequence_to_dna(sequence), motif)
+protein_search(sequence::BioSequence{DNAAlphabet}, motif::AbstractString) = protein_search(sequence, _sequence_to_aa(motif))
+protein_search(sequence::AbstractString, motif::AbstractString) = protein_search(_sequence_to_dna(sequence), _sequence_to_aa(motif))
 
 """
     kmer_frequency(sequence, k; use_cuda=false)
 
 Count k-mer frequencies in a nucleotide sequence.
 """
-function kmer_frequency(sequence::AbstractString, k::Integer; use_cuda::Bool=false)
+function kmer_frequency(sequence::BioSequence{A}, k::Integer; use_cuda::Bool=false) where {A <: BioAlphabet}
     if use_cuda
-        bytes = Vector{UInt8}(codeunits(uppercase(sequence)))
+        bytes = Vector{UInt8}(sequence.data)
         return kmer_frequency(bytes, k; use_cuda=true)
     end
 
@@ -942,15 +1051,16 @@ function kmer_frequency(sequence::AbstractString, k::Integer; use_cuda::Bool=fal
     end
 
     counts = Dict{String,Int}()
-    upper = uppercase(sequence)
+    upper = String(sequence)
 
     for index in firstindex(upper):lastindex(upper) - k + 1
         kmer = upper[index:index+k-1]
         counts[kmer] = get(counts, kmer, 0) + 1
     end
-
     return counts
 end
+
+kmer_frequency(sequence::AbstractString, k::Integer; use_cuda::Bool=false) = kmer_frequency(_sequence_to_dna(sequence), k; use_cuda=use_cuda)
 
 const _KMER_FAST_ALPHABET = (UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T'))
 
@@ -976,11 +1086,11 @@ end
 
 Count k-mers for an unambiguous DNA sequence.
 """
-function _kmer_frequency_unambiguous_dna(sequence::AbstractString, k::Integer)
-    length_sequence = ncodeunits(sequence)
+function _kmer_frequency_unambiguous_dna(sequence::BioSequence{DNAAlphabet}, k::Integer)
+    length_sequence = length(sequence)
     length_sequence < k && return Dict{String,Int}()
 
-    bytes = codeunits(sequence)
+    bytes = sequence.data
     code_table = _DNA_CODE
     base_power = UInt64(1)
     for _ in 2:k
@@ -1033,8 +1143,8 @@ end
 
 Count k-mers for a DNA sequence that may contain ambiguous symbols.
 """
-function _kmer_frequency_dna(sequence::AbstractString, k::Integer)
-    upper = uppercase(sequence)
+function _kmer_frequency_dna(sequence::BioSequence{DNAAlphabet}, k::Integer)
+    upper = String(sequence)
     bytes = codeunits(upper)
     length(bytes) < k && return Dict{String,Int}()
 
@@ -1083,67 +1193,11 @@ function _kmer_frequency_dna(sequence::AbstractString, k::Integer)
 end
 
 """
-    read_fasta(path)
-
-Read FASTA records from a file path.
-"""
-function read_fasta(path::AbstractString)
-    records = Vector{Tuple{String,String}}()
-    header = ""
-    sequence = IOBuffer()
-    seen_header = false
-    line_number = 0
-
-    open(path, "r") do io
-        for raw_line in eachline(io)
-            line_number += 1
-            line = strip(raw_line)
-            isempty(line) && continue
-            if startswith(line, '>')
-                seen_header = true
-                if !isempty(header)
-                    push!(records, (header, String(take!(sequence))))
-                end
-                header = strip(line[2:end])
-                isempty(header) && throw(ArgumentError("FASTA header on line $(line_number) is empty"))
-            else
-                seen_header || throw(ArgumentError("FASTA sequence data encountered before a header on line $(line_number); expected a line starting with >"))
-                write(sequence, uppercase(line))
-            end
-        end
-    end
-
-    !seen_header && return records
-    !isempty(header) && push!(records, (header, String(take!(sequence))))
-    return records
-end
-
-"""
-    read_fastq(path)
-
-Read FASTQ records from a file path.
-"""
-function read_fastq(path::AbstractString)
-    open(path, "r") do io
-        return collect(each_fastq_record(io))
-    end
-end
-
-"""
-    read_fastq(io)
-
-Read FASTQ records from an IO stream.
-"""
-function read_fastq(io::IO)
-    return collect(each_fastq_record(io))
-end
-
-"""
     fasta_index(path)
 
 Build a compact random-access index for a FASTA file.
 """
-function fasta_index(path::AbstractString)
+function fasta_index(path::String)
     records = Dict{String,FastaIndexRecord}()
 
     open(path, "r") do io
@@ -1189,7 +1243,8 @@ function fasta_index(path::AbstractString)
         end
     end
 
-    return records
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, records, "fasta_index")
 end
 
 """
@@ -1226,7 +1281,8 @@ function fetch_fasta_sequence(filebytes::AbstractVector{UInt8}, index::FastaInde
         current_pos += read_length
     end
 
-    return String(bytes)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, String(bytes), "fetch_fasta_sequence")
 end
 
 """
@@ -1234,8 +1290,10 @@ end
 
 Fetch a sequence range from an indexed FASTA file path.
 """
-function fetch_fasta_sequence(path::AbstractString, index::FastaIndexRecord, start_pos::Integer, stop_pos::Integer)
+function fetch_fasta_sequence(path::String, index::FastaIndexRecord, start_pos::Integer, stop_pos::Integer)
+
     open(path, "r") do io
+
         return fetch_fasta_sequence(Mmap.mmap(io), index, start_pos, stop_pos)
     end
 end
@@ -1245,14 +1303,13 @@ end
 
 Compute the Hamming distance between two nucleotide strings.
 """
-function hamming_distance(left::AbstractString, right::AbstractString; use_cuda::Bool=false)
+function hamming_distance(left::BioSequence{A}, right::BioSequence{A}; use_cuda::Bool=false) where {A <: BioAlphabet}
     if use_cuda
-        left_bytes = Vector{UInt8}(codeunits(left))
-        right_bytes = Vector{UInt8}(codeunits(right))
+        left_bytes = Vector{UInt8}(left.data)
+        right_bytes = Vector{UInt8}(right.data)
         return hamming_distance(left_bytes, right_bytes; use_cuda=true)
     end
-
-    return hamming_distance(codeunits(left), codeunits(right))
+    return hamming_distance(left.data, right.data)
 end
 
 """
@@ -1267,7 +1324,8 @@ function kmer_frequency(bytes::AbstractVector{UInt8}, k::Integer; use_cuda::Bool
         return Base.invokelatest(_CUDA_SEQUENCE_KMER_IMPL[], bytes_cuda, k)
     end
 
-    return kmer_frequency(String(bytes), k)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, kmer_frequency(String(bytes), k), "kmer_frequency")
 end
 
 """
@@ -1275,9 +1333,9 @@ end
 
 Check primer pairs for potentially problematic 3' complementarity.
 """
-function check_primer_dimers(fwd_seq::AbstractString, rev_seq::AbstractString; min_3prime_match::Int=4)
-    fwd = uppercase(String(fwd_seq))
-    rev_rc = reverse_complement(uppercase(String(rev_seq)))
+function check_primer_dimers(fwd_seq::BioSequence{DNAAlphabet}, rev_seq::BioSequence{DNAAlphabet}; min_3prime_match::Int=4)
+    fwd = String(fwd_seq)
+    rev_rc = String(reverse_complement(rev_seq))
     best_match = 0
     best_window = ""
 
@@ -1291,30 +1349,36 @@ function check_primer_dimers(fwd_seq::AbstractString, rev_seq::AbstractString; m
         end
     end
 
-    return (
+    _ctx = active_provenance_context()
+    result = (
         has_dimer = best_match >= min_3prime_match,
         max_3prime_match = best_match,
         score = max_window == 0 ? 0.0 : best_match / max_window,
-        matched_sequence = best_window,
-    )
+        matched_sequence = best_window)
+    return provenance_result!(_ctx, result, "check_primer_dimers")
 end
+
+check_primer_dimers(fwd_seq::AbstractString, rev_seq::AbstractString; min_3prime_match::Int=4) =
+    check_primer_dimers(_sequence_to_dna(fwd_seq), _sequence_to_dna(rev_seq); min_3prime_match=min_3prime_match)
 
 """
     _find_all_occurrences(sequence, motif)
 
 Find all exact occurrences of a motif in a sequence.
 """
-function _find_all_occurrences(sequence::AbstractString, motif::AbstractString)
+function _find_all_occurrences(sequence::BioSequence{A}, motif::BioSequence{A}) where {A <: BioAlphabet}
+    sequence_str = String(sequence)
+    motif_str = String(motif)
     matches = Tuple{Int,Int}[]
-    start_index = firstindex(sequence)
-    motif_length = ncodeunits(motif)
+    start_index = firstindex(sequence_str)
+    motif_length = ncodeunits(motif_str)
     motif_length == 0 && return matches
 
-    while start_index <= lastindex(sequence)
-        found = findnext(motif, sequence, start_index)
+    while start_index <= lastindex(sequence_str)
+        found = findnext(motif_str, sequence_str, start_index)
         found === nothing && break
         push!(matches, (first(found), last(found)))
-        start_index = nextind(sequence, last(found))
+        start_index = nextind(sequence_str, last(found))
     end
 
     return matches
@@ -1325,24 +1389,26 @@ end
 
 Resolve genome sequence sources from either an index or a FASTA path.
 """
-function _resolve_genome_sequences(genome_index; genome_path::Union{Nothing,AbstractString}=nothing)
+function _resolve_genome_sequences(genome_index; genome_path::Union{Nothing,String}=nothing)
     if genome_index isa AbstractDict
         sequence_values = collect(Base.values(genome_index))
         if isempty(sequence_values)
-            return Dict{String,String}()
+            return Dict{String,DNASeq}()
+        elseif all(value -> value isa BioSequence{DNAAlphabet}, sequence_values)
+            return Dict{String,DNASeq}(String(chrom) => DNASeq(sequence.data; validate=false) for (chrom, sequence) in genome_index)
         elseif all(value -> value isa AbstractString, sequence_values)
-            return Dict{String,String}(String(chrom) => String(sequence) for (chrom, sequence) in genome_index)
+            return Dict{String,DNASeq}(String(chrom) => DNASeq(String(sequence); validate=false) for (chrom, sequence) in genome_index)
         elseif all(value -> value isa FastaIndexRecord, sequence_values)
             genome_path === nothing && throw(ArgumentError("genome_path is required when genome_index stores FastaIndexRecord values"))
-            sequences = Dict{String,String}()
+            sequences = Dict{String,DNASeq}()
             for (chrom, index) in genome_index
-                sequences[String(chrom)] = fetch_fasta_sequence(genome_path, index, 1, index.sequence_length)
+                sequences[String(chrom)] = DNASeq(fetch_fasta_sequence(genome_path, index, 1, index.sequence_length))
             end
             return sequences
         end
-    elseif genome_index isa AbstractString
+    elseif genome_index isa String
         path = String(genome_index)
-        return Dict{String,String}(name => fetch_fasta_sequence(path, index, 1, index.sequence_length) for (name, index) in fasta_index(path))
+        return Dict{String,DNASeq}(name => DNASeq(fetch_fasta_sequence(path, index, 1, index.sequence_length)) for (name, index) in fasta_index(path))
     end
 
     throw(ArgumentError("genome_index must be a Dict of sequences or FastaIndexRecord objects, or a FASTA path"))
@@ -1353,10 +1419,10 @@ end
 
 Simulate PCR in silico by locating primer hits and possible amplicons.
 """
-function pcr_in_silico(primer_fwd::AbstractString, primer_rev::AbstractString, genome_index; genome_path::Union{Nothing,AbstractString}=nothing, max_product_length::Int=50_000)
+function pcr_in_silico(primer_fwd::BioSequence{DNAAlphabet}, primer_rev::BioSequence{DNAAlphabet}, genome_index; genome_path::Union{Nothing,String}=nothing, max_product_length::Int=50_000)
     genome = _resolve_genome_sequences(genome_index; genome_path=genome_path)
-    forward = uppercase(String(primer_fwd))
-    reverse = reverse_complement(uppercase(String(primer_rev)))
+    forward = DNASeq(String(primer_fwd); validate=false)
+    reverse = reverse_complement(DNASeq(String(primer_rev); validate=false))
     amplicons = NamedTuple[]
 
     for (chrom, sequence) in genome
@@ -1377,26 +1443,33 @@ function pcr_in_silico(primer_fwd::AbstractString, primer_rev::AbstractString, g
                     stop = reverse_stop,
                     amplicon_size = product_size,
                     forward_primer_start = forward_start,
-                    reverse_primer_stop = reverse_stop,
-                ))
+                    reverse_primer_stop = reverse_stop))
             end
         end
     end
 
     sort!(amplicons; by = amplicon -> (amplicon.chrom, amplicon.start, amplicon.stop, amplicon.amplicon_size))
-    return amplicons
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, amplicons, "pcr_in_silico")
 end
+
+function pcr_in_silico(primer_fwd::String, primer_rev::String, genome_index; genome_path::Union{Nothing,String}=nothing, max_product_length::Int=50_000)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, pcr_in_silico(DNASeq(primer_fwd; validate=false), DNASeq(primer_rev; validate=false), genome_index; genome_path=genome_path, max_product_length=max_product_length), "pcr_in_silico")
+end
+
+# Removed pcr_in_silico(::AbstractString, ::AbstractString) - use DNASeq types instead
 
 """
     score_grna_efficiency(guide; pam="NGG")
 
 Score a guide RNA sequence for simple CRISPR efficiency heuristics.
 """
-function score_grna_efficiency(guide::AbstractString; pam::AbstractString="NGG")
+function score_grna_efficiency(guide::BioSequence{DNAAlphabet}; pam::BioSequence{DNAAlphabet}=DNASeq("NGG"; validate=false))
     sequence = uppercase(strip(String(guide)))
     isempty(sequence) && return 0.0
 
-    gc = gc_content(sequence)
+    gc = gc_content(DNASeq(sequence; validate=false))
     gc_score = clamp(1.0 - abs(gc - 0.5) / 0.5, 0.0, 1.0)
     poly_penalty = occursin(r"A{4,}|C{4,}|G{4,}|T{4,}", sequence) ? 0.25 : 0.0
     seed_bonus = startswith(sequence, "G") ? 0.05 : 0.0
@@ -1406,6 +1479,9 @@ function score_grna_efficiency(guide::AbstractString; pam::AbstractString="NGG")
     return clamp(score, 0.0, 1.0)
 end
 
+score_grna_efficiency(guide::AbstractString; pam::AbstractString="NGG") =
+    score_grna_efficiency(_sequence_to_dna(guide); pam=_sequence_to_dna(pam))
+
 # ─── GC Skew ──────────────────────────────────────────────────────────────────
 
 """
@@ -1413,8 +1489,8 @@ end
 
 Compute cumulative GC skew for a sequence.
 """
-function gc_skew(sequence::AbstractString)
-    bytes = codeunits(sequence)
+function gc_skew(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    bytes = sequence.data
     len = length(bytes)
     skew_values = Vector{Int}(undef, len)
     current = 0
@@ -1444,8 +1520,11 @@ function gc_skew(bytes::AbstractVector{UInt8})
         skew_values[i] = current
     end
 
-    return skew_values
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, skew_values, "gc_skew")
 end
+
+gc_skew(sequence::AbstractString) = gc_skew(codeunits(String(sequence)))
 
 """
     minimum_skew(sequence)
@@ -1456,7 +1535,8 @@ function minimum_skew(sequence)
     skew_values = gc_skew(sequence)
     isempty(skew_values) && return Int[]
     min_val = minimum(skew_values)
-    return findall(==(min_val), skew_values)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, findall(==(min_val), skew_values), "minimum_skew")
 end
 
 # ─── Dotmatrix ────────────────────────────────────────────────────────────────
@@ -1468,14 +1548,13 @@ Compute a dot-plot matrix comparing two sequences.
 Returns a Matrix{Int8} where 1 = match, 0 = mismatch.
 Rows correspond to seq1, columns to seq2.
 """
-function dotmatrix(seq1::AbstractString, seq2::AbstractString; use_cuda::Bool=false)
+function dotmatrix(seq1::BioSequence{A}, seq2::BioSequence{A}; use_cuda::Bool=false) where {A <: BioAlphabet}
     if use_cuda
-        seq1_bytes = Vector{UInt8}(codeunits(seq1))
-        seq2_bytes = Vector{UInt8}(codeunits(seq2))
+        seq1_bytes = Vector{UInt8}(seq1.data)
+        seq2_bytes = Vector{UInt8}(seq2.data)
         return dotmatrix(seq1_bytes, seq2_bytes; use_cuda=true)
     end
-
-    return dotmatrix(codeunits(seq1), codeunits(seq2))
+    return dotmatrix(seq1.data, seq2.data)
 end
 
 """
@@ -1502,5 +1581,210 @@ function dotmatrix(seq1::AbstractVector{UInt8}, seq2::AbstractVector{UInt8}; use
         end
     end
 
-    return matrix
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, matrix, "dotmatrix")
 end
+
+# Removed dotmatrix(::AbstractString, ::AbstractString) - use BioSequence types instead
+function dotmatrix(seq1::AbstractString, seq2::AbstractString; use_cuda::Bool=false)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, dotmatrix(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); use_cuda=use_cuda), "dotmatrix")
+end
+
+# ==============================================================================
+# Missing Bioconductor-equivalent features
+#
+# The following functions mirror capabilities from R/Bioconductor's Biostrings,
+# IRanges, and GenomicRanges packages that were absent from BioToolkit.
+# ==============================================================================
+
+# ---- dinucleotide_frequency (Biostrings::dinucleotideFrequency) ---------------
+
+"""
+    dinucleotide_frequency(sequence)
+
+Count all 16 dinucleotide frequencies in a DNA/RNA sequence.
+Returns a Dict{String,Int} with keys like "AA", "AC", ..., "TT".
+
+Equivalent to R/Bioconductor's `Biostrings::dinucleotideFrequency`.
+"""
+function dinucleotide_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    counts = Dict{String,Int}()
+    bytes = sequence.data
+    len = length(bytes)
+    len < 2 && return counts
+
+    @inbounds for i in 1:(len - 1)
+        b1 = bytes[i] < 0x61 ? bytes[i] : bytes[i] - 0x20
+        b2 = bytes[i+1] < 0x61 ? bytes[i+1] : bytes[i+1] - 0x20
+        key = String(UInt8[b1, b2])
+        counts[key] = get(counts, key, 0) + 1
+    end
+
+    return counts
+end
+
+"""
+    trinucleotide_frequency(sequence)
+
+Count all 64 trinucleotide frequencies in a DNA/RNA sequence.
+Returns a Dict{String,Int} with keys like "AAA", "AAC", etc.
+
+Equivalent to R/Bioconductor's `Biostrings::trinucleotideFrequency`.
+"""
+function trinucleotide_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    counts = Dict{String,Int}()
+    bytes = sequence.data
+    len = length(bytes)
+    len < 3 && return counts
+
+    @inbounds for i in 1:(len - 2)
+        b1 = bytes[i] < 0x61 ? bytes[i] : bytes[i] - 0x20
+        b2 = bytes[i+1] < 0x61 ? bytes[i+1] : bytes[i+1] - 0x20
+        b3 = bytes[i+2] < 0x61 ? bytes[i+2] : bytes[i+2] - 0x20
+        key = String(UInt8[b1, b2, b3])
+        counts[key] = get(counts, key, 0) + 1
+    end
+
+    return counts
+end
+
+# ---- letter_frequency (Biostrings::letterFrequency) --------------------------
+
+"""
+    letter_frequency(sequence)
+
+Count every distinct character in a sequence. Returns a Dict{Char,Int}.
+Case-insensitive: all characters are uppercased.
+
+Equivalent to R/Bioconductor's `Biostrings::letterFrequency`.
+"""
+function letter_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    counts = Dict{Char,Int}()
+    @inbounds for byte in sequence.data
+        ch = Char(byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte))
+        counts[ch] = get(counts, ch, 0) + 1
+    end
+    return counts
+end
+
+# ---- sequence_complexity (linguistic complexity) -----------------------------
+
+"""
+    sequence_complexity(sequence; k::Int=3)
+
+Compute the linguistic complexity of a sequence, defined as the ratio of
+observed unique k-mers to the theoretical maximum for the given alphabet
+and sequence length.  Values near 1.0 indicate high-complexity sequences;
+low values indicate repetitive or low-complexity regions.
+
+This is useful for masking low-complexity regions before BLAST searches,
+similar to DUST/SEG algorithms.
+
+Reference: Trifonov (1990) Bull Math Biol 52(1):35-40
+"""
+function sequence_complexity(sequence::BioSequence{A}; k::Int=3) where {A <: BioAlphabet}
+    len = length(sequence)
+    len < k && return 0.0
+
+    observed = Set{UInt64}()
+    bytes = sequence.data
+
+    @inbounds for i in 1:(len - k + 1)
+        h = UInt64(0)
+        for j in 0:(k-1)
+            b = bytes[i + j]
+            b = b < 0x61 ? b : (b <= 0x7a ? b - 0x20 : b)
+            h = (h << 8) | b
+        end
+        push!(observed, h)
+    end
+
+    # Theoretical maximum: min(4^k, L-k+1) for DNA
+    max_possible = min(4^k, len - k + 1)
+    return length(observed) / max_possible
+end
+
+# ---- generalized sequence utilities ----------------------------------------
+
+"""
+    oligonucleotide_frequency(sequence; k::Int=2, normalize::Bool=false)
+
+Count all observed k-mer frequencies in a biological sequence.
+
+When `normalize=true`, returns relative frequencies that sum to 1.0.
+"""
+function oligonucleotide_frequency(sequence::BioSequence{A}; k::Int=2, normalize::Bool=false) where {A <: BioAlphabet}
+    counts = kmer_frequency(sequence, k)
+    normalize || return counts
+
+    total = sum(values(counts))
+    total == 0 && return Dict{String,Float64}()
+    return Dict(kmer => count / total for (kmer, count) in counts)
+end
+
+oligonucleotide_frequency(sequence::AbstractString; k::Int=2, normalize::Bool=false) = oligonucleotide_frequency(DNASeq(sequence; validate=false); k=k, normalize=normalize)
+
+"""
+    sequence_entropy(sequence; k::Int=1)
+
+Compute the Shannon entropy of the observed k-mer distribution in a sequence.
+For `k=1`, this is the single-letter entropy of the sequence.
+"""
+function sequence_entropy(sequence::BioSequence{A}; k::Int=1) where {A <: BioAlphabet}
+    k <= 0 && throw(ArgumentError("k must be positive"))
+
+    counts = k == 1 ? letter_frequency(sequence) : kmer_frequency(sequence, k)
+    total = sum(values(counts))
+    total == 0 && return 0.0
+
+    entropy = 0.0
+    for count in values(counts)
+        probability = count / total
+        entropy -= probability * log2(probability)
+    end
+    return entropy
+end
+
+sequence_entropy(sequence::AbstractString; k::Int=1) = sequence_entropy(DNASeq(sequence; validate=false); k=k)
+
+"""
+    sliding_window_gc_content(sequence; window::Int=100, step::Int=1)
+
+Compute GC content in sliding windows across a DNA sequence.
+Returns a named tuple with start positions, stop positions, and GC fractions.
+"""
+function sliding_window_gc_content(sequence::BioSequence{DNAAlphabet}; window::Int=100, step::Int=1)
+    window <= 0 && throw(ArgumentError("window must be positive"))
+    step <= 0 && throw(ArgumentError("step must be positive"))
+
+    len = length(sequence)
+    if len < window
+        return (start_positions=Int[], stop_positions=Int[], gc_content=Float64[])
+    end
+
+    starts = Int[]
+    stops = Int[]
+    gc_content = Float64[]
+    bytes = sequence.data
+
+    @inbounds for start_pos in 1:step:(len - window + 1)
+        stop_pos = start_pos + window - 1
+        gc_count = 0
+        for index in start_pos:stop_pos
+            byte = bytes[index]
+            byte = byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte)
+            gc_count += byte == UInt8('G') || byte == UInt8('C')
+        end
+
+        push!(starts, start_pos)
+        push!(stops, stop_pos)
+        push!(gc_content, gc_count / window)
+    end
+
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (start_positions=starts, stop_positions=stops, gc_content=gc_content), "sliding_window_gc_content")
+end
+
+sliding_window_gc_content(sequence::AbstractString; window::Int=100, step::Int=1) = sliding_window_gc_content(DNASeq(sequence; validate=false); window=window, step=step)
+

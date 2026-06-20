@@ -1,31 +1,64 @@
+# ==============================================================================
+# phylo.jl — Phylogenetic tree inference, manipulation, and visualization
+#
+# Provides Newick/NEXUS/PhyloXML/NeXML I/O, NJ/UPGMA tree construction,
+# maximum parsimony and likelihood tree search, substitution models (JC69,
+# K80, HKY85), bootstrap analysis, Robinson-Foulds distance, and
+# ASCII/Unicode/DOT/Mermaid tree visualization.
+#
+# References:
+#   - Saitou & Nei (1987) MBE 4(4):406-425 (Neighbor-Joining)
+#   - Felsenstein (1981) J Evol Biol 17:368-376 (ML phylogeny)
+#   - Robinson & Foulds (1981) Math Biosci 53:131-147 (RF distance)
+#   - Jukes & Cantor (1969) Mammalian Protein Metabolism (JC69)
+# ==============================================================================
+
 export distance_matrix, neighbor_joining, neighbor_joining_tree, PhyloTree, parse_newick, write_newick, parse_tree, write_tree, parse_phyloxml, write_phyloxml, parse_nexus, write_nexus, parse_nexml, write_nexml, upgma, get_terminals, get_nonterminals, tree_distance, draw_ascii, draw_unicode, tree_to_dot, tree_to_mermaid, prune, root_with_outgroup, reroot, midpoint_root, get_parent, lowest_common_ancestor, common_ancestor, is_monophyletic, robinson_foulds_distance, bootstrap_trees, tree_consensus, consensus_tree, strict_consensus_tree, majority_consensus_tree, bootstrap_consensus_tree, bootstrap_support, set_metadata!, annotate_tree!, is_terminal, is_parent_of, get_path, trace, is_bifurcating, is_preterminal, total_branch_length, depths, find_clades, ladderize, count_terminals, collapse_clades, parsimony_score, maximum_parsimony_tree, parsimony_tree, JC69, K80, HKY85, felsenstein_likelihood, transition_probability, maximum_likelihood_tree, coordinates
 
-const _HAS_CUDA_PHYLO = false
+# GPU acceleration is available when the CUDA extension is loaded; see lazy_gpu.jl.
 using LinearAlgebra
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id, provenance_parent_ids, register_provenance!
 
+"""
+    PhyloTree
+
+Mutable rooted tree node for phylogenetic workflows.
+
+    Metadata is stored as typed values so tree annotations can carry scientific
+    attributes such as support, posterior probabilities, and provenance without
+    forcing everything into strings. PhyloXML output writes explicit datatype
+    annotations so these values can round-trip across tools without guessing.
+"""
 mutable struct PhyloTree
     name::String
     branch_length::Float64
     children::Vector{PhyloTree}
     support::Float64
-    metadata::Dict{String,String}
+    metadata::Dict{String,Any}
 end
 
 PhyloTree(
-    name::AbstractString;
+    name::String;
     branch_length::Real=0.0,
     children::AbstractVector{PhyloTree}=PhyloTree[],
     support::Real=0.0,
-    metadata::AbstractDict=Dict{String,String}(),
-) = PhyloTree(String(name), Float64(branch_length), Vector{PhyloTree}(children), Float64(support), Dict{String,String}(string.(keys(metadata)) .=> string.(values(metadata))))
+    metadata::AbstractDict=Dict{String,Any}()) = begin
+    normalized_metadata = Dict{String,Any}(string(key) => value for (key, value) in metadata)
+    metadata_provenance(normalized_metadata) === nothing && stamp_provenance!(
+        normalized_metadata;
+        label="PhyloTree",
+        source="PhyloTree",
+        notes=["constructed from in-memory tree node"],
+        parameters=(name=String(name), child_count=length(children), branch_length=Float64(branch_length)))
+    PhyloTree(String(name), Float64(branch_length), Vector{PhyloTree}(children), Float64(support), normalized_metadata)
+end
 
 PhyloTree(
     children::AbstractVector{PhyloTree};
-    name::AbstractString="",
+    name::String="",
     branch_length::Real=0.0,
     support::Real=0.0,
-    metadata::AbstractDict=Dict{String,String}(),
-) = PhyloTree(String(name), Float64(branch_length), Vector{PhyloTree}(children), Float64(support), Dict{String,String}(string.(keys(metadata)) .=> string.(values(metadata))))
+    metadata::AbstractDict=Dict{String,Any}()) = PhyloTree(String(name); branch_length=branch_length, children=children, support=support, metadata=metadata)
 
 isleaf(tree::PhyloTree) = isempty(tree.children)
 
@@ -118,11 +151,11 @@ function _read_label(text::AbstractString, index::Int)
         char == ';' && break
         index += 1
     end
-    return strip(text[start_index:index-1]), index
+    return String(strip(text[start_index:index-1])), index
 end
 
 function _phylo_label_to_support_or_name(label::AbstractString)
-    stripped = strip(String(label))
+    stripped = String(strip(String(label)))
     isempty(stripped) && return "", 0.0
     try
         return "", parse(Float64, stripped)
@@ -151,12 +184,16 @@ function _read_branch_length(text::AbstractString, index::Int)
 end
 
 function _phylo_clade_key(names::AbstractVector{String})
-    return join(sort(collect(names)), '\u001f')
+    sorted = sort(collect(names))
+    return string(length(sorted), '\u001e', join(sorted, '\u001f'))
 end
 
-function _phylo_key_set(key::AbstractString)
-    parts = Base.split(String(key), '\u001f')
-    return Set(String.(parts))
+function _phylo_key_set(key::String)
+    text = String(key)
+    separator = findfirst(==('\u001e'), text)
+    payload = separator === nothing ? text : separator == lastindex(text) ? "" : text[nextind(text, separator):end]
+    isempty(payload) && return Set{String}()
+    return Set(String.(Base.split(payload, "\u001f")))
 end
 
 function _phylo_leaf_names(tree::PhyloTree)
@@ -176,11 +213,11 @@ function _phylo_find_parent(node::PhyloTree, parent::Union{Nothing,PhyloTree}, t
     return nothing
 end
 
-function get_parent(tree::PhyloTree, target_name::AbstractString)
+function get_parent(tree::PhyloTree, target_name::String)
     return _phylo_find_parent(tree, nothing, String(target_name))
 end
 
-function lowest_common_ancestor(tree::PhyloTree, names::AbstractVector{<:AbstractString})
+function lowest_common_ancestor(tree::PhyloTree, names::AbstractVector{<:String})
     isempty(names) && throw(ArgumentError("at least one taxon name is required"))
     paths = PhyloTree[]
     path_list = Vector{Vector{PhyloTree}}()
@@ -200,13 +237,13 @@ function lowest_common_ancestor(tree::PhyloTree, names::AbstractVector{<:Abstrac
     return ancestor
 end
 
-lowest_common_ancestor(tree::PhyloTree, left_name::AbstractString, right_name::AbstractString) = lowest_common_ancestor(tree, [left_name, right_name])
+lowest_common_ancestor(tree::PhyloTree, left_name::String, right_name::String) = lowest_common_ancestor(tree, [left_name, right_name])
 
 common_ancestor(tree::PhyloTree, names) = lowest_common_ancestor(tree, names)
 
 is_terminal(node::PhyloTree) = isleaf(node)
 
-function is_parent_of(tree::PhyloTree, parent_name::AbstractString, child_name::AbstractString)
+function is_parent_of(tree::PhyloTree, parent_name::String, child_name::String)
     parent = _phylo_path_to_named_node(tree, String(parent_name))
     child = _phylo_path_to_named_node(tree, String(child_name))
     parent === nothing && return false
@@ -216,13 +253,13 @@ function is_parent_of(tree::PhyloTree, parent_name::AbstractString, child_name::
     return any(child_ref -> child_ref === child_node, parent_node.children)
 end
 
-function get_path(tree::PhyloTree, target_name::AbstractString)
+function get_path(tree::PhyloTree, target_name::String)
     path = _phylo_path_to_named_node(tree, String(target_name))
     path === nothing && throw(ArgumentError("unknown leaf: $(target_name)"))
     return path
 end
 
-function trace(tree::PhyloTree, start_name::AbstractString, end_name::AbstractString)
+function trace(tree::PhyloTree, start_name::String, end_name::String)
     left_path = get_path(tree, start_name)
     right_path = get_path(tree, end_name)
     shared_index = 0
@@ -235,7 +272,7 @@ function trace(tree::PhyloTree, start_name::AbstractString, end_name::AbstractSt
     return vcat(left_segment, right_segment)
 end
 
-function split(tree::PhyloTree, parent_name::AbstractString; child_names::AbstractVector{<:AbstractString}=String[], branch_length::Real=0.0, support::Real=0.0)
+function split(tree::PhyloTree, parent_name::String; child_names::AbstractVector{<:String}=String[], branch_length::Real=0.0, support::Real=0.0)
     target = String(parent_name)
     path = _phylo_path_to_named_node(tree, target)
     path === nothing && throw(ArgumentError("unknown node: $(parent_name)"))
@@ -409,10 +446,36 @@ const _DNA_STATE_MAP = Dict{Char, Vector{Float64}}(
 
 const _DNA_AMBIGUOUS_STATE = _DNA_STATE_MAP['N']
 
-function _get_leaf_likelihoods(sequence::AbstractString)
-    n_sites = ncodeunits(sequence)
+@inline _phylo_coerce_sequence(sequence::BioSequence) = sequence
+
+function _phylo_coerce_sequence(sequence)
+    sequence_text = String(sequence)
+    inferred_alphabet = _infer_sequence_alphabet(sequence_text)
+    return BioSequence{inferred_alphabet}(sequence_text)
+end
+
+@inline function _phylo_require_alphabet(sequence::BioSequence{A}, ::Type{A}) where {A <: BioAlphabet}
+    return sequence
+end
+
+function _phylo_require_alphabet(sequence::BioSequence, required_alphabet::Type{A}) where {A <: BioAlphabet}
+    sequence_text = String(sequence)
+    validate_sequence(required_alphabet, sequence_text) || throw(ArgumentError("sequence contains symbols incompatible with $(required_alphabet)"))
+    return BioSequence{required_alphabet}(sequence_text)
+end
+
+function _phylo_dna_alignment(alignment::AbstractDict)
+    typed = Dict{String,DNASeq}()
+    for (name, sequence) in alignment
+        typed[String(name)] = _phylo_require_alphabet(_phylo_coerce_sequence(sequence), DNAAlphabet)
+    end
+    return typed
+end
+
+function _get_leaf_likelihoods(sequence::BioSequence{DNAAlphabet})
+    n_sites = length(sequence)
     L = zeros(Float64, 4, n_sites)
-    for (i, byte) in enumerate(codeunits(sequence))
+    for (i, byte) in enumerate(sequence.data)
         state = get(_DNA_STATE_MAP, uppercase(Char(byte)), _DNA_AMBIGUOUS_STATE)
         @inbounds for j in 1:4
             L[j, i] = state[j]
@@ -422,18 +485,21 @@ function _get_leaf_likelihoods(sequence::AbstractString)
 end
 
 """
-    felsenstein_likelihood(tree::PhyloTree, alignment::Dict{String, String}, model::SubstitutionModel)
+    felsenstein_likelihood(tree::PhyloTree, alignment::AbstractDict, model::SubstitutionModel)
 
 Compute the log-likelihood of a phylogenetic tree given an alignment using Felsenstein's pruning algorithm.
 """
-function felsenstein_likelihood(tree::PhyloTree, alignment::Dict{String, String}, model::SubstitutionModel)
+function felsenstein_likelihood(tree::PhyloTree, alignment::AbstractDict, model::SubstitutionModel)
+    alignment_dna = _phylo_dna_alignment(alignment)
+    isempty(alignment_dna) && throw(ArgumentError("alignment must contain at least one sequence"))
+
     leaf_likelihoods = Dict{PhyloTree, Matrix{Float64}}()
     terminals = get_terminals(tree)
     for leaf in terminals
-        seq = get(alignment, leaf.name, "")
-        if isempty(seq)
+        seq = get(alignment_dna, leaf.name, nothing)
+        if seq === nothing
             # Handle missing sequences as all ambiguities
-            n_sites = length(first(values(alignment)))
+            n_sites = length(first(values(alignment_dna)))
             leaf_likelihoods[leaf] = ones(Float64, 4, n_sites)
         else
             leaf_likelihoods[leaf] = _get_leaf_likelihoods(seq)
@@ -478,15 +544,20 @@ function felsenstein_likelihood(tree::PhyloTree, alignment::Dict{String, String}
         log_lik += log(max(site_lik, 1e-300))
     end
     
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "felsenstein_likelihood";
+        parameters=(n_taxa=length(get_terminals(tree)), model_type=string(typeof(model))))
+    end
     return log_lik
 end
 
 """
-    optimize_branch_lengths!(tree::PhyloTree, alignment::Dict{String, String}, model::SubstitutionModel; max_iter=10)
+    optimize_branch_lengths!(tree::PhyloTree, alignment::AbstractDict, model::SubstitutionModel; max_iter=10)
 
 Optimize branch lengths of a given tree to maximize likelihood using a simple coordinate ascent approach.
 """
-function optimize_branch_lengths!(tree::PhyloTree, alignment::Dict{String, String}, model::SubstitutionModel; max_iter=5)
+function optimize_branch_lengths!(tree::PhyloTree, alignment::AbstractDict, model::SubstitutionModel; max_iter=5)
     nodes = vcat(PhyloTree[tree], get_nonterminals(tree))
     
     for iter in 1:max_iter
@@ -513,6 +584,11 @@ function optimize_branch_lengths!(tree::PhyloTree, alignment::Dict{String, Strin
             end
         end
         if !improved; break; end
+    end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "optimize_branch_lengths!";
+        parameters=(n_taxa=count_terminals(tree), max_iter=Int(max_iter)))
     end
     return tree
 end
@@ -583,13 +659,15 @@ function _find_node_by_path(root::PhyloTree, path::Vector{Int})
 end
 
 """
-    maximum_likelihood_tree(alignment::Dict{String, String}; model::SubstitutionModel=JC69(), initial_tree::Union{Nothing, PhyloTree}=nothing)
+    maximum_likelihood_tree(alignment::AbstractDict; model::SubstitutionModel=JC69(), initial_tree::Union{Nothing, PhyloTree}=nothing)
 
 Find the Maximum Likelihood tree for a given alignment.
 """
-function maximum_likelihood_tree(alignment::Dict{String, String}; model::SubstitutionModel=JC69(), initial_tree::Union{Nothing, PhyloTree}=nothing, max_topology_iter=10)
+function maximum_likelihood_tree(alignment::AbstractDict; model::SubstitutionModel=JC69(), initial_tree::Union{Nothing, PhyloTree}=nothing, max_topology_iter=10)
+    alignment_dna = _phylo_dna_alignment(alignment)
+
     if initial_tree === nothing
-        names = collect(keys(alignment))
+        names = collect(keys(alignment_dna))
         if length(names) <= 3
             leaves = [PhyloTree(name; branch_length=0.1) for name in names]
             if length(leaves) == 1
@@ -601,15 +679,15 @@ function maximum_likelihood_tree(alignment::Dict{String, String}; model::Substit
             end
         else
             # Use NJ as starting point for larger alignments
-            seqs = String[alignment[name] for name in names]
+            seqs = [alignment_dna[name] for name in names]
             dm = distance_matrix(seqs)
             initial_tree = neighbor_joining_tree(dm, names)
         end
     end
     
     current_tree = _phylo_copy(initial_tree)
-    optimize_branch_lengths!(current_tree, alignment, model)
-    current_lik = felsenstein_likelihood(current_tree, alignment, model)
+    optimize_branch_lengths!(current_tree, alignment_dna, model)
+    current_lik = felsenstein_likelihood(current_tree, alignment_dna, model)
 
         if count_terminals(current_tree) <= 3
             return current_tree
@@ -622,8 +700,8 @@ function maximum_likelihood_tree(alignment::Dict{String, String}; model::Substit
         # Explore NNI space
         neighbors = _nni_moves(current_tree)
         for neighbor in neighbors
-            optimize_branch_lengths!(neighbor, alignment, model; max_iter=2)
-            n_lik = felsenstein_likelihood(neighbor, alignment, model)
+            optimize_branch_lengths!(neighbor, alignment_dna, model; max_iter=2)
+            n_lik = felsenstein_likelihood(neighbor, alignment_dna, model)
             if n_lik > best_neighbor_lik
                 best_neighbor_lik = n_lik
                 best_neighbor = neighbor
@@ -633,13 +711,18 @@ function maximum_likelihood_tree(alignment::Dict{String, String}; model::Substit
         if best_neighbor_lik > current_lik
             current_tree = best_neighbor
             current_lik = best_neighbor_lik
-            optimize_branch_lengths!(current_tree, alignment, model; max_iter=5)
-            current_lik = felsenstein_likelihood(current_tree, alignment, model)
+            optimize_branch_lengths!(current_tree, alignment_dna, model; max_iter=5)
+            current_lik = felsenstein_likelihood(current_tree, alignment_dna, model)
         else
             break
         end
     end
     
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "maximum_likelihood_tree";
+        parameters=(n_taxa=length(alignment_dna), model_type=string(typeof(model)), max_topology_iter=Int(max_topology_iter)))
+    end
     return current_tree
 end
 
@@ -795,7 +878,7 @@ function _phylo_clone_from(node::PhyloTree, parent::Union{Nothing,PhyloTree}, in
     return PhyloTree(node.name; branch_length=incoming_length, children=children, support=node.support)
 end
 
-function _phylo_path_between(tree::PhyloTree, left_name::AbstractString, right_name::AbstractString)
+function _phylo_path_between(tree::PhyloTree, left_name::String, right_name::String)
     left_path = _phylo_path_to_leaf(tree, String(left_name))
     right_path = _phylo_path_to_leaf(tree, String(right_name))
     left_path === nothing && throw(ArgumentError("unknown leaf: $(left_name)"))
@@ -850,7 +933,7 @@ function _parse_newick_node(text::AbstractString, index::Int)
 end
 
 function parse_newick(text::AbstractString)
-    stripped = strip(text)
+    stripped = String(strip(text))
     isempty(stripped) && throw(ArgumentError("empty Newick string"))
     tree, index = _parse_newick_node(stripped, firstindex(stripped))
     index = _skip_whitespace(stripped, index)
@@ -863,7 +946,13 @@ function parse_newick(text::AbstractString)
 end
 
 function neighbor_joining_tree(D::Matrix{Float64}, names::Vector{String})
-    return parse_newick(neighbor_joining(D, names))
+    result = parse_newick(neighbor_joining(D, names))
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "neighbor_joining_tree";
+        parameters=(n_taxa=length(names)))
+    end
+    return result
 end
 
 function midpoint_root(tree::PhyloTree)
@@ -903,6 +992,11 @@ function midpoint_root(tree::PhyloTree)
         accumulated += edge_length
     end
 
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "midpoint_root";
+        parameters=(n_taxa=count_terminals(tree)))
+    end
     return _phylo_copy(tree)
 end
 
@@ -970,7 +1064,13 @@ function upgma(D_in::Matrix{Float64}, names::Vector{String})
         heights = new_heights
     end
 
-    return clusters[1]
+    upgma_result = clusters[1]
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "upgma";
+        parameters=(n_taxa=length(names)))
+    end
+    return upgma_result
 end
 
 function _tree_distance_map(tree::PhyloTree, target::String, current_length::Float64, seen::Dict{String,Float64}, path::Vector{Tuple{String,Float64}})
@@ -1022,7 +1122,7 @@ function _phylo_path_length(path::Vector{PhyloTree})
     return total
 end
 
-function tree_distance(tree::PhyloTree, left_name::AbstractString, right_name::AbstractString)
+function tree_distance(tree::PhyloTree, left_name::String, right_name::String)
     left_path = _phylo_path_to_leaf(tree, String(left_name))
     right_path = _phylo_path_to_leaf(tree, String(right_name))
     left_path === nothing && throw(ArgumentError("unknown leaf: $(left_name)"))
@@ -1070,7 +1170,7 @@ function draw_unicode(tree::PhyloTree)
     return String(take!(io))
 end
 
-function tree_to_dot(tree::PhyloTree; graph_name::AbstractString="phylo_tree")
+function tree_to_dot(tree::PhyloTree; graph_name::String="phylo_tree")
     node_ids = IdDict{PhyloTree,String}()
     counter = 0
 
@@ -1146,7 +1246,7 @@ function tree_to_mermaid(tree::PhyloTree)
 end
 
 function prune(tree::PhyloTree, keep_names)
-    if keep_names isa AbstractString
+    if keep_names isa String
         keep = Set([String(keep_names)])
     else
         keep = Set(String.(collect(keep_names)))
@@ -1179,7 +1279,7 @@ function prune(tree::PhyloTree, keep_names)
     return pruned
 end
 
-function root_with_outgroup(tree::PhyloTree, outgroup_name::AbstractString)
+function root_with_outgroup(tree::PhyloTree, outgroup_name::String)
     target = String(outgroup_name)
     leaf_names = Set(_phylo_leaf_names(tree))
     target in leaf_names || throw(ArgumentError("unknown outgroup: $(outgroup_name)"))
@@ -1190,13 +1290,13 @@ function root_with_outgroup(tree::PhyloTree, outgroup_name::AbstractString)
     return PhyloTree(""; branch_length=0.0, children=[target_tree, remainder], support=1.0)
 end
 
-reroot(tree::PhyloTree, outgroup_name::AbstractString) = root_with_outgroup(tree, outgroup_name)
+reroot(tree::PhyloTree, outgroup_name::String) = root_with_outgroup(tree, outgroup_name)
 
-function _bootstrap_alignment_sequences(alignment)
+function _bootstrap_alignment_sequences(alignment, rng::Random.AbstractRNG)
     width = get_alignment_length(alignment)
     width == 0 && return [record.sequence for record in alignment.records]
 
-    sampled_columns = rand(1:width, width)
+    sampled_columns = rand(rng, 1:width, width)
     return [begin
         buffer = Vector{UInt8}(undef, width)
         for (position, column) in enumerate(sampled_columns)
@@ -1206,18 +1306,29 @@ function _bootstrap_alignment_sequences(alignment)
     end for record in alignment.records]
 end
 
-function bootstrap_trees(alignment; replicates::Int=100, method::Symbol=:hamming, constructor::Symbol=:nj)
+function bootstrap_trees(alignment; replicates::Int=100, method::Symbol=:hamming, constructor::Symbol=:nj, rng::Random.AbstractRNG=Random.default_rng())
     replicates > 0 || throw(ArgumentError("replicates must be positive"))
     trees = PhyloTree[]
     names = [record.identifier for record in alignment.records]
 
     for _ in 1:replicates
-        sequences = _bootstrap_alignment_sequences(alignment)
+        sequences = _bootstrap_alignment_sequences(alignment, rng)
         D = distance_matrix(sequences; method=method)
         tree = constructor == :nj ? neighbor_joining_tree(D, names) : constructor == :upgma ? upgma(D, names) : throw(ArgumentError("constructor must be :nj or :upgma"))
+        update_provenance!(
+            tree.metadata;
+            label="PhyloTree",
+            source="bootstrap_trees",
+            notes=["tree built from bootstrap resampled alignment columns"],
+            parameters=(replicates=Int(replicates), method=method, constructor=constructor, taxon_count=length(names)))
         push!(trees, tree)
     end
 
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "bootstrap_trees";
+        parameters=(replicates=Int(replicates), method=method, constructor=constructor, n_trees=length(trees)))
+    end
     return trees
 end
 
@@ -1290,16 +1401,40 @@ function tree_consensus(trees::AbstractVector{PhyloTree}; threshold::Real=0.5)
         return PhyloTree(""; branch_length=0.0, children=children, support=1.0)
     end
 
-    return _build(universe)
+    consensus = _build(universe)
+    update_provenance!(
+        consensus.metadata;
+        label="PhyloTree",
+        source="tree_consensus",
+        notes=["consensus tree built from bootstrap or posterior sample trees"],
+        parameters=(tree_count=length(trees), threshold=Float64(threshold), taxon_count=length(universe)))
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "tree_consensus";
+        parameters=(n_trees=length(trees), threshold=Float64(threshold), n_taxa=length(universe)))
+    end
+    return consensus
 end
 
 consensus_tree(trees::AbstractVector{PhyloTree}; kwargs...) = tree_consensus(trees; kwargs...)
 strict_consensus_tree(trees::AbstractVector{PhyloTree}) = tree_consensus(trees; threshold=1.0)
 majority_consensus_tree(trees::AbstractVector{PhyloTree}) = tree_consensus(trees; threshold=0.5)
 
-function bootstrap_consensus_tree(alignment; replicates::Int=100, threshold::Real=0.5, method::Symbol=:hamming, constructor::Symbol=:nj)
-    trees = bootstrap_trees(alignment; replicates=replicates, method=method, constructor=constructor)
-    return tree_consensus(trees; threshold=threshold)
+function bootstrap_consensus_tree(alignment; replicates::Int=100, threshold::Real=0.5, method::Symbol=:hamming, constructor::Symbol=:nj, rng::Random.AbstractRNG=Random.default_rng())
+    trees = bootstrap_trees(alignment; replicates=replicates, method=method, constructor=constructor, rng=rng)
+    consensus = tree_consensus(trees; threshold=threshold)
+    update_provenance!(
+        consensus.metadata;
+        label="PhyloTree",
+        source="bootstrap_consensus_tree",
+        notes=["consensus tree generated from bootstrap replicate trees"],
+        parameters=(replicates=Int(replicates), threshold=Float64(threshold), method=method, constructor=constructor))
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "bootstrap_consensus_tree";
+        parameters=(replicates=Int(replicates), threshold=Float64(threshold), method=method))
+    end
+    return consensus
 end
 
 function bootstrap_support(trees::AbstractVector{PhyloTree}, target_tree::PhyloTree)
@@ -1330,16 +1465,64 @@ function bootstrap_support(trees::AbstractVector{PhyloTree}, target_tree::PhyloT
     return _annotate(annotated)
 end
 
-function set_metadata!(tree::PhyloTree, key::AbstractString, value::AbstractString)
-    tree.metadata[String(key)] = String(value)
+function set_metadata!(tree::PhyloTree, key::String, value)
+    tree.metadata[String(key)] = value
     return tree
 end
 
 function annotate_tree!(tree::PhyloTree, metadata::AbstractDict)
     for (key, value) in metadata
-        tree.metadata[string(key)] = string(value)
+        tree.metadata[string(key)] = value
     end
     return tree
+end
+
+function _phylo_metadata_value(text::String)
+    return _phylo_metadata_value(text, "")
+end
+
+function _phylo_metadata_value(text::String, datatype::String)
+    stripped = strip(String(text))
+    isempty(stripped) && return ""
+    normalized_datatype = lowercase(strip(String(datatype)))
+
+    if normalized_datatype in ("", "xsd:string", "string")
+        lowered = lowercase(stripped)
+        lowered == "true" && return true
+        lowered == "false" && return false
+        try
+            return parse(Int, stripped)
+        catch
+        end
+        try
+            return parse(Float64, stripped)
+        catch
+        end
+        return stripped
+    elseif normalized_datatype in ("xsd:boolean", "boolean")
+        lowered = lowercase(stripped)
+        lowered == "true" && return true
+        lowered == "false" && return false
+        throw(ArgumentError("invalid PhyloXML boolean value: $(stripped)"))
+    elseif normalized_datatype in ("xsd:integer", "xsd:int", "xsd:long", "xsd:short", "xsd:byte", "xsd:unsignedint", "xsd:unsignedlong", "xsd:unsignedshort", "xsd:unsignedbyte", "integer", "int", "long", "short", "byte")
+        return parse(Int, stripped)
+    elseif normalized_datatype in ("xsd:float", "xsd:double", "xsd:decimal", "float", "double", "decimal")
+        return parse(Float64, stripped)
+    end
+
+    return stripped
+end
+
+function _phylo_metadata_datatype(value)
+    if value isa Bool
+        return "xsd:boolean"
+    elseif value isa Integer
+        return "xsd:integer"
+    elseif value isa AbstractFloat
+        return "xsd:double"
+    else
+        return "xsd:string"
+    end
 end
 
 function _xml_escape(text::AbstractString)
@@ -1359,7 +1542,8 @@ function _phyloxml_write_clade(io::IO, tree::PhyloTree, depth::Int)
     !isapprox(tree.branch_length, 0.0; atol=1e-12) && println(io, indent, "  <branch_length>", round(tree.branch_length; digits=5), "</branch_length>")
     tree.support > 0 && println(io, indent, "  <confidence type=\"support\">", round(tree.support; digits=5), "</confidence>")
     for (key, value) in sort(collect(tree.metadata); by=first)
-        println(io, indent, "  <property ref=\"", _xml_escape(key), "\">", _xml_escape(value), "</property>")
+        datatype = _phylo_metadata_datatype(value)
+        println(io, indent, "  <property ref=\"", _xml_escape(key), "\" datatype=\"", _xml_escape(datatype), "\">", _xml_escape(string(value)), "</property>")
     end
     for child in tree.children
         _phyloxml_write_clade(io, child, depth + 1)
@@ -1395,12 +1579,13 @@ function _phyloxml_attr_value(token::AbstractString, attr::AbstractString)
     return match_result === nothing ? "" : _xml_unescape(match_result.captures[1])
 end
 
-function parse_phyloxml(text::AbstractString)
+function parse_phyloxml(text::String)
     tokens = collect(eachmatch(r"<[^>]+>|[^<]+", String(text)))
     root = nothing
     node_stack = PhyloTree[]
     current_field = ""
     current_property = ""
+    current_property_datatype = ""
 
     for token_match in tokens
         token = token_match.match
@@ -1419,11 +1604,12 @@ function parse_phyloxml(text::AbstractString)
                 elseif tag == "name" || tag == "branch_length" || tag == "confidence" || tag == "property"
                     current_field = ""
                     current_property = ""
+                    current_property_datatype = ""
                 end
             else
                 tag = _phyloxml_tag_name(token)
                 if tag == "clade"
-                    push!(node_stack, PhyloTree(""; metadata=Dict{String,String}()))
+                    push!(node_stack, PhyloTree(""; metadata=Dict{String,Any}()))
                 elseif tag == "name"
                     current_field = "name"
                 elseif tag == "branch_length"
@@ -1433,6 +1619,7 @@ function parse_phyloxml(text::AbstractString)
                 elseif tag == "property"
                     current_field = "property"
                     current_property = _phyloxml_attr_value(token, "ref")
+                    current_property_datatype = _phyloxml_attr_value(token, "datatype")
                 end
             end
         else
@@ -1447,7 +1634,7 @@ function parse_phyloxml(text::AbstractString)
             elseif current_field == "confidence"
                 node.support = parse(Float64, value)
             elseif current_field == "property" && !isempty(current_property)
-                node.metadata[current_property] = _xml_unescape(value)
+                node.metadata[current_property] = _phylo_metadata_value(_xml_unescape(value), current_property_datatype)
             end
         end
     end
@@ -1456,7 +1643,7 @@ function parse_phyloxml(text::AbstractString)
     return root
 end
 
-function write_nexus(tree::PhyloTree; tree_name::AbstractString="tree_1")
+function write_nexus(tree::PhyloTree; tree_name::String="tree_1")
     return join([
         "#NEXUS",
         "begin trees;",
@@ -1465,7 +1652,7 @@ function write_nexus(tree::PhyloTree; tree_name::AbstractString="tree_1")
     ], "\n")
 end
 
-function parse_nexus(text::AbstractString)
+function parse_nexus(text::String)
     for line in eachline(IOBuffer(String(text)))
         stripped = strip(line)
         startswith(lowercase(stripped), "tree ") || continue
@@ -1478,7 +1665,7 @@ function parse_nexus(text::AbstractString)
     throw(ArgumentError("invalid Nexus tree block"))
 end
 
-function write_nexml(tree::PhyloTree; tree_id::AbstractString="tree1")
+function write_nexml(tree::PhyloTree; tree_id::String="tree1")
     io = IOBuffer()
     println(io, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
     println(io, "<nexml xmlns=\"http://www.nexml.org/2009\">")
@@ -1486,7 +1673,7 @@ function write_nexml(tree::PhyloTree; tree_id::AbstractString="tree1")
     println(io, "    <tree id=\"", _xml_escape(tree_id), "\" rooted=\"true\">")
     println(io, "      <newick>", _xml_escape(write_newick(tree)), "</newick>")
     for (key, value) in sort(collect(tree.metadata); by=first)
-        println(io, "      <meta property=\"", _xml_escape(key), "\">", _xml_escape(value), "</meta>")
+        println(io, "      <meta property=\"", _xml_escape(key), "\">", _xml_escape(string(value)), "</meta>")
     end
     println(io, "    </tree>")
     println(io, "  </trees>")
@@ -1494,29 +1681,29 @@ function write_nexml(tree::PhyloTree; tree_id::AbstractString="tree1")
     return String(take!(io))
 end
 
-function parse_nexml(text::AbstractString)
+function parse_nexml(text::String)
     match_result = match(r"<newick>(.+?)</newick>"is, String(text))
     match_result === nothing && throw(ArgumentError("invalid NeXML tree document"))
     return parse_newick(_xml_unescape(match_result.captures[1]))
 end
 
-parse_tree(text::AbstractString; format::Symbol=:newick) = format == :newick ? parse_newick(text) : format == :phyloxml ? parse_phyloxml(text) : format == :nexus ? parse_nexus(text) : format == :nexml ? parse_nexml(text) : throw(ArgumentError("unsupported tree format: $(format)"))
+parse_tree(text::String; format::Symbol=:newick) = format == :newick ? parse_newick(text) : format == :phyloxml ? parse_phyloxml(text) : format == :nexus ? parse_nexus(text) : format == :nexml ? parse_nexml(text) : throw(ArgumentError("unsupported tree format: $(format)"))
 write_tree(tree::PhyloTree; format::Symbol=:newick) = format == :newick ? write_newick(tree) : format == :phyloxml ? write_phyloxml(tree) : format == :nexus ? write_nexus(tree) : format == :nexml ? write_nexml(tree) : throw(ArgumentError("unsupported tree format: $(format)"))
 
 function _dna_transition(left::Char, right::Char)
     (left == 'A' && right == 'G') || (left == 'G' && right == 'A') || (left == 'C' && right == 'T') || (left == 'T' && right == 'C')
 end
 
-function _pairwise_dna_distance(sequence_left::AbstractString, sequence_right::AbstractString, model::Symbol)
+function _pairwise_dna_distance(sequence_left::BioSequence{DNAAlphabet}, sequence_right::BioSequence{DNAAlphabet}, model::Symbol)
     length(sequence_left) == length(sequence_right) || throw(ArgumentError("sequences must be aligned and equal length for DNA substitution distances"))
     valid_sites = 0
     mismatches = 0
     transitions = 0
     transversions = 0
 
-    @inbounds for index in eachindex(sequence_left)
-        left = uppercase(sequence_left[index])
-        right = uppercase(sequence_right[index])
+    @inbounds for index in eachindex(sequence_left.data)
+        left = Char(sequence_left.data[index])
+        right = Char(sequence_right.data[index])
         left == '-' && continue
         right == '-' && continue
         valid_sites += 1
@@ -1546,7 +1733,7 @@ function _pairwise_dna_distance(sequence_left::AbstractString, sequence_right::A
     return p
 end
 
-function _pairwise_protein_distance(sequence_left::AbstractString, sequence_right::AbstractString, matrix_name::Symbol)
+function _pairwise_protein_distance(sequence_left::BioSequence{AminoAcidAlphabet}, sequence_right::BioSequence{AminoAcidAlphabet}, matrix_name::Symbol)
     length(sequence_left) == length(sequence_right) || throw(ArgumentError("sequences must be aligned and equal length for protein distances"))
     scoring = named_substitution_matrix(matrix_name)
     best_score = 0.0
@@ -1554,9 +1741,9 @@ function _pairwise_protein_distance(sequence_left::AbstractString, sequence_righ
     observed_score = 0.0
     min_score = minimum(scoring.scores)
 
-    @inbounds for index in eachindex(sequence_left)
-        left = sequence_left[index]
-        right = sequence_right[index]
+    @inbounds for index in eachindex(sequence_left.data)
+        left = Char(sequence_left.data[index])
+        right = Char(sequence_right.data[index])
         observed_score += _pairwise_residue_score(scoring, left, right)
         best_score += max(_pairwise_residue_score(scoring, left, left), _pairwise_residue_score(scoring, right, right))
         worst_score += min_score
@@ -1568,20 +1755,30 @@ function _pairwise_protein_distance(sequence_left::AbstractString, sequence_righ
 end
 
 """
-    distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming)
+    distance_matrix(sequences; method=:hamming)
 
 Computes an N x N symmetric distance matrix for a list of sequences.
 If `method=:hamming`, it leverages SIMD/SWAR byte-mismatch tracking.
 If `method=:alignment`, it computes Needleman-Wunsch identity inversion.
 """
-function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, use_threads::Bool=true, use_cuda::Bool=false)
-    N = length(sequences)
+@inline function _phylo_hamming_distance(sequence_left::BioSequence, sequence_right::BioSequence)
+    length(sequence_left) == length(sequence_right) || throw(ArgumentError("sequences must be aligned and equal length for Hamming distance"))
+    mismatches = 0
+    @inbounds for index in eachindex(sequence_left.data)
+        mismatches += sequence_left.data[index] != sequence_right.data[index]
+    end
+    return mismatches
+end
+
+function distance_matrix(sequences::AbstractVector; method=:hamming, use_threads::Bool=true, use_cuda::Bool=false)
+    typed_sequences = [_phylo_coerce_sequence(sequence) for sequence in sequences]
+    N = length(typed_sequences)
     D = zeros(Float64, N, N)
 
     if use_cuda
         if isdefined(@__MODULE__, :CUDA)
             _ensure_cuda_phylo!()
-            return Base.invokelatest(_CUDA_PHYLO_DISTANCE_MATRIX_IMPL[], sequences; method=method)
+            return Base.invokelatest(_CUDA_PHYLO_DISTANCE_MATRIX_IMPL[], String.(typed_sequences); method=method)
         end
         use_threads = true
     end
@@ -1590,10 +1787,10 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
     if method == :hamming || method == :p_distance
         if use_threads
             Threads.@threads for i in 1:N
-                seq_i = sequences[i]
+                seq_i = typed_sequences[i]
                 len_i = length(seq_i)
                 @inbounds for j in (i+1):N
-                    dist = hamming_distance(seq_i, sequences[j])
+                    dist = _phylo_hamming_distance(seq_i, typed_sequences[j])
                     val = Float64(dist) / len_i
                     D[i, j] = val
                     D[j, i] = val
@@ -1601,10 +1798,10 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
             end
         else
             for i in 1:N
-                seq_i = sequences[i]
+                seq_i = typed_sequences[i]
                 len_i = length(seq_i)
                 @inbounds for j in (i+1):N
-                    dist = hamming_distance(seq_i, sequences[j])
+                    dist = _phylo_hamming_distance(seq_i, typed_sequences[j])
                     val = Float64(dist) / len_i
                     D[i, j] = val
                     D[j, i] = val
@@ -1612,41 +1809,43 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
             end
         end
     elseif method == :jukes_cantor || method == :kimura2p || method == :kimura
+        dna_sequences = [_phylo_require_alphabet(sequence, DNAAlphabet) for sequence in typed_sequences]
         if use_threads
             Threads.@threads for i in 1:N
-                seq_i = sequences[i]
+                seq_i = dna_sequences[i]
                 @inbounds for j in (i+1):N
-                    val = _pairwise_dna_distance(seq_i, sequences[j], method)
+                    val = _pairwise_dna_distance(seq_i, dna_sequences[j], method)
                     D[i, j] = val
                     D[j, i] = val
                 end
             end
         else
             for i in 1:N
-                seq_i = sequences[i]
+                seq_i = dna_sequences[i]
                 @inbounds for j in (i+1):N
-                    val = _pairwise_dna_distance(seq_i, sequences[j], method)
+                    val = _pairwise_dna_distance(seq_i, dna_sequences[j], method)
                     D[i, j] = val
                     D[j, i] = val
                 end
             end
         end
     elseif method == :blosum62 || method == :pam250 || method == :pam70 || method == :protein
+        protein_sequences = [_phylo_require_alphabet(sequence, AminoAcidAlphabet) for sequence in typed_sequences]
         protein_model = method == :protein ? :BLOSUM62 : Symbol(uppercase(String(method)))
         if use_threads
             Threads.@threads for i in 1:N
-                seq_i = sequences[i]
+                seq_i = protein_sequences[i]
                 @inbounds for j in (i+1):N
-                    val = _pairwise_protein_distance(seq_i, sequences[j], protein_model)
+                    val = _pairwise_protein_distance(seq_i, protein_sequences[j], protein_model)
                     D[i, j] = val
                     D[j, i] = val
                 end
             end
         else
             for i in 1:N
-                seq_i = sequences[i]
+                seq_i = protein_sequences[i]
                 @inbounds for j in (i+1):N
-                    val = _pairwise_protein_distance(seq_i, sequences[j], protein_model)
+                    val = _pairwise_protein_distance(seq_i, protein_sequences[j], protein_model)
                     D[i, j] = val
                     D[j, i] = val
                 end
@@ -1655,9 +1854,9 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
     elseif method == :alignment
         if use_threads
             Threads.@threads for i in 1:N
-                seq_i = sequences[i]
+                seq_i = typed_sequences[i]
                 @inbounds for j in (i+1):N
-                    res = pairwise_align(seq_i, sequences[j]; is_local=false)
+                    res = pairwise_align(seq_i.data, typed_sequences[j].data; is_local=false)
                     val = 1.0 - res.identity
                     D[i, j] = val
                     D[j, i] = val
@@ -1665,9 +1864,9 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
             end
         else
             for i in 1:N
-                seq_i = sequences[i]
+                seq_i = typed_sequences[i]
                 @inbounds for j in (i+1):N
-                    res = pairwise_align(seq_i, sequences[j]; is_local=false)
+                    res = pairwise_align(seq_i.data, typed_sequences[j].data; is_local=false)
                     val = 1.0 - res.identity
                     D[i, j] = val
                     D[j, i] = val
@@ -1678,6 +1877,11 @@ function distance_matrix(sequences::Vector{<:AbstractString}; method=:hamming, u
         throw(ArgumentError("Unknown method: \$method. Options: :hamming, :p_distance, :jukes_cantor, :kimura2p, :kimura, :blosum62, :pam250, :pam70, :protein, :alignment"))
     end
     
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "distance_matrix";
+        parameters=(n_sequences=length(sequences), method=method))
+    end
     return D
 end
 
@@ -1743,7 +1947,13 @@ function parsimony_score(tree::PhyloTree, alignment; threaded::Bool=true)
         end
     end
 
-    return sum(total_steps)
+    score = sum(total_steps)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "parsimony_score";
+        parameters=(n_taxa=count_terminals(tree), threaded=Bool(threaded)))
+    end
+    return score
 end
 
 function _binary_tree_combinations(names::Vector{String})
@@ -1808,6 +2018,11 @@ function maximum_parsimony_tree(alignment; max_exact_taxa::Int=7, threaded::Bool
     end
 
     seed = neighbor_joining_tree(distance_matrix(sequences; method=:p_distance), names)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "maximum_parsimony_tree";
+        parameters=(n_taxa=length(alignment), max_exact_taxa=Int(max_exact_taxa), threaded=Bool(threaded)))
+    end
     return seed
 end
 
@@ -1908,5 +2123,11 @@ function neighbor_joining(D_in::Matrix{Float64}, names_in::Vector{String})
     
     # Connect the final two aggregated structural nodes
     dist_final = D[1, 2]
-    return "($(nodes[1]):$(round(dist_final/2, digits=5)),$(nodes[2]):$(round(dist_final/2, digits=5)));"
+    nj_result = "($(nodes[1]):$(round(dist_final/2, digits=5)),$(nodes[2]):$(round(dist_final/2, digits=5)));"
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "neighbor_joining";
+        parameters=(n_taxa=length(names_in)))
+    end
+    return nj_result
 end

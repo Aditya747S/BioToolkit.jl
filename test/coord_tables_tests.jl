@@ -88,6 +88,7 @@ using DataFrames
         @test BioToolkit.parse_gff_record("chr1\tsrc\tgene") === nothing
         @test_throws ArgumentError BioToolkit.parse_bed_record("chr1\tnot_an_int\t20")
         @test_throws ArgumentError BioToolkit.parse_gff_record("chr1\tsrc\tgene\tfoo\t20\t.\t+\t.\tID=x")
+        @test_throws ArgumentError BioToolkit.parse_gff_record("chr1\tsrc\tmRNA\t1\t20\t.\t+\t3\tID=x")
 
         mktempdir() do dir
             bed_path = joinpath(dir, "mixed.bed")

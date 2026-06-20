@@ -5,12 +5,12 @@ include(joinpath(@__DIR__, "..", "..", "scripts", "benchmark_helpers.jl"))
 
 function build_motif_inputs()
     instances = [
-        SeqRecordLite("TTTACGTTTT"; identifier="s1"),
-        SeqRecordLite("GGGACGTGGG"; identifier="s2"),
-        SeqRecordLite("CCCACGTCCC"; identifier="s3"),
-        SeqRecordLite("TTTACGTTTT"; identifier="s4"),
+        SeqRecordLite(DNASeq("TTTACGTTTT"); identifier="s1"),
+        SeqRecordLite(DNASeq("GGGACGTGGG"); identifier="s2"),
+        SeqRecordLite(DNASeq("CCCACGTCCC"); identifier="s3"),
+        SeqRecordLite(DNASeq("TTTACGTTTT"); identifier="s4"),
     ]
-    sequence = repeat("TTTACGTTTTGGGACGTGGGCCCACGTCCC", 1000)
+    sequence = DNASeq(repeat("TTTACGTTTTGGGACGTGGGCCCACGTCCC", 1000))
     return instances, sequence
 end
 

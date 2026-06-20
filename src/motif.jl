@@ -1,70 +1,129 @@
-using DataFrames
+# ==============================================================================
+# motif.jl — Sequence motif discovery and scanning
+#
+# Provides position weight matrix (PWM) construction, JASPAR/TRANSFAC I/O,
+# motif scanning with IUPAC consensus, information content computation,
+# and de novo motif discovery via expectation-maximization.
+#
+# References:
+#   - Stormo (2000) Bioinformatics 16(1):16-23 (weight matrices)
+#   - Sandelin et al. (2004) NAR 32(D91-D94) (JASPAR database)
+# ==============================================================================
 
-struct MotifCounts
-    alphabet::Vector{Char}
+using DataFrames
+using SHA
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, register_provenance!
+
+"""
+    MotifCounts{A <: BioAlphabet}
+
+Count matrix for symbols in alphabet `A` across a motif. 
+The `alphabet` field stores the symbol order (rows of the `counts` matrix).
+"""
+struct MotifCounts{A <: BioAlphabet}
+    alphabet::Vector{UInt8}
     counts::Matrix{Int}
 end
 
-struct MotifFrequencyMatrix
-    alphabet::Vector{Char}
+"""
+    MotifFrequencyMatrix{A <: BioAlphabet}
+
+Probability matrix (PFM) for symbols in alphabet `A`.
+"""
+struct MotifFrequencyMatrix{A <: BioAlphabet}
+    alphabet::Vector{UInt8}
     values::Matrix{Float64}
 end
 
-struct MotifPWM
-    alphabet::Vector{Char}
+"""
+    MotifPWM{A <: BioAlphabet}
+
+Position weight matrix (PWM) for symbols in alphabet `A`.
+Scores are usually in log2-odds format.
+"""
+struct MotifPWM{A <: BioAlphabet}
+    alphabet::Vector{UInt8}
     values::Matrix{Float64}
 end
 
-struct MotifHit
+function MotifCounts(alphabet::AbstractVector{<:Union{Char,UInt8}}, counts::AbstractMatrix{<:Integer})
+    alphabet_bytes = Vector{UInt8}(codeunits(String(collect(alphabet))))
+    return MotifCounts{_motif_infer_alphabet(String(alphabet_bytes))}(alphabet_bytes, Matrix{Int}(counts))
+end
+
+function MotifFrequencyMatrix(alphabet::AbstractVector{<:Union{Char,UInt8}}, values::AbstractMatrix{<:Real})
+    alphabet_bytes = Vector{UInt8}(codeunits(String(collect(alphabet))))
+    return MotifFrequencyMatrix{_motif_infer_alphabet(String(alphabet_bytes))}(alphabet_bytes, Matrix{Float64}(values))
+end
+
+function MotifPWM(alphabet::AbstractVector{<:Union{Char,UInt8}}, values::AbstractMatrix{<:Real})
+    alphabet_bytes = Vector{UInt8}(codeunits(String(collect(alphabet))))
+    return MotifPWM{_motif_infer_alphabet(String(alphabet_bytes))}(alphabet_bytes, Matrix{Float64}(values))
+end
+
+struct MotifHit{A <: BioAlphabet}
     start::Int
     strand::Int8
     score::Float64
-    window::String
+    window::BioSequence{A}
 end
 
-struct MotifSite
+struct MotifSite{A <: BioAlphabet}
     sequence_index::Int
     start::Int
     strand::Int8
     mismatches::Int
-    window::String
+    window::BioSequence{A}
 end
 
-struct MotifDiscoveryResult
-    seed::String
-    alphabet::Vector{Char}
-    counts::MotifCounts
-    pwm::MotifPWM
-    sites::Vector{MotifSite}
+"""
+    MotifDiscoveryResult{A <: BioAlphabet}
+
+Result of de novo motif discovery, including the PWM and identified sites.
+"""
+struct MotifDiscoveryResult{A <: BioAlphabet} <: AbstractAnalysisResult
+    seed::BioSequence{A}
+    alphabet::Vector{UInt8}
+    counts::MotifCounts{A}
+    pwm::MotifPWM{A}
+    sites::Vector{MotifSite{A}}
     support::Int
     information_content::Float64
 end
 
-const _MOTIF_CODE = fill(UInt8(255), 256)
-
-for byte in (UInt8('A'), UInt8('a'))
-    _MOTIF_CODE[Int(byte) + 1] = UInt8(1)
-end
-for byte in (UInt8('C'), UInt8('c'))
-    _MOTIF_CODE[Int(byte) + 1] = UInt8(2)
-end
-for byte in (UInt8('G'), UInt8('g'))
-    _MOTIF_CODE[Int(byte) + 1] = UInt8(3)
-end
-for byte in (UInt8('T'), UInt8('t'), UInt8('U'), UInt8('u'))
-    _MOTIF_CODE[Int(byte) + 1] = UInt8(4)
+function _motif_infer_alphabet(sequence)
+    upper = uppercase(String(sequence))
+    if all(character -> character in ('A', 'C', 'G', 'T', 'U', 'N', 'R', 'Y', 'S', 'W', 'K', 'M', 'B', 'D', 'H', 'V', '-'), upper)
+        return DNAAlphabet
+    end
+    return AminoAcidAlphabet
 end
 
-function Base.show(io::IO, profile::MotifCounts)
-    print(io, "MotifCounts(", join(profile.alphabet), ", ", size(profile.counts, 2), " positions)")
+MotifHit(start::Integer, strand::Integer, score::Real, window::BioSequence{A}) where {A <: BioAlphabet} = MotifHit{A}(Int(start), Int8(strand), Float64(score), window)
+
+function MotifHit(start::Integer, strand::Integer, score::Real, window)
+    window_text = String(window)
+    alphabet = _motif_infer_alphabet(window_text)
+    return MotifHit(Int(start), Int8(strand), Float64(score), BioSequence{alphabet}(window_text))
 end
 
-function Base.show(io::IO, profile::MotifFrequencyMatrix)
-    print(io, "MotifFrequencyMatrix(", join(profile.alphabet), ", ", size(profile.values, 2), " positions)")
+MotifSite(sequence_index::Integer, start::Integer, strand::Integer, mismatches::Integer, window::BioSequence{A}) where {A <: BioAlphabet} = MotifSite{A}(Int(sequence_index), Int(start), Int8(strand), Int(mismatches), window)
+
+MotifDiscoveryResult(seed::BioSequence{A}, alphabet::Vector{UInt8}, counts::MotifCounts{A}, pwm::MotifPWM{A}, sites::Vector{MotifSite{A}}, support::Integer, information_content::Real) where {A <: BioAlphabet} = MotifDiscoveryResult{A}(seed, alphabet, counts, pwm, sites, Int(support), Float64(information_content))
+
+# Manual byte mappings are replaced by the parametric symbol system
+# where possible, keeping compat for IUPAC letters.
+
+function Base.show(io::IO, profile::MotifCounts{A}) where {A}
+    print(io, "MotifCounts{", A, "}(", String(profile.alphabet), ", ", size(profile.counts, 2), " positions)")
 end
 
-function Base.show(io::IO, pwm::MotifPWM)
-    print(io, "MotifPWM(", join(pwm.alphabet), ", ", size(pwm.values, 2), " positions)")
+function Base.show(io::IO, profile::MotifFrequencyMatrix{A}) where {A}
+    print(io, "MotifFrequencyMatrix{", A, "}(", String(profile.alphabet), ", ", size(profile.values, 2), " positions)")
+end
+
+function Base.show(io::IO, pwm::MotifPWM{A}) where {A}
+    print(io, "MotifPWM{", A, "}(", String(pwm.alphabet), ", ", size(pwm.values, 2), " positions)")
 end
 
 function Base.show(io::IO, hit::MotifHit)
@@ -76,7 +135,7 @@ function Base.show(io::IO, site::MotifSite)
 end
 
 function Base.show(io::IO, result::MotifDiscoveryResult)
-    print(io, "MotifDiscoveryResult(seed=", result.seed, ", support=", result.support, ", ic=", round(result.information_content, digits=3), ")")
+    print(io, analysis_result_summary(result))
 end
 
 function DataFrames.DataFrame(hits::AbstractVector{<:MotifHit})
@@ -85,8 +144,7 @@ function DataFrames.DataFrame(hits::AbstractVector{<:MotifHit})
         start = [hit.start for hit in rows],
         strand = [hit.strand for hit in rows],
         score = [hit.score for hit in rows],
-        window = [hit.window for hit in rows],
-    )
+        window = [String(hit.window) for hit in rows])
 end
 
 function DataFrames.DataFrame(sites::AbstractVector{<:MotifSite})
@@ -96,57 +154,64 @@ function DataFrames.DataFrame(sites::AbstractVector{<:MotifSite})
         start = [site.start for site in rows],
         strand = [site.strand for site in rows],
         mismatches = [site.mismatches for site in rows],
-        window = [site.window for site in rows],
-    )
+        window = [String(site.window) for site in rows])
 end
 
-function _motif_alphabet_index(alphabet::AbstractString)
-    alphabet_chars = collect(uppercase(alphabet))
-    index = Dict{Char,Int}()
+function _motif_alphabet_index(A::Type{<:BioAlphabet}, alphabet_str::String)
+    alphabet_bytes = collect(codeunits(uppercase(alphabet_str)))
+    index = Dict{UInt8,Int}()
 
-    for (position, character) in pairs(alphabet_chars)
-        index[character] = position
+    valid = symbols(A)
+    for (position, byte) in enumerate(alphabet_bytes)
+        byte in valid || throw(ArgumentError("symbol '$(Char(byte))' not in alphabet $(A)"))
+        index[byte] = position
     end
 
-    return alphabet_chars, index
+    return alphabet_bytes, index
 end
 
-function motif_counts(sequences::AbstractVector{<:AbstractString}; alphabet::AbstractString="ACGT")
+"""
+    motif_counts(sequences; alphabet="ACGT")
+
+Count symbol frequencies at each position across a set of aligned sequences.
+The primary API accepts `AbstractVector{BioSequence{A}}`.
+"""
+function motif_counts(sequences::AbstractVector{BioSequence{A}}; alphabet::String="ACGT", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: BioAlphabet}
     isempty(sequences) && throw(ArgumentError("at least one sequence is required"))
 
-    alphabet_chars, alphabet_index = _motif_alphabet_index(alphabet)
-    motif_length = ncodeunits(first(sequences))
-    counts = zeros(Int, length(alphabet_chars), motif_length)
-    row_lookup = zeros(Int, 4)
-
-    for (position, character) in pairs(alphabet_chars)
-        character == 'A' && (row_lookup[1] = position)
-        character == 'C' && (row_lookup[2] = position)
-        character == 'G' && (row_lookup[3] = position)
-        character == 'T' && (row_lookup[4] = position)
-        character == 'U' && (row_lookup[4] = position)
+    alphabet_bytes, alphabet_index = _motif_alphabet_index(A, alphabet)
+    motif_length = length(first(sequences))
+    counts = zeros(Int, length(alphabet_bytes), motif_length)
+    
+    # Pre-calculate mapping for speed
+    lookup = fill(0, 256)
+    for (byte, pos) in alphabet_index
+        lookup[Int(byte) + 1] = pos
     end
 
     for sequence in sequences
-        ncodeunits(sequence) == motif_length || throw(ArgumentError("all motif sequences must have the same length"))
-
-        @inbounds for (position, byte) in enumerate(codeunits(sequence))
-            code = _MOTIF_CODE[Int(byte) + 1]
-            code == 0xff && throw(ArgumentError("unsupported motif character $(Char(byte))"))
-            row = row_lookup[Int(code)]
-            row == 0 && throw(ArgumentError("unsupported motif character $(Char(byte))"))
+        length(sequence) == motif_length || throw(ArgumentError("all motif sequences must have the same length"))
+        bytes = sequence.data
+        @inbounds for (position, byte) in enumerate(bytes)
+            row = lookup[Int(byte) + 1]
+            row == 0 && throw(ArgumentError("unsupported motif character $(Char(byte)) for alphabet $(A)"))
             counts[row, position] += 1
         end
     end
 
-    return MotifCounts(alphabet_chars, counts)
+    return MotifCounts{A}(alphabet_bytes, counts)
 end
 
-function motif_counts(records::AbstractVector{SeqRecordLite}; alphabet::AbstractString="ACGT")
+# Removed motif_counts(::AbstractVector{<:AbstractString}) - use Vector{BioSequence} instead
+function motif_counts(sequences::AbstractVector{<:AbstractString}; alphabet::String="ACGT")
+    return motif_counts(DNASeq.(String.(sequences)); alphabet=alphabet)
+end
+
+function motif_counts(records::AbstractVector{<:SeqRecordLite}; alphabet::String="ACGT")
     return motif_counts([record.sequence for record in records]; alphabet=alphabet)
 end
 
-function _motif_frequency_matrix(profile::MotifCounts; pseudocount::Real=0.0)
+function _motif_frequency_matrix(profile::MotifCounts{A}; pseudocount::Real=0.0) where {A}
     pseudocount >= 0 || throw(ArgumentError("pseudocount must be nonnegative"))
     nrows = size(profile.counts, 1)
     ncols = size(profile.counts, 2)
@@ -165,22 +230,18 @@ function _motif_frequency_matrix(profile::MotifCounts; pseudocount::Real=0.0)
         end
     end
 
-    return MotifFrequencyMatrix(profile.alphabet, values)
+    return MotifFrequencyMatrix{A}(profile.alphabet, values)
 end
 
-function motif_frequency_matrix(profile::MotifCounts; pseudocount::Real=0.0)
+function motif_frequency_matrix(profile::MotifCounts{A}; pseudocount::Real=0.0) where {A}
     return _motif_frequency_matrix(profile; pseudocount=pseudocount)
 end
 
-function motif_frequency_matrix(sequences::AbstractVector{<:AbstractString}; alphabet::AbstractString="ACGT", pseudocount::Real=0.0)
-    return motif_frequency_matrix(motif_counts(sequences; alphabet=alphabet); pseudocount=pseudocount)
-end
-
-function motif_frequency_matrix(records::AbstractVector{SeqRecordLite}; alphabet::AbstractString="ACGT", pseudocount::Real=0.0)
+function motif_frequency_matrix(records::AbstractVector{<:SeqRecordLite}; alphabet::String="ACGT", pseudocount::Real=0.0)
     return motif_frequency_matrix(motif_counts(records; alphabet=alphabet); pseudocount=pseudocount)
 end
 
-function motif_entropy(profile::MotifFrequencyMatrix)
+function motif_entropy(profile::MotifFrequencyMatrix{A}) where {A}
     ncols = size(profile.values, 2)
     total = 0.0
 
@@ -197,7 +258,7 @@ function motif_entropy(profile::MotifFrequencyMatrix)
     return ncols == 0 ? 0.0 : total / ncols
 end
 
-function motif_relative_entropy(profile::MotifFrequencyMatrix; background=nothing)
+function motif_relative_entropy(profile::MotifFrequencyMatrix{A}; background=nothing) where {A}
     background_vector = _motif_background_vector(profile.alphabet, background)
     ncols = size(profile.values, 2)
     total = 0.0
@@ -217,10 +278,10 @@ function motif_relative_entropy(profile::MotifFrequencyMatrix; background=nothin
     return ncols == 0 ? 0.0 : total / ncols
 end
 
-@inline function _motif_hamming_distance(left::AbstractString, right::AbstractString)
-    ncodeunits(left) == ncodeunits(right) || throw(ArgumentError("motif windows must have the same length"))
+@inline function _motif_hamming_distance(left::BioSequence, right::BioSequence)
+    length(left) == length(right) || throw(ArgumentError("motif windows must have the same length"))
     mismatches = 0
-    @inbounds for (left_byte, right_byte) in zip(codeunits(left), codeunits(right))
+    @inbounds for (left_byte, right_byte) in zip(left.data, right.data)
         left_byte == right_byte && continue
         mismatches += 1
     end
@@ -235,7 +296,7 @@ function _motif_lookup_array(alphabet::Vector{Char})
     return lookup
 end
 
-function _motif_canonical_kmer(kmer::AbstractString; reverse_complements::Bool=true)
+function _motif_canonical_kmer(kmer::String; reverse_complements::Bool=true)
     reverse_complements || return String(kmer)
     reverse_kmer = reverse_complement(kmer)
     return reverse_kmer < kmer ? reverse_kmer : String(kmer)
@@ -245,7 +306,11 @@ function _motif_background_vector_from_pwm(alphabet::Vector{Char}, background)
     return _motif_background_vector(alphabet, background)
 end
 
-function _motif_seed_counts(sequences::AbstractVector{<:AbstractString}, k::Int; reverse_complements::Bool=true)
+function _motif_background_vector_from_pwm(alphabet::Vector{UInt8}, background)
+    return _motif_background_vector(alphabet, background)
+end
+
+function _motif_seed_counts(sequences::AbstractVector{<:String}, k::Int; reverse_complements::Bool=true)
     seed_counts = Dict{String,Int}()
     for sequence in sequences
         sequence_length = ncodeunits(sequence)
@@ -259,8 +324,8 @@ function _motif_seed_counts(sequences::AbstractVector{<:AbstractString}, k::Int;
     return seed_counts
 end
 
-function _motif_best_site(sequence::AbstractString, seed::AbstractString, seed_rc::AbstractString, k::Int, max_mismatches::Int)
-    sequence_length = ncodeunits(sequence)
+function _motif_best_site(sequence::BioSequence{A}, seed::BioSequence{A}, seed_rc::BioSequence{A}, k::Int, max_mismatches::Int) where {A <: BioAlphabet}
+    sequence_length = length(sequence)
     best_site = nothing
     best_mismatches = max_mismatches + 1
     best_strand = Int8(1)
@@ -269,7 +334,7 @@ function _motif_best_site(sequence::AbstractString, seed::AbstractString, seed_r
         window = sequence[start_index:start_index + k - 1]
         mismatches = _motif_hamming_distance(window, seed)
         strand = Int8(1)
-        oriented_window = String(window)
+        oriented_window = window
 
         if mismatches > max_mismatches
             rc_mismatches = _motif_hamming_distance(window, seed_rc)
@@ -293,7 +358,7 @@ function _motif_best_site(sequence::AbstractString, seed::AbstractString, seed_r
     return MotifSite(0, best_site.start, best_strand, best_site.mismatches, best_site.window)
 end
 
-function _motif_information_content(profile::MotifPWM; background=nothing)
+function _motif_information_content(profile::MotifPWM{A}; background=nothing) where {A}
     background_vector = _motif_background_vector_from_pwm(profile.alphabet, background)
     total = 0.0
     ncols = size(profile.values, 2)
@@ -313,20 +378,31 @@ function _motif_information_content(profile::MotifPWM; background=nothing)
     return ncols == 0 ? 0.0 : total / ncols
 end
 
-function motif_information_content(profile::MotifPWM; background=nothing)
+function motif_information_content(profile::MotifPWM{A}; background=nothing) where {A}
     return _motif_information_content(profile; background=background)
 end
 
-function motif_scan(sequence::AbstractString, pwm::MotifPWM; threshold::Real=0.0, background=nothing)
+"""
+    motif_scan(sequence, pwm; threshold=0.0, background=nothing)
+
+Scan a biological sequence for occurrences of a motif PWM.
+Primary API accepts `BioSequence{A}`.
+"""
+function motif_scan(sequence::BioSequence{A}, pwm::MotifPWM{A}; threshold::Real=0.0, background=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: BioAlphabet}
     threshold isa Real || throw(ArgumentError("threshold must be real"))
     motif_length = size(pwm.values, 2)
-    sequence_bytes = codeunits(sequence)
+    sequence_bytes = sequence.data
     sequence_length = length(sequence_bytes)
-    sequence_length >= motif_length || return MotifHit[]
+    sequence_length >= motif_length || return MotifHit{A}[]
 
-    row_lookup = _motif_lookup_array(pwm.alphabet)
+    # Pre-build lookup for the PWM's symbol order
+    row_lookup = fill(0, 256)
+    for (i, byte) in enumerate(pwm.alphabet)
+        row_lookup[Int(byte) + 1] = i
+    end
+
     background_vector = _motif_background_vector_from_pwm(pwm.alphabet, background)
-    hits = MotifHit[]
+    hits = MotifHit{A}[]
     window_buffer = Vector{UInt8}(undef, motif_length)
 
     for start_index in 1:(sequence_length - motif_length + 1)
@@ -350,35 +426,60 @@ function motif_scan(sequence::AbstractString, pwm::MotifPWM; threshold::Real=0.0
         end
 
         if valid && score >= threshold
-            push!(hits, MotifHit(start_index, Int8(1), score, String(copy(window_buffer))))
+            push!(hits, MotifHit(start_index, Int8(1), score, BioSequence{A}(copy(window_buffer); validate=false)))
         end
     end
 
+    if _ctx !== nothing
+        register_provenance!(_ctx, "motif_scan";
+        parents=provenance_parent_ids(sequence, pwm),
+        parameters=(threshold=threshold, hit_count=length(hits), alphabet=string(A)))
+    end
     return hits
 end
 
-function _motif_is_dna_alphabet(alphabet::Vector{Char})
-    for character in alphabet
-        character in ('A', 'C', 'G', 'T', 'U', 'N') || return false
-    end
-    return true
+# Removed motif_scan(::AbstractString, ::MotifPWM) - use BioSequence instead
+
+"""
+    motif_scan_both_strands(sequence, pwm; threshold=0.0, background=nothing)
+
+Scan both strands of a DNA/RNA sequence for a motif.
+"""
+function motif_scan_both_strands(sequence::BioSequence{A}, pwm::MotifPWM{A}; threshold::Real=0.0, background=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: Union{DNAAlphabet, RNAAlphabet}}
+    hits = _motif_scan_both_strands_nucleotide(sequence, pwm; threshold=threshold, background=background)
+    _ctx !== nothing && register_provenance!(_ctx, "motif_scan_both_strands"; parents=provenance_parent_ids(sequence, pwm), parameters=(threshold=threshold, hit_count=length(hits), alphabet=string(A)))
+    return hits
 end
 
-function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; threshold::Real=0.0, background=nothing)
+# Removed motif_scan_both_strands(::AbstractString, ::MotifPWM) - use BioSequence instead
+function motif_scan_both_strands(sequence::AbstractString, pwm::MotifPWM{A}; threshold::Real=0.0, background=nothing) where {A <: Union{DNAAlphabet, RNAAlphabet}}
+    typed_sequence = A === DNAAlphabet ? DNASeq(sequence; validate=false) : RNASeq(sequence; validate=false)
+    _ctx = active_provenance_context()
+
+
+    return motif_scan_both_strands(typed_sequence, pwm; threshold=threshold, background=background, _ctx=_ctx)
+end
+
+function _motif_scan_both_strands_nucleotide(sequence::BioSequence{A}, pwm::MotifPWM{A}; threshold::Real=0.0, background=nothing) where {A}
     threshold isa Real || throw(ArgumentError("threshold must be real"))
     motif_length = size(pwm.values, 2)
-    sequence_bytes = codeunits(sequence)
+    sequence_bytes = sequence.data
     sequence_length = length(sequence_bytes)
-    sequence_length >= motif_length || return MotifHit[]
+    sequence_length >= motif_length || return MotifHit{A}[]
 
-    row_lookup = _motif_lookup_array(pwm.alphabet)
+    # Pre-build lookup for the PWM's symbol order
+    row_lookup = fill(0, 256)
+    for (i, byte) in enumerate(pwm.alphabet)
+        row_lookup[Int(byte) + 1] = i
+    end
 
     background_vector = _motif_background_vector_from_pwm(pwm.alphabet, background)
     complement = _DNA_COMPLEMENT
-    hits = MotifHit[]
+    hits = MotifHit{A}[]
     window_buffer = Vector{UInt8}(undef, motif_length)
 
     @inbounds for start_index in 1:(sequence_length - motif_length + 1)
+        # Forward strand
         forward_score = 0.0
         forward_valid = true
         for column_index in 1:motif_length
@@ -388,7 +489,6 @@ function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; t
                 forward_valid = false
                 break
             end
-
             probability = pwm.values[row_index, column_index]
             probability <= 0 && (forward_valid = false; break)
             background_probability = background_vector[row_index]
@@ -396,11 +496,11 @@ function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; t
             forward_score += log2(probability / background_probability)
             window_buffer[column_index] = byte
         end
-
         if forward_valid && forward_score >= threshold
-            push!(hits, MotifHit(start_index, Int8(1), forward_score, String(copy(window_buffer))))
+            push!(hits, MotifHit(start_index, Int8(1), forward_score, BioSequence{A}(copy(window_buffer); validate=false)))
         end
 
+        # Reverse strand
         reverse_score = 0.0
         reverse_valid = true
         for column_index in 1:motif_length
@@ -411,7 +511,6 @@ function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; t
                 reverse_valid = false
                 break
             end
-
             probability = pwm.values[row_index, column_index]
             probability <= 0 && (reverse_valid = false; break)
             background_probability = background_vector[row_index]
@@ -419,9 +518,8 @@ function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; t
             reverse_score += log2(probability / background_probability)
             window_buffer[column_index] = complemented
         end
-
         if reverse_valid && reverse_score >= threshold
-            push!(hits, MotifHit(start_index, Int8(-1), reverse_score, String(copy(window_buffer))))
+            push!(hits, MotifHit(start_index, Int8(-1), reverse_score, BioSequence{A}(copy(window_buffer); validate=false)))
         end
     end
 
@@ -429,63 +527,48 @@ function _motif_scan_both_strands_dna(sequence::AbstractString, pwm::MotifPWM; t
     return hits
 end
 
-function motif_scan_both_strands(sequence::AbstractString, pwm::MotifPWM; threshold::Real=0.0, background=nothing)
-    if _motif_is_dna_alphabet(pwm.alphabet)
-        return _motif_scan_both_strands_dna(sequence, pwm; threshold=threshold, background=background)
-    end
+"""
+    discover_motifs(sequences; kwargs...)
 
-    forward_hits = motif_scan(sequence, pwm; threshold=threshold, background=background)
-    motif_length = size(pwm.values, 2)
-    sequence_length = ncodeunits(sequence)
-    reverse_sequence = reverse_complement(sequence)
-    reverse_hits = motif_scan(reverse_sequence, pwm; threshold=threshold, background=background)
-
-    if isempty(reverse_hits)
-        return forward_hits
-    end
-
-    hits = copy(forward_hits)
-    for hit in reverse_hits
-        start_index = sequence_length - hit.start - motif_length + 2
-        push!(hits, MotifHit(start_index, Int8(-1), hit.score, hit.window))
-    end
-
-    sort!(hits; by = hit -> (hit.start, -hit.strand, -hit.score))
-    return hits
-end
-
+Perform de novo motif discovery using a seed-and-extend approach.
+"""
 function discover_motifs(
-    sequences::AbstractVector{<:AbstractString};
-    alphabet::AbstractString="ACGT",
+    sequences::AbstractVector{BioSequence{A}};
+    alphabet::String=A <: DNAAlphabet ? "ACGT" : "ACDEFGHIKLMNPQRSTVWY",
     k::Int=6,
     top_n::Int=3,
     min_support::Int=2,
     max_mismatches::Int=1,
     pseudocount::Real=0.5,
     background=nothing,
-    reverse_complements::Bool=true,
-)
+    reverse_complements::Bool=true) where {A <: BioAlphabet}
     isempty(sequences) && throw(ArgumentError("at least one sequence is required"))
     k > 0 || throw(ArgumentError("motif length must be positive"))
     top_n > 0 || throw(ArgumentError("top_n must be positive"))
     min_support > 0 || throw(ArgumentError("min_support must be positive"))
     max_mismatches >= 0 || throw(ArgumentError("max_mismatches must be nonnegative"))
 
-    sequence_lengths = map(ncodeunits, sequences)
+    sequence_lengths = map(length, sequences)
     minimum(sequence_lengths) >= k || throw(ArgumentError("motif length must be no greater than each sequence length"))
 
-    seed_counts = _motif_seed_counts(sequences, k; reverse_complements=reverse_complements)
+    # Convert to String briefly for seed counting (dict keys)
+    str_seqs = [String(s) for s in sequences]
+    seed_counts = _motif_seed_counts(str_seqs, k; reverse_complements=reverse_complements)
     ranked_seeds = collect(seed_counts)
     sort!(ranked_seeds; by = item -> (-item[2], item[1]))
 
-    selected = MotifDiscoveryResult[]
+    selected = MotifDiscoveryResult{A}[]
+    typed_seed_cache = Dict{String,BioSequence{A}}()
     for (seed, seed_support) in ranked_seeds
         seed_support < min_support && break
-        seed_rc = reverse_complement(seed)
-        sites = MotifSite[]
+        seed_seq = get!(typed_seed_cache, seed) do
+            BioSequence{A}(seed)
+        end
+        seed_rc = reverse_complement(seed_seq)
+        sites = MotifSite{A}[]
 
         for (sequence_index, sequence) in enumerate(sequences)
-            best_site = _motif_best_site(sequence, seed, seed_rc, k, max_mismatches)
+            best_site = _motif_best_site(sequence, seed_seq, seed_rc, k, max_mismatches)
             best_site === nothing && continue
             push!(sites, MotifSite(sequence_index, best_site.start, best_site.strand, best_site.mismatches, best_site.window))
         end
@@ -493,22 +576,27 @@ function discover_motifs(
         support = length(sites)
         support < min_support && continue
 
-        site_windows = [site.window for site in sites]
-        counts = motif_counts(site_windows; alphabet=alphabet)
+        site_seqs = [site.window for site in sites]
+        counts = motif_counts(site_seqs; alphabet=alphabet)
         pwm = motif_pwm(counts; pseudocount=pseudocount, background=background)
         information_content = _motif_information_content(pwm; background=background)
-        push!(selected, MotifDiscoveryResult(seed, counts.alphabet, counts, pwm, sites, support, information_content))
+        push!(selected, MotifDiscoveryResult(seed_seq, counts.alphabet, counts, pwm, sites, support, information_content))
         length(selected) >= top_n && break
     end
 
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "discover_motifs"; parents=provenance_parent_ids(sequences), parameters=(alphabet=alphabet, k=k, top_n=top_n, min_support=min_support, max_mismatches=max_mismatches, motif_count=length(selected)))
     return selected
 end
 
-function discover_motifs(records::AbstractVector{SeqRecordLite}; kwargs...)
-    return discover_motifs([record.sequence for record in records]; kwargs...)
+function discover_motifs(records::AbstractVector{<:SeqRecordLite}, kwargs...)
+    _ctx = active_provenance_context()
+
+
+    return discover_motifs([record.sequence for record in records]; _ctx=_ctx, kwargs...)
 end
 
-function _motif_background_vector(alphabet::Vector{Char}, background)
+function _motif_background_vector(alphabet::Vector{UInt8}, background)
     if background === nothing
         return fill(1.0 / length(alphabet), length(alphabet))
     elseif background isa AbstractVector
@@ -517,7 +605,12 @@ function _motif_background_vector(alphabet::Vector{Char}, background)
         total > 0 || throw(ArgumentError("background vector must have positive mass"))
         return Float64.(background) ./ total
     elseif background isa AbstractDict
-        values = [Float64(get(background, character, 0.0)) for character in alphabet]
+        # Support both Char and UInt8 keys
+        values = Float64[]
+        for byte in alphabet
+            val = get(background, byte, get(background, Char(byte), 0.0))
+            push!(values, Float64(val))
+        end
         total = sum(values)
         total > 0 || throw(ArgumentError("background dictionary must have positive mass"))
         return values ./ total
@@ -527,10 +620,11 @@ function _motif_background_vector(alphabet::Vector{Char}, background)
 end
 
 function motif_pwm(
-    profile::MotifCounts;
+    profile::MotifCounts{A};
     pseudocount::Real=0.0,
     background=nothing,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx)) where {A}
     pseudocount >= 0 || throw(ArgumentError("pseudocount must be nonnegative"))
     background_vector = _motif_background_vector(profile.alphabet, background)
     nrows  = size(profile.counts, 1)
@@ -555,15 +649,23 @@ function motif_pwm(
         end
     end
 
-    return MotifPWM(profile.alphabet, values)
+    pwm = MotifPWM{A}(profile.alphabet, values)
+    _ctx !== nothing && register_provenance!(_ctx, "motif_pwm"; parents=provenance_parent_ids(profile), parameters=(pseudocount=pseudocount, background=background === nothing ? "none" : "provided"))
+    return pwm
 end
 
-function motif_pwm(sequences::AbstractVector{<:AbstractString}; alphabet::AbstractString="ACGT", pseudocount::Real=0.0, background=nothing)
-    return motif_pwm(motif_counts(sequences; alphabet=alphabet); pseudocount=pseudocount, background=background)
+function motif_pwm(sequences::AbstractVector{BioSequence{A}}; alphabet::String="ACGT", pseudocount::Real=0.0, background=nothing) where {A}
+    _ctx = active_provenance_context()
+
+
+    return motif_pwm(motif_counts(sequences; alphabet=alphabet); pseudocount=pseudocount, background=background, _ctx=_ctx)
 end
 
-function motif_pwm(records::AbstractVector{SeqRecordLite}; alphabet::AbstractString="ACGT", pseudocount::Real=0.0, background=nothing)
-    return motif_pwm(motif_counts(records; alphabet=alphabet); pseudocount=pseudocount, background=background)
+function motif_pwm(records::AbstractVector{<:SeqRecordLite}; alphabet::String="ACGT", pseudocount::Real=0.0, background=nothing)
+    _ctx = active_provenance_context()
+
+
+    return motif_pwm(motif_counts(records; alphabet=alphabet); pseudocount=pseudocount, background=background, _ctx=_ctx)
 end
 
 function motif_consensus(profile::MotifCounts; threshold::Real=0.5)
@@ -577,21 +679,27 @@ function motif_consensus(profile::MotifCounts; threshold::Real=0.5)
         if total_sequences == 0 || best_count / total_sequences < threshold || count(==(best_count), column_counts) != 1
             consensus[column] = 'N'
         else
-            consensus[column] = profile.alphabet[best_index]
+            consensus[column] = Char(profile.alphabet[best_index])
         end
     end
 
-    return String(consensus)
+    result = String(consensus)
+    _ctx = active_provenance_context()
+    _ctx !== nothing && register_provenance!(_ctx, "motif_consensus"; parents=provenance_parent_ids(profile), parameters=(threshold=threshold, consensus=result))
+    return result
 end
 
-struct MotifOccurrence
-    sequence::String
+struct MotifOccurrence{A <: BioAlphabet}
+    sequence_id::String
     start::Int
     strand::Int8
     score::Float64
     pvalue::Float64
-    site::String
+    site::BioSequence{A}
 end
+
+MotifOccurrence(sequence_id::AbstractString, start::Integer, strand::Integer, score::Real, pvalue::Real, site::BioSequence{A}) where {A <: BioAlphabet} =
+    MotifOccurrence{A}(String(sequence_id), Int(start), Int8(strand), Float64(score), Float64(pvalue), site)
 
 struct MotifProfile
     name::String
@@ -603,7 +711,7 @@ struct MotifProfile
 end
 
 function Base.show(io::IO, occurrence::MotifOccurrence)
-    print(io, "MotifOccurrence(seq=", occurrence.sequence, ", start=", occurrence.start, ", strand=", occurrence.strand, ", site=", occurrence.site, ")")
+    print(io, "MotifOccurrence(seq=", occurrence.sequence_id, ", start=", occurrence.start, ", strand=", occurrence.strand, ", site=", String(occurrence.site), ")")
 end
 
 function Base.show(io::IO, profile::MotifProfile)
@@ -615,10 +723,12 @@ motif_pwm(profile::MotifProfile) = profile.pwm
 motif_frequency_matrix(profile::MotifProfile; pseudocount::Real=0.0) = motif_frequency_matrix(profile.counts; pseudocount=pseudocount)
 motif_consensus(profile::MotifProfile; threshold::Real=0.5) = motif_consensus(profile.counts; threshold=threshold)
 motif_information_content(profile::MotifProfile; background=nothing) = motif_information_content(profile.pwm; background=background)
-motif_scan(sequence::AbstractString, profile::MotifProfile; kwargs...) = motif_scan(sequence, profile.pwm; kwargs...)
-motif_scan_both_strands(sequence::AbstractString, profile::MotifProfile; kwargs...) = motif_scan_both_strands(sequence, profile.pwm; kwargs...)
+motif_scan(sequence::BioSequence, profile::MotifProfile; kwargs...) = motif_scan(sequence, profile.pwm; kwargs...)
+motif_scan_both_strands(sequence::BioSequence, profile::MotifProfile; kwargs...) = motif_scan_both_strands(sequence, profile.pwm; kwargs...)
+# Removed motif_scan(::AbstractString, ::MotifProfile) - use BioSequence instead
+# Removed motif_scan_both_strands(::AbstractString, ::MotifProfile) - use BioSequence instead
 
-function _motif_profile_alphabet(alphabet::AbstractString, alength::Int)
+function _motif_profile_alphabet(alphabet::String, alength::Int)
     alphabet_chars = collect(uppercase(alphabet))
     length(alphabet_chars) >= alength || throw(ArgumentError("alphabet is shorter than the motif alphabet length"))
     return alphabet_chars[1:alength]
@@ -644,8 +754,8 @@ function _motif_parse_float(header::AbstractString, pattern::Regex, default::Flo
     return parse(Float64, found.captures[1])
 end
 
-function _motif_profile_from_pwm(name::AbstractString, alphabet::Vector{Char}, pwm::MotifPWM; counts=nothing, occurrences=MotifOccurrence[], metadata=Dict{String,String}())
-    motif_counts_profile = counts === nothing ? MotifCounts(alphabet, round.(Int, pwm.values .* 1.0)) : counts
+function _motif_profile_from_pwm(name::String, alphabet::Vector{Char}, pwm::MotifPWM; counts=nothing, occurrences=MotifOccurrence[], metadata=Dict{String,String}())
+    motif_counts_profile = counts === nothing ? MotifCounts{_motif_infer_alphabet(String(alphabet))}(Vector{UInt8}(codeunits(String(alphabet))), round.(Int, pwm.values .* 1.0)) : counts
     return MotifProfile(String(name), alphabet, motif_counts_profile, pwm, Vector{MotifOccurrence}(occurrences), Dict{String,String}(metadata))
 end
 
@@ -685,12 +795,14 @@ function _motif_color(letter::Char)
     return "#7f7f7f"
 end
 
+_motif_color(letter::UInt8) = _motif_color(Char(letter))
+
 function _motif_profile_label(profile)
     profile isa MotifProfile && return profile.name
     return "Motif Logo"
 end
 
-function sequence_logo_svg(profile::Union{MotifCounts, MotifFrequencyMatrix, MotifPWM, MotifProfile}; width::Integer=720, height::Integer=220, background=nothing, title::Union{Nothing,AbstractString}=nothing)
+function sequence_logo_svg(profile::Union{MotifCounts, MotifFrequencyMatrix, MotifPWM, MotifProfile}; width::Integer=720, height::Integer=220, background=nothing, title::Union{Nothing,String}=nothing)
     pwm = _motif_logo_pwm(profile)
     info = _motif_column_information(pwm; background=background)
     ncols = length(info)
@@ -730,7 +842,7 @@ function sequence_logo_svg(profile::Union{MotifCounts, MotifFrequencyMatrix, Mot
             block_height = probability * column_info * scale
             block_height <= 0 && continue
             y_base -= block_height
-            letter = pwm.alphabet[row]
+            letter = Char(pwm.alphabet[row])
             print(io, "<rect x=\"", x0 + 1.0, "\" y=\"", y_base, "\" width=\"", max(1.0, column_width - 2.0), "\" height=\"", block_height, "\" rx=\"2\" ry=\"2\" fill=\"", _motif_color(letter), "\" opacity=\"0.92\"/>")
             font_size = min(24.0, max(8.0, block_height * 0.72))
             print(io, "<text x=\"", x0 + column_width / 2, "\" y=\"", y_base + block_height * 0.72, "\" text-anchor=\"middle\" font-family=\"DejaVu Sans, Arial, sans-serif\" font-size=\"", font_size, "\" font-weight=\"700\" fill=\"white\">", letter, "</text>")
@@ -745,19 +857,29 @@ end
 motif_logo_svg(profile::Union{MotifCounts, MotifFrequencyMatrix, MotifPWM, MotifProfile}; kwargs...) = sequence_logo_svg(profile; kwargs...)
 sequence_logo(profile::Union{MotifCounts, MotifFrequencyMatrix, MotifPWM, MotifProfile}; kwargs...) = sequence_logo_svg(profile; kwargs...)
 
-function _motif_finalize_profile(name::AbstractString, alphabet::Vector{Char}, counts_matrix::Matrix{Int}, pwm_values::Matrix{Float64}, occurrences::Vector{MotifOccurrence}, metadata::Dict{String,String})
-    counts = MotifCounts(alphabet, counts_matrix)
-    pwm = MotifPWM(alphabet, pwm_values)
-    return MotifProfile(String(name), alphabet, counts, pwm, occurrences, metadata)
+function _motif_finalize_profile(name::String, alphabet::AbstractVector{<:Union{Char,UInt8}}, counts_matrix::Matrix{Int}, pwm_values::Matrix{Float64}, occurrences::Vector{MotifOccurrence}, metadata::Dict{String,String}; provenance_id::Union{Nothing,String}=nothing, provenance_hash::Union{Nothing,String}=nothing)
+    alphabet_chars = alphabet isa Vector{Char} ? alphabet : Char.(alphabet)
+    counts = MotifCounts{_motif_infer_alphabet(String(alphabet_chars))}(Vector{UInt8}(codeunits(String(alphabet_chars))), counts_matrix)
+    pwm = MotifPWM(alphabet_chars, pwm_values)
+    provenance_id === nothing || (metadata["provenance_id"] = provenance_id)
+    provenance_hash === nothing || (metadata["provenance_hash"] = provenance_hash)
+    return MotifProfile(String(name), alphabet_chars, counts, pwm, occurrences, metadata)
 end
 
-function read_meme(filepath::AbstractString; alphabet::AbstractString="ACGT")
-    open(filepath, "r") do io
-        return read_meme(io; alphabet=alphabet)
+function read_meme(filepath::String; alphabet::String="ACGT", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_meme(io; alphabet=alphabet)
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_meme(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_meme(io::IO; alphabet::AbstractString="ACGT")
+function read_meme(io::IO; alphabet::String="ACGT", provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_meme", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lines = collect(eachline(io))
     profiles = MotifProfile[]
     current_name = ""
@@ -807,12 +929,14 @@ function read_meme(io::IO; alphabet::AbstractString="ACGT")
                     site = uppercase(tokens[end])
                     if all(character -> character in ('A', 'C', 'G', 'T', 'U', 'N', '-') , site)
                         strand = any(token -> token == "-", tokens) ? Int8(-1) : Int8(1)
-                        push!(occurrences, MotifOccurrence(tokens[1], start, strand, 0.0, pvalue, site))
+                        push!(occurrences, MotifOccurrence(tokens[1], start, strand, 0.0, pvalue, BioSequence{DNAAlphabet}(site)))
                     end
                 end
                 j += 1
             end
-            push!(profiles, _motif_finalize_profile(current_name == "" ? "MEME_$(length(profiles) + 1)" : current_name, motif_alphabet, counts_matrix, matrix, occurrences, metadata))
+            profile_name = current_name == "" ? "MEME_$(length(profiles) + 1)" : current_name
+            profile_id = _ctx === nothing ? nothing : register_provenance!(_ctx, "read_meme"; parents=String[], parameters=(source=provenance_source, motif_name=profile_name, hash=provenance_hash)).id
+            push!(profiles, _motif_finalize_profile(profile_name, motif_alphabet, counts_matrix, matrix, occurrences, metadata; provenance_id=profile_id, provenance_hash=provenance_hash === nothing ? nothing : String(provenance_hash)))
             current_name = ""
             i = j
             continue
@@ -821,16 +945,24 @@ function read_meme(io::IO; alphabet::AbstractString="ACGT")
         i += 1
     end
 
+    _ctx !== nothing && register_provenance!(_ctx, "read_meme"; parents=String[], parameters=(source=provenance_source, profile_count=length(profiles), hash=provenance_hash))
     return profiles
 end
 
-function read_alignace(filepath::AbstractString; alphabet::AbstractString="ACGT")
-    open(filepath, "r") do io
-        return read_alignace(io; alphabet=alphabet)
+function read_alignace(filepath::String; alphabet::String="ACGT", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_alignace(io; alphabet=alphabet)
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_alignace(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_alignace(io::IO; alphabet::AbstractString="ACGT")
+function read_alignace(io::IO; alphabet::String="ACGT", provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_alignace", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     motif_profiles = MotifProfile[]
     current_name = Ref{String}("")
     current_sites = String[]
@@ -844,7 +976,8 @@ function read_alignace(io::IO; alphabet::AbstractString="ACGT")
         pwm = motif_pwm(counts; pseudocount=0.5)
         metadata = Dict{String,String}(current_metadata)
         metadata["source"] = "ALIGNACE"
-        push!(motif_profiles, MotifProfile(motif_name, counts.alphabet, counts, pwm, Vector{MotifOccurrence}(current_occurrences), metadata))
+        profile_id = _ctx === nothing ? nothing : register_provenance!(_ctx, "read_alignace"; parents=String[], parameters=(source=provenance_source, motif_name=motif_name, hash=provenance_hash)).id
+        push!(motif_profiles, _motif_finalize_profile(motif_name, counts.alphabet, Matrix{Int}(counts.counts), Matrix{Float64}(pwm.values), Vector{MotifOccurrence}(current_occurrences), metadata; provenance_id=profile_id, provenance_hash=provenance_hash === nothing ? nothing : String(provenance_hash)))
         empty!(current_sites)
         empty!(current_occurrences)
         empty!(current_metadata)
@@ -888,11 +1021,12 @@ function read_alignace(io::IO; alphabet::AbstractString="ACGT")
             start = length(tokens) > 2 && tryparse(Int, tokens[2]) !== nothing ? parse(Int, tokens[2]) : length(current_sites)
             strand = occursin('-', line) ? Int8(-1) : Int8(1)
             pvalue = length(tokens) > 3 && tryparse(Float64, tokens[3]) !== nothing ? parse(Float64, tokens[3]) : 0.0
-            push!(current_occurrences, MotifOccurrence(sequence_name, start, strand, 0.0, pvalue, site_candidate))
+            push!(current_occurrences, MotifOccurrence(sequence_name, start, strand, 0.0, pvalue, BioSequence{DNAAlphabet}(site_candidate)))
         end
     end
 
     finalize_current()
+    _ctx !== nothing && register_provenance!(_ctx, "read_alignace"; parents=String[], parameters=(source=provenance_source, profile_count=length(motif_profiles), hash=provenance_hash))
     return motif_profiles
 end
 
@@ -904,13 +1038,20 @@ function _jaspar_parse_row(line::AbstractString)
     return values
 end
 
-function read_jaspar(filepath::AbstractString; alphabet::AbstractString="ACGT")
-    open(filepath, "r") do io
-        return read_jaspar(io; alphabet=alphabet)
+function read_jaspar(filepath::String; alphabet::String="ACGT", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(filepath, "r") do io
+            return read_jaspar(io; alphabet=alphabet)
+        end
     end
+    raw_bytes = read(filepath)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_jaspar(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=filepath)
 end
 
-function read_jaspar(io::IO; alphabet::AbstractString="ACGT")
+function read_jaspar(io::IO; alphabet::String="ACGT", provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_jaspar", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     profiles = MotifProfile[]
     lines = collect(eachline(io))
     i = 1
@@ -951,17 +1092,24 @@ function read_jaspar(io::IO; alphabet::AbstractString="ACGT")
                 end
             end
 
-            counts = MotifCounts(motif_alphabet, counts_matrix)
+            counts = MotifCounts{_motif_infer_alphabet(String(motif_alphabet))}(Vector{UInt8}(codeunits(String(motif_alphabet))), counts_matrix)
             pwm = motif_pwm(counts; pseudocount=0.0)
             metadata = Dict{String,String}("source" => "JASPAR")
             !isempty(jaspar_id) && (metadata["jaspar_id"] = jaspar_id)
             !isempty(jaspar_name) && (metadata["name"] = jaspar_name)
-            push!(profiles, MotifProfile(!isempty(jaspar_name) ? jaspar_name : jaspar_id, motif_alphabet, counts, pwm, MotifOccurrence[], metadata))
+            profile_name = !isempty(jaspar_name) ? jaspar_name : jaspar_id
+            profile_id = _ctx === nothing ? nothing : register_provenance!(_ctx, "read_jaspar"; parents=String[], parameters=(source=provenance_source, motif_name=profile_name, hash=provenance_hash)).id
+            push!(profiles, _motif_finalize_profile(profile_name, motif_alphabet, counts_matrix, pwm.values, MotifOccurrence[], metadata; provenance_id=profile_id, provenance_hash=provenance_hash === nothing ? nothing : String(provenance_hash)))
             continue
         end
 
         i += 1
     end
 
+    _ctx !== nothing && register_provenance!(_ctx, "read_jaspar"; parents=String[], parameters=(source=provenance_source, profile_count=length(profiles), hash=provenance_hash))
     return profiles
 end
+
+# ---- Typed BioSequence{DNAAlphabet} dispatch ---------------------------------
+# These overloads ensure that typed DNA sequences can be used directly with
+# motif scanning functions without explicit String conversion.

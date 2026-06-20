@@ -3,3 +3,11 @@
 *.jl.mem
 /Manifest*.toml
 /docs/build/
+BIOTYPES_MIGRATION.md
+.github/*
+*debug*
+*deprecated*
+*serena*
+master.md
+*cache*
+*logs*

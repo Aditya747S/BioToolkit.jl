@@ -1,3 +1,15 @@
+# ==============================================================================
+# msa.jl — Multiple sequence alignment I/O and manipulation
+#
+# Provides readers/writers for FASTA, CLUSTAL, Stockholm, PIR, NEXUS,
+# MSF, PHYLIP, MAF, and GCG alignment formats. Supports column slicing,
+# consensus computation, gap statistics, conservation scoring, and
+# substitution matrix-based alignment quality metrics.
+# ==============================================================================
+
+using SHA
+using ..BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, register_container_provenance!, register_provenance!
+
 abstract type AbstractMultipleSequenceAlignment end
 
 mutable struct MultipleSequenceAlignment <: AbstractMultipleSequenceAlignment
@@ -6,23 +18,27 @@ mutable struct MultipleSequenceAlignment <: AbstractMultipleSequenceAlignment
     column_annotations::Dict{Symbol,Any}
 end
 
-function _copy_seqrecord(record::SeqRecordLite, sequence::AbstractString=record.sequence)
+function _copy_seqrecord(record::SeqRecordLite, sequence=record.sequence)
     return SeqRecordLite(
         sequence;
         identifier=record.identifier,
         name=record.name,
         description=record.description,
         annotations=record.annotations,
-        letter_annotations=record.letter_annotations,
-    )
+        letter_annotations=record.letter_annotations)
 end
 
 function _coerce_msa_record(record::SeqRecordLite)
     return _copy_seqrecord(record)
 end
 
-function _coerce_msa_record(record::AbstractString, index::Integer)
-    return SeqRecordLite(String(record); identifier="sequence_$(index)", name="sequence_$(index)", description="")
+@inline _msa_sequence_from_string(sequence) = begin
+    sequence_text = String(sequence)
+    BioSequence{_infer_sequence_alphabet(sequence_text)}(sequence_text)
+end
+
+function _coerce_msa_record(record::String, index::Integer)
+    return SeqRecordLite(_msa_sequence_from_string(String(record)); identifier="sequence_$(index)", name="sequence_$(index)", description="")
 end
 
 function _coerce_msa_records(records)
@@ -30,7 +46,7 @@ function _coerce_msa_records(records)
     for (index, record) in enumerate(records)
         if record isa SeqRecordLite
             push!(aligned_records, _coerce_msa_record(record))
-        elseif record isa AbstractString
+        elseif record isa String
             push!(aligned_records, _coerce_msa_record(record, index))
         else
             throw(ArgumentError("MultipleSequenceAlignment expects SeqRecordLite or string records"))
@@ -40,7 +56,7 @@ function _coerce_msa_records(records)
 end
 
 function _column_annotation_length(value)
-    value isa AbstractString && return lastindex(value)
+    value isa String && return lastindex(value)
     value isa AbstractVector && return length(value)
     return nothing
 end
@@ -55,13 +71,13 @@ function _validate_column_annotations(column_annotations::AbstractDict, alignmen
 end
 
 function _slice_column_annotation(value, cols)
-    value isa AbstractString && return value[cols]
+    value isa String && return value[cols]
     value isa AbstractVector && return value[cols]
     return value
 end
 
 function _column_annotation_text(value)
-    value isa AbstractString && return value
+    value isa String && return value
     value isa AbstractVector && return join(string.(value))
     return nothing
 end
@@ -75,7 +91,7 @@ function _subset_column_annotations(column_annotations::AbstractDict, cols)
 end
 
 function _concat_column_annotation(left_value, right_value)
-    left_value isa AbstractString && right_value isa AbstractString && return string(left_value, right_value)
+    left_value isa String && right_value isa String && return string(left_value, right_value)
     left_value isa AbstractVector && right_value isa AbstractVector && return vcat(left_value, right_value)
     return string(left_value, right_value)
 end
@@ -117,8 +133,7 @@ function _column_consensus_symbol(
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
-    style::Symbol=:clustal,
-)
+    style::Symbol=:clustal)
     counts = _column_symbol_counts(alignment, col; gap=gap)
     isempty(counts) && return ' '
     length(counts) == 1 && return _alignment_format_symbol(true, false, false, style)
@@ -143,16 +158,14 @@ function clustal_consensus(
     gap::Char='-',
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
-    weak_threshold::Int=0,
-)
+    weak_threshold::Int=0)
     return alignment_symbol_line(
         alignment;
         gap=gap,
         scoring=scoring,
         strong_threshold=strong_threshold,
         weak_threshold=weak_threshold,
-        style=:clustal,
-    )
+        style=:clustal)
 end
 
 function alignment_symbol_line(
@@ -162,11 +175,10 @@ function alignment_symbol_line(
     strong_threshold::Int=1,
     weak_threshold::Int=0,
     style::Symbol=:clustal,
-    threaded::Bool=true,
-)
+    threaded::Bool=true)
     if haskey(alignment.column_annotations, :clustal_consensus) && style === :clustal
         value = alignment.column_annotations[:clustal_consensus]
-        value isa AbstractString && return value
+        value isa String && return value
         value isa AbstractVector && return join(value)
     end
 
@@ -181,8 +193,7 @@ function alignment_symbol_line(
                 scoring=scoring,
                 strong_threshold=strong_threshold,
                 weak_threshold=weak_threshold,
-                style=style,
-            )
+                style=style)
         end
     else
         for column in 1:width
@@ -193,8 +204,7 @@ function alignment_symbol_line(
                 scoring=scoring,
                 strong_threshold=strong_threshold,
                 weak_threshold=weak_threshold,
-                style=style,
-            )
+                style=style)
         end
     end
     return String(symbols)
@@ -205,19 +215,18 @@ function emboss_consensus(
     gap::Char='-',
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
-    weak_threshold::Int=0,
-)
+    weak_threshold::Int=0)
     return alignment_symbol_line(
         alignment;
         gap=gap,
         scoring=scoring,
         strong_threshold=strong_threshold,
         weak_threshold=weak_threshold,
-        style=:emboss,
-    )
+        style=:emboss)
 end
 
 function alignment_column_counts(alignment::MultipleSequenceAlignment, col::Integer; gap::Char='-')
+
     return _column_symbol_counts(alignment, col; gap=gap)
 end
 
@@ -230,6 +239,7 @@ function alignment_column_frequencies(alignment::MultipleSequenceAlignment, col:
     for (symbol, count) in counts
         frequencies[symbol] = count / total
     end
+
     return frequencies
 end
 
@@ -240,8 +250,7 @@ function alignment_column_symbol(
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
-    style::Symbol=:clustal,
-)
+    style::Symbol=:clustal)
     return _column_consensus_symbol(
         alignment,
         col;
@@ -249,11 +258,10 @@ function alignment_column_symbol(
         scoring=scoring,
         strong_threshold=strong_threshold,
         weak_threshold=weak_threshold,
-        style=style,
-    )
+        style=style)
 end
 
-function _read_alignment_fasta(lines::AbstractVector{<:AbstractString})
+function _read_alignment_fasta(lines::AbstractVector{<:String})
     records = SeqRecordLite[]
     current_identifier = ""
     current_description = ""
@@ -261,7 +269,8 @@ function _read_alignment_fasta(lines::AbstractVector{<:AbstractString})
 
     function flush_record!()
         isempty(current_identifier) && return nothing
-        push!(records, SeqRecordLite(String(take!(sequence)); identifier=current_identifier, description=current_description))
+        sequence_text = String(take!(sequence))
+        push!(records, SeqRecordLite(_msa_sequence_from_string(sequence_text); identifier=current_identifier, description=current_description))
         return nothing
     end
 
@@ -270,9 +279,9 @@ function _read_alignment_fasta(lines::AbstractVector{<:AbstractString})
         isempty(line) && continue
         if startswith(line, '>')
             flush_record!()
-            current_description = strip(line[2:end])
+            current_description = String(strip(line[2:end]))
             separator = findfirst(isspace, current_description)
-            current_identifier = separator === nothing ? current_description : current_description[1:prevind(current_description, separator)]
+            current_identifier = separator === nothing ? current_description : String(current_description[1:prevind(current_description, separator)])
         else
             write(sequence, line)
         end
@@ -282,7 +291,7 @@ function _read_alignment_fasta(lines::AbstractVector{<:AbstractString})
     return MultipleSequenceAlignment(records)
 end
 
-function _read_alignment_clustal(lines::AbstractVector{<:AbstractString})
+function _read_alignment_clustal(lines::AbstractVector{<:String})
     fragments = Dict{String,IOBuffer}()
     order = String[]
     consensus = IOBuffer()
@@ -318,7 +327,7 @@ function _read_alignment_clustal(lines::AbstractVector{<:AbstractString})
     records = SeqRecordLite[]
     for identifier in order
         sequence = String(take!(fragments[identifier]))
-        push!(records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     clustal_consensus = String(take!(consensus))
@@ -326,7 +335,7 @@ function _read_alignment_clustal(lines::AbstractVector{<:AbstractString})
     return MultipleSequenceAlignment(records; column_annotations=column_annotations)
 end
 
-function _read_alignment_stockholm(lines::AbstractVector{<:AbstractString})
+function _read_alignment_stockholm(lines::AbstractVector{<:String})
     fragments = Dict{String,IOBuffer}()
     order = String[]
     column_annotation_buffers = Dict{Symbol,IOBuffer}()
@@ -365,36 +374,63 @@ function _read_alignment_stockholm(lines::AbstractVector{<:AbstractString})
     records = SeqRecordLite[]
     for identifier in order
         sequence = String(take!(fragments[identifier]))
-        push!(records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     column_annotations = Dict{Symbol,Any}(key => String(take!(buffer)) for (key, buffer) in column_annotation_buffers)
     return MultipleSequenceAlignment(records; column_annotations=column_annotations)
 end
 
-function read_alignment(source::AbstractString, format::AbstractString="auto")
-    open(source, "r") do io
-        return read_alignment(io, format)
+function read_alignment(source::String, format::String="auto"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(source, "r") do io
+            return read_alignment(io, format)
+        end
     end
+    raw_bytes = read(source)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+
+
+    return read_alignment(IOBuffer(raw_bytes), format; _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=source)
 end
 
-function read_alignment(io::IO, format::AbstractString="auto")
+function read_alignment(io::IO, format::String="auto"; provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_alignment", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lines = readlines(io)
     normalized = lowercase(strip(String(format)))
     if normalized == "auto"
         normalized = isempty(lines) ? "fasta" : startswith(uppercase(strip(first(lines))), "#NEXUS") ? "nexus" : startswith(strip(first(lines)), "!!") ? "msf" : startswith(strip(first(lines)), "!!") && occursin("Check:", first(lines)) ? "gcg" : startswith(strip(first(lines)), "##maf") ? "maf" : startswith(strip(first(lines)), ">P1;") || startswith(strip(first(lines)), ">F1;") ? "pir" : startswith(strip(first(lines)), "# STOCKHOLM") ? "stockholm" : startswith(strip(first(lines)), "CLUSTAL") ? "clustal" : occursin(r"^\s*\d+\s+\d+\s*$", strip(first(lines))) ? "phylip" : "fasta"
     end
-    normalized in ("fasta", "fa") && return _read_alignment_fasta(lines)
-    normalized == "clustal" && return _read_alignment_clustal(lines)
-    normalized in ("stockholm", "sto") && return _read_alignment_stockholm(lines)
-    normalized == "pir" && return _read_alignment_pir(lines)
-    normalized == "nexus" && return _read_alignment_nexus(lines)
-    normalized == "msf" && return _read_alignment_msf(lines)
-    normalized == "phylip" && return _read_alignment_phylip(lines)
-    normalized == "phylip-relaxed" && return _read_alignment_phylip(lines)
-    normalized == "maf" && return _read_alignment_maf(lines)
-    normalized == "gcg" && return _read_alignment_gcg(lines)
-    throw(ArgumentError("unsupported alignment format: $(format)"))
+    alignment = if normalized in ("fasta", "fa")
+        _read_alignment_fasta(lines)
+    elseif normalized == "clustal"
+        _read_alignment_clustal(lines)
+    elseif normalized in ("stockholm", "sto")
+        _read_alignment_stockholm(lines)
+    elseif normalized == "pir"
+        _read_alignment_pir(lines)
+    elseif normalized == "nexus"
+        _read_alignment_nexus(lines)
+    elseif normalized == "msf"
+        _read_alignment_msf(lines)
+    elseif normalized == "phylip"
+        _read_alignment_phylip(lines)
+    elseif normalized == "phylip-relaxed"
+        _read_alignment_phylip(lines)
+    elseif normalized == "maf"
+        _read_alignment_maf(lines)
+    elseif normalized == "gcg"
+        _read_alignment_gcg(lines)
+    else
+        throw(ArgumentError("unsupported alignment format: $(format)"))
+    end
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_alignment"; parents=String[], parameters=(source=provenance_source, format=normalized, record_count=length(alignment.records), hash=provenance_hash))
+        register_container_provenance!(_ctx, alignment, "read_alignment"; parents=[root.id], parameters=(source=provenance_source, format=normalized, record_count=length(alignment.records)), provenance_hash=provenance_hash)
+        for (index, record) in enumerate(alignment.records)
+        register_container_provenance!(_ctx, record, "read_alignment_record"; parents=[root.id], parameters=(source=provenance_source, format=normalized, record_index=index, identifier=record.identifier), provenance_hash=provenance_hash)
+        end
+    end
+    return alignment
 end
 
 function _validate_msa_records(records::Vector{SeqRecordLite})
@@ -409,16 +445,14 @@ end
 function MultipleSequenceAlignment(
     records::AbstractVector;
     annotations::AbstractDict=Dict{Symbol,Any}(),
-    column_annotations::AbstractDict=Dict{Symbol,Any}(),
-)
+    column_annotations::AbstractDict=Dict{Symbol,Any}())
     aligned_records = _coerce_msa_records(records)
     alignment_length = _validate_msa_records(aligned_records)
     _validate_column_annotations(column_annotations, alignment_length)
     return MultipleSequenceAlignment(
         aligned_records,
         Dict{Symbol,Any}(annotations),
-        Dict{Symbol,Any}(column_annotations),
-    )
+        Dict{Symbol,Any}(column_annotations))
 end
 
 function Base.length(alignment::MultipleSequenceAlignment)
@@ -427,6 +461,7 @@ end
 
 function get_alignment_length(alignment::MultipleSequenceAlignment)
     isempty(alignment.records) && return 0
+
     return length(alignment.records[1].sequence)
 end
 
@@ -445,16 +480,14 @@ function Base.getindex(alignment::MultipleSequenceAlignment, ::Colon)
     return MultipleSequenceAlignment(
         alignment.records;
         annotations=alignment.annotations,
-        column_annotations=alignment.column_annotations,
-    )
+        column_annotations=alignment.column_annotations)
 end
 
 function Base.copy(alignment::MultipleSequenceAlignment)
     return MultipleSequenceAlignment(
         alignment.records;
         annotations=alignment.annotations,
-        column_annotations=alignment.column_annotations,
-    )
+        column_annotations=alignment.column_annotations)
 end
 
 function _slice_record(record::SeqRecordLite, cols)
@@ -506,8 +539,7 @@ function Base.getindex(alignment::MultipleSequenceAlignment, rows::Colon, cols)
     return MultipleSequenceAlignment(
         selected;
         annotations=alignment.annotations,
-        column_annotations=_subset_column_annotations(alignment.column_annotations, cols),
-    )
+        column_annotations=_subset_column_annotations(alignment.column_annotations, cols))
 end
 
 function Base.getindex(alignment::MultipleSequenceAlignment, rows, cols::Colon)
@@ -520,16 +552,14 @@ function Base.getindex(alignment::MultipleSequenceAlignment, rows::AbstractVecto
     return MultipleSequenceAlignment(
         alignment.records[rows];
         annotations=alignment.annotations,
-        column_annotations=_subset_column_annotations(alignment.column_annotations, :),
-    )
+        column_annotations=_subset_column_annotations(alignment.column_annotations, :))
 end
 
 function Base.getindex(alignment::MultipleSequenceAlignment, rows::AbstractRange)
     return MultipleSequenceAlignment(
         alignment.records[collect(rows)];
         annotations=alignment.annotations,
-        column_annotations=_subset_column_annotations(alignment.column_annotations, :),
-    )
+        column_annotations=_subset_column_annotations(alignment.column_annotations, :))
 end
 
 function Base.getindex(alignment::MultipleSequenceAlignment, rows, cols)
@@ -550,8 +580,7 @@ function Base.getindex(alignment::MultipleSequenceAlignment, rows, cols)
         return MultipleSequenceAlignment(
             selected;
             annotations=alignment.annotations,
-            column_annotations=_subset_column_annotations(alignment.column_annotations, cols),
-        )
+            column_annotations=_subset_column_annotations(alignment.column_annotations, cols))
     end
 end
 
@@ -588,7 +617,7 @@ function Base.:+(left::MultipleSequenceAlignment, right::MultipleSequenceAlignme
     length(left) == length(right) || throw(ArgumentError("alignments must have the same number of rows"))
     merged = SeqRecordLite[]
     for (left_record, right_record) in zip(left.records, right.records)
-        merged_sequence = string(left_record.sequence, right_record.sequence)
+        merged_sequence = String(left_record.sequence) * String(right_record.sequence)
         push!(merged, _copy_seqrecord(left_record, merged_sequence))
     end
     annotations = Dict{Symbol,Any}()
@@ -613,7 +642,7 @@ function _alignment_block_lines(alignment::MultipleSequenceAlignment, start_col:
     end
 
     for record in alignment.records
-        push!(lines, string(record.identifier, " ", record.sequence[start_col:stop_col]))
+        push!(lines, string(record.identifier, " ", String(record.sequence[start_col:stop_col])))
     end
 
     return lines
@@ -638,13 +667,14 @@ function _alignment_text(alignment::MultipleSequenceAlignment; width::Integer=60
     return String(take!(io))
 end
 
-function _wrap_sequence(sequence::AbstractString, width::Integer)
-    width <= 0 && return [sequence]
+function _wrap_sequence(sequence::BioSequence, width::Integer)
+    sequence_text = String(sequence)
+    width <= 0 && return [sequence_text]
     pieces = String[]
-    start_index = firstindex(sequence)
-    while start_index <= lastindex(sequence)
-        stop_index = min(start_index + width - 1, lastindex(sequence))
-        push!(pieces, sequence[start_index:stop_index])
+    start_index = firstindex(sequence_text)
+    while start_index <= lastindex(sequence_text)
+        stop_index = min(start_index + width - 1, lastindex(sequence_text))
+        push!(pieces, sequence_text[start_index:stop_index])
         start_index = stop_index + 1
     end
     return pieces
@@ -653,21 +683,21 @@ end
 function _write_fasta(io::IO, alignment::MultipleSequenceAlignment; width::Integer=60)
     isempty(alignment.records) && throw(ArgumentError("cannot format an empty multiple sequence alignment"))
     for record in alignment.records
-        # Bug fix: only append description when it is non-empty AND differs from
-        # the identifier; otherwise FASTA headers come out as ">seq1 seq1".
+        # Deduplicate: only append the description when it provides information
+        # beyond the identifier. Avoids producing headers like ">seq1 seq1".
         header = (isempty(record.description) || record.description == record.identifier) ?
                  record.identifier : string(record.identifier, " ", record.description)
         print(io, ">", header, "\n")
         sequence = record.sequence
         if width <= 0
-            print(io, sequence, "\n")
+            print(io, String(sequence), "\n")
             continue
         end
 
         start_index = firstindex(sequence)
         while start_index <= lastindex(sequence)
             stop_index = min(start_index + width - 1, lastindex(sequence))
-            print(io, SubString(sequence, start_index, stop_index), "\n")
+            print(io, String(sequence[start_index:stop_index]), "\n")
             start_index = stop_index + 1
         end
     end
@@ -690,8 +720,9 @@ function _write_stockholm(io::IO, alignment::MultipleSequenceAlignment; width::I
     for start_col in 1:block_width:alignment_width
         stop_col = min(start_col + block_width - 1, alignment_width)
         for (row_index, record) in enumerate(alignment.records)
+            sequence_text = String(record.sequence)
             print(io, padded_identifiers[row_index])
-            print(io, SubString(record.sequence, start_col, stop_col), "\n")
+            print(io, SubString(sequence_text, start_col, stop_col), "\n")
         end
         for (key, block) in annotation_blocks
             print(io, "#=GC ", key, " ", SubString(block, start_col, stop_col), "\n")
@@ -701,9 +732,10 @@ function _write_stockholm(io::IO, alignment::MultipleSequenceAlignment; width::I
     print(io, "//")
 end
 
-function _msf_chunk(sequence::AbstractString, start_index::Int, width::Int)
-    stop_index = min(start_index + width - 1, lastindex(sequence))
-    chunk = sequence[start_index:stop_index]
+function _msf_chunk(sequence::BioSequence, start_index::Int, width::Int)
+    sequence_text = String(sequence)
+    stop_index = min(start_index + width - 1, lastindex(sequence_text))
+    chunk = sequence_text[start_index:stop_index]
     groups = String[]
     for group_start in 1:10:length(chunk)
         push!(groups, chunk[group_start:min(group_start + 9, lastindex(chunk))])
@@ -735,7 +767,7 @@ function _write_msf(io::IO, alignment::MultipleSequenceAlignment)
     end
 end
 
-function _pir_identifier(identifier::AbstractString)
+function _pir_identifier(identifier::String)
     return replace(String(identifier), r"\s+" => "_")
 end
 
@@ -744,18 +776,19 @@ function _write_pir(io::IO, alignment::MultipleSequenceAlignment; width::Integer
     block_width = max(1, width)
 
     for record in alignment.records
+        sequence_text = String(record.sequence)
         println(io, ">P1;", _pir_identifier(record.identifier))
         description = isempty(record.description) ? record.identifier : record.description
         println(io, description)
-        for start_index in 1:block_width:lastindex(record.sequence)
-            stop_index = min(start_index + block_width - 1, lastindex(record.sequence))
-            println(io, SubString(record.sequence, start_index, stop_index))
+        for start_index in 1:block_width:lastindex(sequence_text)
+            stop_index = min(start_index + block_width - 1, lastindex(sequence_text))
+            println(io, SubString(sequence_text, start_index, stop_index))
         end
         println(io, "*")
     end
 end
 
-function _read_alignment_pir(lines::AbstractVector{<:AbstractString})
+function _read_alignment_pir(lines::AbstractVector{<:String})
     records = Dict{String,IOBuffer}()
     order = String[]
     current_identifier = ""
@@ -794,13 +827,13 @@ function _read_alignment_pir(lines::AbstractVector{<:AbstractString})
         sequence = String(take!(records[identifier]))
         alignment_length === nothing && (alignment_length = length(sequence))
         length(sequence) == alignment_length || throw(ArgumentError("PIR sequence length mismatch"))
-        push!(parsed_records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(parsed_records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     return MultipleSequenceAlignment(parsed_records)
 end
 
-function _read_alignment_msf(lines::AbstractVector{<:AbstractString})
+function _read_alignment_msf(lines::AbstractVector{<:String})
     records = Dict{String,IOBuffer}()
     order = String[]
     in_matrix = false
@@ -839,13 +872,13 @@ function _read_alignment_msf(lines::AbstractVector{<:AbstractString})
     for identifier in order
         sequence = String(take!(records[identifier]))
         alignment_length !== nothing && length(sequence) == alignment_length || throw(ArgumentError("MSF sequence length mismatch"))
-        push!(parsed_records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(parsed_records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     return MultipleSequenceAlignment(parsed_records)
 end
 
-function _normalize_alignment_format(format::AbstractString)
+function _normalize_alignment_format(format::String)
     normalized = lowercase(strip(String(format)))
     normalized in ("fasta", "fa") && return "fasta"
     normalized == "clustal" && return "clustal"
@@ -858,7 +891,7 @@ function _normalize_alignment_format(format::AbstractString)
     throw(ArgumentError("unsupported alignment format: $(format)"))
 end
 
-function _nexus_identifier(identifier::AbstractString)
+function _nexus_identifier(identifier::String)
     return replace(String(identifier), r"\s+" => "_")
 end
 
@@ -872,13 +905,13 @@ function _write_nexus(io::IO, alignment::MultipleSequenceAlignment)
     println(io, "Format datatype=standard missing=? gap=- interleave=no;")
     println(io, "Matrix")
     for record in alignment.records
-        println(io, _nexus_identifier(record.identifier), " ", record.sequence)
+        println(io, _nexus_identifier(record.identifier), " ", String(record.sequence))
     end
     println(io, ";")
     println(io, "End;")
 end
 
-function _read_alignment_nexus(lines::AbstractVector{<:AbstractString})
+function _read_alignment_nexus(lines::AbstractVector{<:String})
     records = Dict{String,IOBuffer}()
     order = String[]
     in_data = false
@@ -942,7 +975,7 @@ function _read_alignment_nexus(lines::AbstractVector{<:AbstractString})
         if alignment_length !== nothing && length(sequence) != alignment_length
             throw(ArgumentError("NEXUS sequence length mismatch"))
         end
-        push!(parsed_records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(parsed_records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     if sequence_count !== nothing && length(parsed_records) != sequence_count
@@ -951,7 +984,7 @@ function _read_alignment_nexus(lines::AbstractVector{<:AbstractString})
     return MultipleSequenceAlignment(parsed_records)
 end
 
-function _phylip_identifier(identifier::AbstractString; relaxed::Bool=false)
+function _phylip_identifier(identifier::String; relaxed::Bool=false)
     relaxed && return String(identifier)
     stop_index = min(lastindex(identifier), firstindex(identifier) + 9)
     return String(identifier[firstindex(identifier):stop_index])
@@ -965,11 +998,11 @@ function _write_phylip(io::IO, alignment::MultipleSequenceAlignment; relaxed::Bo
     println(io, length(alignment.records), " ", alignment_width)
     for record in alignment.records
         identifier = _phylip_identifier(record.identifier; relaxed=relaxed)
-        print(io, rpad(identifier, name_width), record.sequence, "\n")
+        print(io, rpad(identifier, name_width), String(record.sequence), "\n")
     end
 end
 
-function _read_alignment_phylip(lines::AbstractVector{<:AbstractString})
+function _read_alignment_phylip(lines::AbstractVector{<:String})
     stripped_lines = [strip(line) for line in lines if !isempty(strip(line))]
     isempty(stripped_lines) && return MultipleSequenceAlignment(SeqRecordLite[])
 
@@ -1012,7 +1045,7 @@ function _read_alignment_phylip(lines::AbstractVector{<:AbstractString})
     for identifier in order
         sequence = String(take!(records[identifier]))
         length(sequence) == alignment_length || throw(ArgumentError("PHYLIP sequence length mismatch"))
-        push!(parsed_records, SeqRecordLite(sequence; identifier=identifier, description=identifier))
+        push!(parsed_records, SeqRecordLite(_msa_sequence_from_string(sequence); identifier=identifier, description=identifier))
     end
 
     length(parsed_records) == sequence_count || throw(ArgumentError("PHYLIP record count mismatch"))
@@ -1026,8 +1059,7 @@ function _write_clustal(
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
-    symbol_style::Symbol=:clustal,
-)
+    symbol_style::Symbol=:clustal)
     isempty(alignment.records) && throw(ArgumentError("cannot format an empty multiple sequence alignment"))
     alignment_width = get_alignment_length(alignment)
     consensus = alignment_symbol_line(alignment; scoring=scoring, strong_threshold=strong_threshold, weak_threshold=weak_threshold, style=symbol_style)
@@ -1040,7 +1072,7 @@ function _write_clustal(
         stop_col = min(start_col + block_width - 1, alignment_width)
         for (row_index, record) in enumerate(alignment.records)
             print(io, padded_identifiers[row_index])
-            print(io, SubString(record.sequence, start_col, stop_col), "\n")
+            print(io, SubString(String(record.sequence), start_col, stop_col), "\n")
         end
         print(io, rpad("", max_identifier + 2))
         print(io, SubString(consensus, start_col, stop_col), "\n\n")
@@ -1058,8 +1090,7 @@ function _format_clustal(
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
-    symbol_style::Symbol=:clustal,
-)
+    symbol_style::Symbol=:clustal)
     return sprint(io -> _write_clustal(io, alignment; width=width, scoring=scoring, strong_threshold=strong_threshold, weak_threshold=weak_threshold, symbol_style=symbol_style))
 end
 
@@ -1085,13 +1116,12 @@ end
 
 function format_alignment(
     alignment::MultipleSequenceAlignment,
-    format::AbstractString="clustal";
+    format::String="clustal";
     width::Integer=60,
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
-    symbol_style::Symbol=:clustal,
-)
+    symbol_style::Symbol=:clustal)
     normalized = _normalize_alignment_format(format)
     if normalized in ("fasta", "fa")
         return _format_fasta(alignment; width=width)
@@ -1116,13 +1146,14 @@ end
 function write_alignment(
     io::IO,
     alignment::MultipleSequenceAlignment,
-    format::AbstractString="clustal";
+    format::String="clustal";
     width::Integer=60,
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
     symbol_style::Symbol=:clustal,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     normalized = _normalize_alignment_format(format)
     if normalized in ("fasta", "fa")
         _write_fasta(io, alignment; width=width)
@@ -1143,26 +1174,32 @@ function write_alignment(
     else
         throw(ArgumentError("unsupported alignment format: $(format)"))
     end
+    _ctx !== nothing && register_provenance!(_ctx, "write_alignment"; parents=provenance_parent_ids(alignment, alignment.records), parameters=(output="IO", format=normalized, width=width, record_count=length(alignment), hash=nothing))
     return alignment
 end
 
 function write_alignment(
-    path::AbstractString,
+    path::String,
     alignment::MultipleSequenceAlignment,
-    format::AbstractString="clustal";
+    format::String="clustal";
     width::Integer=60,
     scoring::Union{Nothing,SubstitutionMatrix}=nothing,
     strong_threshold::Int=1,
     weak_threshold::Int=0,
     symbol_style::Symbol=:clustal,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     open(path, "w") do io
-        write_alignment(io, alignment, format; width=width, scoring=scoring, strong_threshold=strong_threshold, weak_threshold=weak_threshold, symbol_style=symbol_style)
+        write_alignment(io, alignment, format; width=width, scoring=scoring, strong_threshold=strong_threshold, weak_threshold=weak_threshold, symbol_style=symbol_style, _ctx=_ctx)
+    end
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        register_provenance!(_ctx, "write_alignment"; parents=provenance_parent_ids(alignment, alignment.records), parameters=(output=path, format=_normalize_alignment_format(format), width=width, record_count=length(alignment), hash=provenance_hash))
     end
     return alignment
 end
 
-function _normalize_external_alignment_format(format::AbstractString)
+function _normalize_external_alignment_format(format::String)
     normalized = _normalize_alignment_format(format)
     normalized in ("fasta", "fa") && return "fasta"
     normalized == "clustal" && return "clustal"
@@ -1170,7 +1207,7 @@ function _normalize_external_alignment_format(format::AbstractString)
     throw(ArgumentError("unsupported external alignment format: $(format)"))
 end
 
-function _alignment_output_extension(format::AbstractString)
+function _alignment_output_extension(format::String)
     normalized = _normalize_external_alignment_format(format)
     normalized == "fasta" && return "fasta"
     normalized == "clustal" && return "aln"
@@ -1185,8 +1222,8 @@ function _external_msa_records(records)
     for (index, record) in enumerate(records)
         if record isa SeqRecordLite
             push!(coerced, _copy_seqrecord(record))
-        elseif record isa AbstractString
-            push!(coerced, SeqRecordLite(String(record); identifier="sequence_$(index)", name="sequence_$(index)", description=""))
+        elseif record isa String
+            push!(coerced, SeqRecordLite(_msa_sequence_from_string(String(record)); identifier="sequence_$(index)", name="sequence_$(index)", description=""))
         else
             throw(ArgumentError("external MSA wrappers expect SeqRecordLite or string records"))
         end
@@ -1194,15 +1231,15 @@ function _external_msa_records(records)
     return coerced
 end
 
-function _write_fasta_records(io::IO, records::AbstractVector{SeqRecordLite})
+function _write_fasta_records(io::IO, records::AbstractVector{<:SeqRecordLite})
     for record in records
         header = (isempty(record.description) || record.description == record.identifier) ? record.identifier : string(record.identifier, " ", record.description)
-        print(io, ">", header, "\n", record.sequence, "\n")
+        print(io, ">", header, "\n", String(record.sequence), "\n")
     end
     return nothing
 end
 
-function _external_msa_search_paths(candidate::AbstractString)
+function _external_msa_search_paths(candidate::String)
     paths = String[]
     conda_prefix = get(ENV, "CONDA_PREFIX", "")
     if !isempty(conda_prefix)
@@ -1213,8 +1250,7 @@ function _external_msa_search_paths(candidate::AbstractString)
     for root in (
         joinpath(home, "miniconda3", "envs"),
         joinpath(home, ".conda", "envs"),
-        joinpath(home, "anaconda3", "envs"),
-    )
+        joinpath(home, "anaconda3", "envs"))
         isdir(root) || continue
         for env_name in readdir(root)
             push!(paths, joinpath(root, env_name, "bin", candidate))
@@ -1225,7 +1261,7 @@ function _external_msa_search_paths(candidate::AbstractString)
     return paths
 end
 
-function _resolve_external_msa_executable(candidates::AbstractVector{<:AbstractString}, executable::Union{Nothing,AbstractString})
+function _resolve_external_msa_executable(candidates::AbstractVector{<:String}, executable::Union{Nothing,String})
     if executable !== nothing
         executable_string = String(executable)
         if occursin('/', executable_string) || occursin('\\', executable_string)
@@ -1251,10 +1287,11 @@ end
 function _run_external_msa(
     tool::Symbol,
     records;
-    executable::Union{Nothing,AbstractString}=nothing,
-    output_format::AbstractString="clustal",
-    extra_args::AbstractVector{<:AbstractString}=String[],
-)
+    executable::Union{Nothing,String}=nothing,
+    output_format::String="clustal",
+    extra_args::AbstractVector{<:String}=String[],
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     input_records = _external_msa_records(records)
     normalized_output_format = _normalize_external_alignment_format(output_format)
     output_extension = _alignment_output_extension(normalized_output_format)
@@ -1268,8 +1305,7 @@ function _run_external_msa(
 
         executable_path = _resolve_external_msa_executable(
             tool === :clustal ? ["clustalo", "clustalw2", "clustalw"] : ["muscle"],
-            executable,
-        )
+            executable)
 
         if tool === :clustal
             command_variants = [
@@ -1280,54 +1316,78 @@ function _run_external_msa(
             for command in command_variants
                 try
                     run(command)
-                    return read_alignment(output_path, normalized_output_format)
-                catch err
-                    last_error = err
-                end
-            end
-            throw(ArgumentError("clustal execution failed: $(last_error === nothing ? "unknown error" : sprint(showerror, last_error))"))
+                    alignment = read_alignment(output_path, normalized_output_format)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output_path)))
+        root = register_provenance!(_ctx, "clustal_msa"; parents=provenance_parent_ids(input_records), parameters=(executable=executable_path, output_format=normalized_output_format, extra_args=collect(extra_args), input_count=length(input_records), hash=provenance_hash))
+        register_container_provenance!(_ctx, alignment, "clustal_msa"; parents=[root.id], parameters=(executable=executable_path, output_format=normalized_output_format, record_count=length(alignment.records)), provenance_hash=provenance_hash)
+        for (index, record) in enumerate(alignment.records)
+        register_container_provenance!(_ctx, record, "clustal_msa_record"; parents=[root.id], parameters=(record_index=index, identifier=record.identifier), provenance_hash=provenance_hash)
+        end
+        end
+        return alignment
+        catch err
+        last_error = err
+        end
+        end
+        throw(ArgumentError("clustal execution failed: $(last_error === nothing ? "unknown error" : sprint(showerror, last_error))"))
         elseif tool === :muscle
-            normalized_output_format == "fasta" || throw(ArgumentError("muscle currently supports FASTA output only"))
-            command_variants = [
-                Cmd(vcat([executable_path, "-align", input_path, "-output", output_path], String.(extra_args))),
-                Cmd(vcat([executable_path, "-in", input_path, "-out", output_path], String.(extra_args))),
-            ]
-            last_error = nothing
-            for command in command_variants
-                try
-                    run(command)
-                    return read_alignment(output_path, normalized_output_format)
-                catch err
-                    last_error = err
-                end
-            end
-            throw(ArgumentError("muscle execution failed: $(last_error === nothing ? "unknown error" : sprint(showerror, last_error))"))
+        normalized_output_format == "fasta" || throw(ArgumentError("muscle currently supports FASTA output only"))
+        command_variants = [
+        Cmd(vcat([executable_path, "-align", input_path, "-output", output_path], String.(extra_args))),
+        Cmd(vcat([executable_path, "-in", input_path, "-out", output_path], String.(extra_args))),
+        ]
+        last_error = nothing
+        for command in command_variants
+        try
+        run(command)
+        alignment = read_alignment(output_path, normalized_output_format)
+        if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output_path)))
+        root = register_provenance!(_ctx, "muscle_msa"; parents=provenance_parent_ids(input_records), parameters=(executable=executable_path, output_format=normalized_output_format, extra_args=collect(extra_args), input_count=length(input_records), hash=provenance_hash))
+        register_container_provenance!(_ctx, alignment, "muscle_msa"; parents=[root.id], parameters=(executable=executable_path, output_format=normalized_output_format, record_count=length(alignment.records)), provenance_hash=provenance_hash)
+        for (index, record) in enumerate(alignment.records)
+        register_container_provenance!(_ctx, record, "muscle_msa_record"; parents=[root.id], parameters=(record_index=index, identifier=record.identifier), provenance_hash=provenance_hash)
+        end
+        end
+        return alignment
+        catch err
+        last_error = err
+        end
+        end
+        throw(ArgumentError("muscle execution failed: $(last_error === nothing ? "unknown error" : sprint(showerror, last_error))"))
         else
-            throw(ArgumentError("unsupported external MSA tool: $(tool)"))
+        throw(ArgumentError("unsupported external MSA tool: $(tool)"))
         end
     end
 end
 
-clustal_available(; executable::Union{Nothing,AbstractString}=nothing) = try
+clustal_available(; executable::Union{Nothing,String}=nothing) = try
     _resolve_external_msa_executable(["clustalo", "clustalw2", "clustalw"], executable)
     true
 catch
     false
 end
 
-muscle_available(; executable::Union{Nothing,AbstractString}=nothing) = try
+muscle_available(; executable::Union{Nothing,String}=nothing) = try
     _resolve_external_msa_executable(["muscle"], executable)
     true
 catch
     false
 end
 
-function clustal_msa(records; executable::Union{Nothing,AbstractString}=nothing, output_format::AbstractString="clustal", extra_args::AbstractVector{<:AbstractString}=String[])
-    return _run_external_msa(:clustal, records; executable=executable, output_format=output_format, extra_args=extra_args)
+function clustal_msa(records; executable::Union{Nothing,String}=nothing, output_format::String="clustal", extra_args::AbstractVector{<:String}=String[])
+    _ctx = active_provenance_context()
+
+
+    return _run_external_msa(:clustal, records; executable=executable, output_format=output_format, extra_args=extra_args, _ctx=_ctx)
 end
 
-function muscle_msa(records; executable::Union{Nothing,AbstractString}=nothing, output_format::AbstractString="clustal", extra_args::AbstractVector{<:AbstractString}=String[])
-    return _run_external_msa(:muscle, records; executable=executable, output_format=output_format, extra_args=extra_args)
+function muscle_msa(records; executable::Union{Nothing,String}=nothing, output_format::String="clustal", extra_args::AbstractVector{<:String}=String[])
+    _ctx = active_provenance_context()
+
+
+    return _run_external_msa(:muscle, records; executable=executable, output_format=output_format, extra_args=extra_args, _ctx=_ctx)
 end
 
 function Base.show(io::IO, alignment::MultipleSequenceAlignment)
@@ -1361,6 +1421,7 @@ function Base.repr(alignment::MultipleSequenceAlignment)
 end
 
 function alignment_column(alignment::MultipleSequenceAlignment, col::Integer)
+
     return _column_string(alignment, collect(eachindex(alignment.records)), col)
 end
 
@@ -1442,7 +1503,8 @@ function _read_alignment_maf(lines::Vector{String})
                 :strand => strand,
                 :srcSize => src_size
             )
-            push!(records, SeqRecordLite(sequence, identifier=src, name=src, annotations=annotations))
+            src_text = String(src)
+            push!(records, SeqRecordLite(_msa_sequence_from_string(sequence), identifier=src_text, name=src_text, annotations=annotations))
         end
     end
     return MultipleSequenceAlignment(records)
@@ -1456,7 +1518,7 @@ function _read_alignment_gcg(lines::Vector{String})
     
     for line in lines
         if occursin("..", line)
-            id = strip(Base.split(line, "..")[1])
+            id = String(strip(Base.split(line, "..")[1]))
             in_sequence = true
             continue
         end
@@ -1471,7 +1533,8 @@ function _read_alignment_gcg(lines::Vector{String})
         end
     end
     
-    push!(records, SeqRecordLite(String(take!(sequence_data)), identifier=id, name=id))
+    sequence_text = String(take!(sequence_data))
+    push!(records, SeqRecordLite(_msa_sequence_from_string(sequence_text), identifier=id, name=id))
     return MultipleSequenceAlignment(records)
 end
 multiple_sequence_alignment(records::AbstractVector; kwargs...) = MultipleSequenceAlignment(records; kwargs...)

@@ -1,5 +1,23 @@
 # ==============================================================================
+# popgen.jl — Population genetics analysis
+#
+# Provides allele/genotype frequency estimation, Hardy-Weinberg equilibrium
+# testing (chi-squared and exact), F-statistics, AMOVA, linkage
+# disequilibrium, genetic distance matrices, effective population size
+# estimation, and migration rate inference.
+#
+# References:
+#   - Weir & Cockerham (1984) Evolution 38(6):1358-1370 (F-statistics)
+#   - Excoffier et al. (1992) Genetics 131(2):479-491 (AMOVA)
+#   - Hill (1981) Heredity 47(2):229-239 (LD-based Ne estimation)
+#   - Wigginton et al. (2005) AJHG 76(5):887-893 (exact HW test)
+# ==============================================================================
 using Distributions, Random, Statistics
+using ..BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id
+
+@inline function _register_popgen_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
 
 
 # ------------------------------------------------------------------------------
@@ -198,13 +216,10 @@ function hardy_weinberg_test(pop::Population{T}, locus_idx::Int) where T
     chi2 += exp_q2 > 0 ? ((obs_q2 - exp_q2)^2 / exp_q2) : 0.0
     chi2 += exp_pq > 0 ? ((obs_pq - exp_pq)^2 / exp_pq) : 0.0
     
-    # Approx 1 DoF Chi-Square PDF -> p-value mapping
-    # Note: rigorous p-value requires advanced stats libs, using a fast approximation for popgen
-    # This is a basic approximation of the chi-square CDF upper tail
-    # More exact approximations will be used in production
-    
-    # Basic lookup approx for df=1
-    return exp(-chi2/2) / sqrt(chi2 * 2 + 1e-9)
+    # Chi-Square p-value (1 degree of freedom for bi-allelic HW test).
+    # Uses the proper chi-squared survival function from the Distributions package.
+    # Reference: Wigginton, Cutler & Abecasis (2005) AJHG 76(5):887-893
+    return ccdf(Chisq(1), chi2)
 end
 
 """
@@ -263,7 +278,6 @@ function hardy_weinberg_exact(pop::Population{T}, locus_idx::Int) where T
             p_total += p_i
         end
     end
-    
     return min(p_total, 1.0)
 end
 
@@ -340,8 +354,10 @@ function f_statistics(populations::Vector{Population{T}}, locus_idx::Int) where 
     F_IS = mean_Hs > 0 ? (mean_Hs - mean_Ho) / mean_Hs : 0.0
     F_ST = Ht > 0 ? (Ht - mean_Hs) / Ht : 0.0
     F_IT = Ht > 0 ? (Ht - mean_Ho) / Ht : 0.0
-    
-    return (F_IS, F_ST, F_IT)
+
+    result = (F_IS, F_ST, F_IT)
+    _ctx = active_provenance_context()
+    return _register_popgen_result!(_ctx, result, "f_statistics"; parameters=(n_populations=length(populations), locus_idx=locus_idx, F_ST=F_ST))
 end
 
 """
@@ -464,8 +480,10 @@ function amova(distance_matrix::Matrix{Float64}, pop_sizes::Vector{Int})
     
     Var_total = Var_within + Var_among
     Phi_ST = Var_total > 0 ? Var_among / Var_total : 0.0
-    
-    return (Phi_ST, Var_within, Var_among)
+
+    result = (Phi_ST, Var_within, Var_among)
+    _ctx = active_provenance_context()
+    return _register_popgen_result!(_ctx, result, "amova"; parameters=(n_populations=length(pop_sizes), n_individuals=N, Phi_ST=Phi_ST))
 end
 
 # ------------------------------------------------------------------------------
@@ -772,8 +790,10 @@ function population_pca(populations::Vector{Population{T}}, loci::Vector{Int}) w
     # are the exact projections of our populations onto the PCs.
     projections = svd_res.U * Diagonal(svd_res.S)
     eigenvalues = (svd_res.S .^ 2) ./ (num_pops - 1)
-    
-    return (projections, eigenvalues, freq_matrix)
+
+    result = (projections, eigenvalues, freq_matrix)
+    _ctx = active_provenance_context()
+    return _register_popgen_result!(_ctx, result, "population_pca"; parameters=(n_populations=length(populations), n_loci=length(loci)))
 end
 
 """
@@ -808,7 +828,8 @@ function population_pcoa(dist_matrix::Matrix{Float64})
     pos_idx = evals .> 0
     coords = evecs[:, pos_idx] * Diagonal(sqrt.(evals[pos_idx]))
     
-    return (coords, evals[pos_idx])
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (coords, evals[pos_idx]), "population_pcoa")
 end
 
 """
@@ -879,7 +900,8 @@ function mantel_test(dist_matrix1::Matrix{Float64}, dist_matrix2::Matrix{Float64
     end
     
     p_val = (count_extreme + 1) / (permutations + 1)
-    return (obs_corr, p_val)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (obs_corr, p_val), "mantel_test")
 end
 
 # ------------------------------------------------------------------------------
@@ -993,7 +1015,8 @@ function segregating_sites(alignment::MultipleSequenceAlignment)
             S += 1
         end
     end
-    return S
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, S, "segregating_sites")
 end
 
 """
@@ -1021,7 +1044,8 @@ function mismatch_distribution(alignment::MultipleSequenceAlignment)
             push!(mismatches, diffs)
         end
     end
-    return mismatches
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, mismatches, "mismatch_distribution")
 end
 
 """
@@ -1068,7 +1092,8 @@ function nucleotide_diversity(alignment::MultipleSequenceAlignment)
         end
     end
     
-    return valid_sites > 0 ? (pi_sum / valid_sites) : 0.0
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, valid_sites > 0 ? (pi_sum / valid_sites) : 0.0, "nucleotide_diversity")
 end
 
 """
@@ -1083,7 +1108,8 @@ function watterson_theta(alignment::MultipleSequenceAlignment)
     S = segregating_sites(alignment)
     a1 = sum(1.0 / i for i in 1:(n-1))
     
-    return S / a1
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, S / a1, "watterson_theta")
 end
 
 """
@@ -1154,7 +1180,8 @@ function tajimas_d(alignment::MultipleSequenceAlignment)
     end
     
     D = (total_pairwise_diffs - (S / a1)) / sqrt(variance_d)
-    return D
+    _ctx = active_provenance_context()
+    return _register_popgen_result!(_ctx, D, "tajimas_d"; parameters=(n_sequences=n, n_segregating_sites=S, tajimas_d=D))
 end
 
 """
@@ -1197,7 +1224,8 @@ function site_frequency_spectrum(alignment::MultipleSequenceAlignment; folded::B
             end
         end
     end
-    return sfs
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sfs, "site_frequency_spectrum")
 end
 
 # ------------------------------------------------------------------------------
@@ -1246,7 +1274,8 @@ function fu_li_d(alignment::MultipleSequenceAlignment)
     u_d = (n - 1.0) / n - (1.0 / a1)
     v_d = ((n - 1.0) / n)^2 * (sum(1.0/(i^2) for i in 1:(n-1)) + (a1^2)) / (a1^2)
     
-    return (S - a1 * singletons) / sqrt(abs(v_d)) 
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (S - a1 * singletons) / sqrt(abs(v_d)) , "fu_li_d")
 end
 
 """
@@ -1257,7 +1286,8 @@ Calculates Fu and Li's F statistic (without an outgroup).
 function fu_li_f(alignment::MultipleSequenceAlignment)
     td = tajimas_d(alignment)
     fd = fu_li_d(alignment)
-    return (td + fd) / 2.0 
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (td + fd) / 2.0 , "fu_li_f")
 end
 
 """
@@ -1323,7 +1353,8 @@ function ehh(alignment::MultipleSequenceAlignment, core_site::Int, distance_site
     end
     
     sum_sq = sum(c * (c - 1) for c in values(counts))
-    return sum_sq / (n * (n - 1))
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, sum_sq / (n * (n - 1)), "ehh")
 end
 
 """
@@ -1341,7 +1372,8 @@ function ihs(alignment::MultipleSequenceAlignment, core_site::Int)
         if e < 0.05; break; end
         dist += 1
     end
-    return integral
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, integral, "ihs")
 end
 
 """
@@ -1354,7 +1386,8 @@ function xp_ehh(pop1_ali::MultipleSequenceAlignment, pop2_ali::MultipleSequenceA
     ih2 = ihs(pop2_ali, core_site)
     
     if ih2 == 0; return 0.0; end
-    return log(ih1 / ih2)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, log(ih1 / ih2), "xp_ehh")
 end
 
 """
@@ -1418,7 +1451,8 @@ function sweepfinder_clr(alignment::MultipleSequenceAlignment, grid_points::Int=
         push!(clrs, max(0.0, clr))
     end
     
-    return clrs
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, clrs, "sweepfinder_clr")
 end
 
 # ------------------------------------------------------------------------------
@@ -1532,7 +1566,8 @@ function wright_fisher_simulation(N::Int, generations::Int; mu::Float64=1e-8, s:
         
         if p <= 0.0 || p >= 1.0; break; end
     end
-    return traj
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, traj, "wright_fisher_simulation")
 end
 
 """
@@ -1569,7 +1604,8 @@ function wright_fisher_metapopulation(N::Vector{Int}, generations::Int, M::Matri
             trajs[k][i+1] = p[k]
         end
     end
-    return trajs
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, trajs, "wright_fisher_metapopulation")
 end
 
 # ------------------------------------------------------------------------------
@@ -1659,7 +1695,8 @@ function _parse_genepop_population(filepath::String)
 end
 
 function read_genepop_record(filepath::String)
-    return _parse_genepop_population(filepath)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, _parse_genepop_population(filepath), "read_genepop_record")
 end
 
 """
@@ -1668,7 +1705,8 @@ end
 Parses a GenePop format file into a vector of Population objects.
 """
 function read_genepop(filepath::String)
-    return read_genepop_record(filepath).populations
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, read_genepop_record(filepath).populations, "read_genepop")
 end
 
 function split_in_pops(record::GenePopRecord{T}, pop_names::Vector{String}) where T
@@ -1705,7 +1743,8 @@ function remove_population!(record::GenePopRecord, pos::Int)
     if pos + 1 <= length(record.pop_list)
         deleteat!(record.pop_list, pos + 1)
     end
-    return record
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, record, "remove_population!")
 end
 
 function remove_locus_by_position!(record::GenePopRecord{T}, pos::Int) where T
@@ -1718,7 +1757,7 @@ function remove_locus_by_position!(record::GenePopRecord{T}, pos::Int) where T
     return record
 end
 
-function remove_locus_by_name!(record::GenePopRecord{T}, name::AbstractString) where T
+function remove_locus_by_name!(record::GenePopRecord{T}, name::String) where T
     for (index, locus_name) in enumerate(record.loci_list)
         if locus_name == name
             return remove_locus_by_position!(record, index - 1)
@@ -1729,7 +1768,7 @@ end
 
 remove_population(record::GenePopRecord, pos::Int) = remove_population!(record, pos)
 remove_locus_by_position(record::GenePopRecord, pos::Int) = remove_locus_by_position!(record, pos)
-remove_locus_by_name(record::GenePopRecord, name::AbstractString) = remove_locus_by_name!(record, name)
+remove_locus_by_name(record::GenePopRecord, name::String) = remove_locus_by_name!(record, name)
 
 """
     write_genepop(populations::Vector{Population}, filepath::String; title="BioToolkit export")
@@ -1892,7 +1931,8 @@ function linear_mixed_model_scan(genotypes::Matrix{Float64}, phenotypes::Vector{
         p_values[i] = exp(-beta^2 / 2.0) # very crude approx
     end
     
-    return p_values
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, p_values, "linear_mixed_model_scan")
 end
 
 """
@@ -1902,7 +1942,8 @@ Calculates the inbreeding coefficient (F) from the GRM diagonal.
 F = G[i, i] - 1.
 """
 function inbreeding_coefficient(G::Matrix{Float64}, ind_idx::Int)
-    return G[ind_idx, ind_idx] - 1.0
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, G[ind_idx, ind_idx] - 1.0, "inbreeding_coefficient")
 end
 
 """
@@ -1911,7 +1952,8 @@ end
 Returns the genomic relatedness coefficient between two individuals from the GRM.
 """
 function relatedness(G::Matrix{Float64}, ind1::Int, ind2::Int)
-    return G[ind1, ind2]
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, G[ind1, ind2], "relatedness")
 end
 
 # --- Coalescent Simulation (ms-style) ---
@@ -2017,10 +2059,8 @@ function simulate_coalescent(n::Int; ne::Real=10000, mu::Real=1e-8, seq_len::Int
         hap_strings[name] = join(string.(hap))
     end
     
-    return tree, hap_strings
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (tree, hap_strings), "simulate_coalescent")
 end
-
-
-
 
 

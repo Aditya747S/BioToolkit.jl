@@ -1,47 +1,151 @@
-# protein.jl
+# `protein.jl` - Protein Property Calculations
 
-## Purpose
-This file implements fast protein property calculations in a table-driven style. It mirrors the kinds of outputs users expect from ExPASy ProtParam without adding heavy dependencies or runtime lookup overhead.
+## Overview
 
-## Main data tables
-- `_AA_MASS_MONO` and `_AA_MASS_AVG` store residue masses for monoisotopic and average molecular weight calculations.
-- `_HYDROPATHICITY` stores Kyte-Doolittle hydropathy scores.
-- `_AA_CODE` and `_AA_CHARS` provide compact amino-acid encoding for fast indexing.
-- `_INSTABILITY_DIWV` stores the Guruprasad dipeptide instability weights used by the instability index calculation.
-- `_PK_NTERM`, `_PK_CTERM`, `_PK_D`, `_PK_E`, `_PK_C`, `_PK_Y`, `_PK_H`, `_PK_K`, and `_PK_R` hold the pK constants used by the isoelectric-point estimator.
+`protein.jl` implements high-performance ProtParam-style protein property calculations using byte-indexed lookup tables.
 
-## Public functions
-- `protein_mass(sequence; type="monoisotopic")` computes molecular weight in Daltons.
-- `extinction_coefficient(sequence)` computes the 280 nm extinction coefficient using the Pace formula.
-- `instability_index(sequence)` computes the Guruprasad instability index.
-- `isoelectric_point(sequence; precision=0.01)` estimates pI using a bisection-style IPC algorithm.
-- `gravy(sequence)` computes the grand average of hydropathicity.
-- `aliphatic_index(sequence)` computes the aliphatic index from Ala, Val, Ile, and Leu content.
-- `protparam(sequence)` returns a bundled summary of the main physicochemical properties.
+### Purpose
 
-## How it is used
-The basic functions work on any amino-acid string and are intended for direct use in annotation or reporting pipelines. For example, `protein_mass` is useful for mass validation, `gravy` and `aliphatic_index` help describe hydrophobicity, and `instability_index` provides a coarse in vitro stability signal.
+Protein analysis often needs quick estimates of mass, extinction coefficient, instability, isoelectric point, hydropathicity, and aliphatic index. This file provides those calculations for `BioSequence{AminoAcidAlphabet}` and string inputs converted to `AASeq`.
 
-`protparam` is the best entry point when a caller wants a single summary object. It performs one pass over the sequence, then returns a `NamedTuple` containing:
-- `length`
-- `molecular_weight_mono`
-- `molecular_weight_avg`
-- `negative_residues`
-- `positive_residues`
-- `extinction_coefficient`
-- `instability_index`
-- `aliphatic_index`
-- `gravy`
-- `isoelectric_point`
+---
 
-## Implementation notes
-- Lookups are intentionally done through 256-element arrays so ASCII residue access stays constant time.
-- Functions throw `ArgumentError` when they encounter unknown residues or invalid input lengths.
-- The module treats protein properties as sequence-level summaries, not as structural predictions.
+## Design Decisions
 
-## Threading notes
-- This module is intentionally left serial: the main operations are already O(n) with very small per-residue work, so `Threads.@threads` would add overhead without a meaningful speedup.
-- If protein summaries are needed in bulk, parallelize at the caller level over many sequences instead of inside these helpers.
+| Decision | Rationale |
+|---|---|
+| **Byte-indexed lookup tables** | 256-element arrays provide O(1) residue lookup with good cache locality. |
+| **Typed protein inputs** | Primary APIs accept `BioSequence{AminoAcidAlphabet}`. |
+| **String compatibility retained** | String overloads convert to `AASeq` for convenience. |
+| **Separate internal calculators** | Public methods handle typing/provenance; `_protein_*` helpers operate on bytes. |
+| **ProtParam conventions** | Calculations follow common ExPASy/ProtParam-style formulas and tables. |
 
-## Why it matters
-Protein descriptors are used throughout annotation, proteomics, and downstream interpretation. This file gives BioToolkit a compact, predictable implementation of the standard sequence statistics people reach for most often.
+---
+
+## 1. Mass
+
+### `protein_mass`
+
+```julia
+protein_mass(sequence; type="monoisotopic")
+```
+
+**Description:** Computes protein molecular mass from amino-acid residue masses.
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `type` | `"monoisotopic"` | `"monoisotopic"` or average mass mode. |
+
+---
+
+## 2. Extinction Coefficient
+
+### `extinction_coefficient`
+
+```julia
+extinction_coefficient(sequence)
+```
+
+**Description:** Estimates extinction coefficient from aromatic/cysteine content using Pace-style constants.
+
+---
+
+## 3. Instability
+
+### `instability_index`
+
+```julia
+instability_index(sequence)
+```
+
+**Description:** Computes the Guruprasad dipeptide instability index from adjacent residue pairs.
+
+---
+
+## 4. Isoelectric Point
+
+### `isoelectric_point`
+
+```julia
+isoelectric_point(sequence; precision=0.01)
+```
+
+**Description:** Estimates protein pI by searching pH values using pK tables.
+
+---
+
+## 5. Hydropathicity
+
+### `gravy`
+
+```julia
+gravy(sequence)
+```
+
+**Description:** Computes GRAVY, the average Kyte-Doolittle hydropathicity.
+
+---
+
+## 6. Aliphatic Index
+
+### `aliphatic_index`
+
+```julia
+aliphatic_index(sequence)
+```
+
+**Description:** Computes Ikai-style aliphatic index from alanine, valine, isoleucine, and leucine content.
+
+---
+
+## 7. Combined ProtParam Summary
+
+### `protparam`
+
+```julia
+protparam(sequence)
+```
+
+**Description:** Returns a combined property summary containing the core protein metrics.
+
+**Typical contents:**
+
+- mass;
+- extinction coefficient;
+- instability index;
+- isoelectric point;
+- GRAVY;
+- aliphatic index.
+
+---
+
+## Quick Reference
+
+| API | Purpose |
+|---|---|
+| `protein_mass` | Monoisotopic or average protein mass. |
+| `extinction_coefficient` | Aromatic/cysteine extinction estimate. |
+| `instability_index` | Dipeptide instability score. |
+| `isoelectric_point` | Estimated pI. |
+| `gravy` | Average hydropathicity. |
+| `aliphatic_index` | Thermostability-related aliphatic index. |
+| `protparam` | Combined protein property summary. |
+
+---
+
+## Complete Usage Example
+
+```julia
+protein = AASeq("MVLSPADKTNVKAAW")
+
+protein_mass(protein)
+extinction_coefficient(protein)
+instability_index(protein)
+isoelectric_point(protein)
+gravy(protein)
+aliphatic_index(protein)
+
+summary = protparam(protein)
+```

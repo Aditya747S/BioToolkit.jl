@@ -1,6 +1,12 @@
 using BigWig
 
-const _HAS_CUDA_QUERY = false
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+
+@inline function _register_query_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
+
+# GPU acceleration is available when the CUDA extension is loaded; see lazy_gpu.jl.
 
 """
     _window_coverage_serial(starts, stops, window_size)
@@ -47,7 +53,7 @@ end
 
 Filter a tabular region using a boolean mask.
 """
-function _filter_region_mask(columns, chrom::AbstractString, min_pos::Integer, max_pos::Integer)
+function _filter_region_mask(columns, chrom::String, min_pos::Integer, max_pos::Integer)
     mask = (columns.chrom .== chrom) .& (columns.pos .>= min_pos) .& (columns.pos .<= max_pos)
     indices = findall(mask)
 
@@ -57,8 +63,7 @@ function _filter_region_mask(columns, chrom::AbstractString, min_pos::Integer, m
         id = columns.id[indices],
         ref = columns.ref[indices],
         alt = columns.alt[indices],
-        qual = columns.qual[indices],
-    )
+        qual = columns.qual[indices])
 end
 
 """
@@ -66,7 +71,7 @@ end
 
 Filter a sorted tabular region using binary search.
 """
-function _filter_region_sorted(columns, chrom::AbstractString, min_pos::Integer, max_pos::Integer)
+function _filter_region_sorted(columns, chrom::String, min_pos::Integer, max_pos::Integer)
     chroms = columns.chrom
     start = searchsortedfirst(chroms, chrom)
     stop = searchsortedlast(chroms, chrom)
@@ -81,8 +86,7 @@ function _filter_region_sorted(columns, chrom::AbstractString, min_pos::Integer,
         id = columns.id[1:0],
         ref = columns.ref[1:0],
         alt = columns.alt[1:0],
-        qual = columns.qual[1:0],
-    )
+        qual = columns.qual[1:0])
 
     first_index = start + pos_start - 1
     last_index = start + pos_stop - 1
@@ -92,8 +96,7 @@ function _filter_region_sorted(columns, chrom::AbstractString, min_pos::Integer,
         id = columns.id[first_index:last_index],
         ref = columns.ref[first_index:last_index],
         alt = columns.alt[first_index:last_index],
-        qual = columns.qual[first_index:last_index],
-    )
+        qual = columns.qual[first_index:last_index])
 end
 
 """
@@ -103,13 +106,17 @@ Filter rows in a genomic table by chromosome and coordinate range.
 """
 function filter_region(
     table,
-    chrom::AbstractString,
+    chrom::String,
     min_pos::Integer,
     max_pos::Integer;
     sorted::Bool=false,
-)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     columns = Tables.columntable(table)
-    return sorted ? _filter_region_sorted(columns, chrom, min_pos, max_pos) : _filter_region_mask(columns, chrom, min_pos, max_pos)
+    result = sorted ? _filter_region_sorted(columns, chrom, min_pos, max_pos) : _filter_region_mask(columns, chrom, min_pos, max_pos)
+
+
+    return _register_query_result!(_ctx, result, "filter_region"; parents=provenance_parent_ids(table), parameters=(chrom=chrom, min_pos=Int(min_pos), max_pos=Int(max_pos), sorted=sorted))
 end
 
 """
@@ -216,14 +223,18 @@ end
 
 Count positions into integer bins, optionally using CUDA.
 """
-function bin_positions(positions, bin_size::Integer; threaded::Bool=true, use_cuda::Bool=false)
+function bin_positions(positions, bin_size::Integer; threaded::Bool=true, use_cuda::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     if use_cuda
         _ensure_cuda_query!()
         positions_cuda = _is_cuda_backed_array(positions) ? positions : CUDA.CuArray{Int}(Int.(positions))
-        return Base.invokelatest(_CUDA_QUERY_BIN_IMPL[], positions_cuda, bin_size)
+        result = Base.invokelatest(_CUDA_QUERY_BIN_IMPL[], positions_cuda, bin_size)
+        return _register_query_result!(_ctx, result, "bin_positions"; parents=provenance_parent_ids(positions), parameters=(bin_size=Int(bin_size), threaded=threaded, use_cuda=use_cuda, bin_count=length(result)))
     end
 
-    return threaded ? _bin_positions_threaded(positions, bin_size) : _bin_positions_serial(positions, bin_size)
+    result = threaded ? _bin_positions_threaded(positions, bin_size) : _bin_positions_serial(positions, bin_size)
+
+
+    return _register_query_result!(_ctx, result, "bin_positions"; parents=provenance_parent_ids(positions), parameters=(bin_size=Int(bin_size), threaded=threaded, use_cuda=use_cuda, bin_count=length(result)))
 end
 
 """
@@ -231,9 +242,12 @@ end
 
 Build a binned coverage histogram from a table of genomic intervals.
 """
-function coverage_histogram(table, chrom::AbstractString, bin_size::Integer; threaded::Bool=true, use_cuda::Bool=false)
-    subset = filter_region(table, chrom, typemin(Int), typemax(Int))
-    return bin_positions(subset.pos, bin_size; threaded=threaded, use_cuda=use_cuda)
+function coverage_histogram(table, chrom::String, bin_size::Integer; threaded::Bool=true, use_cuda::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    subset = filter_region(table, chrom, typemin(Int), typemax(Int); _ctx=_ctx)
+    result = bin_positions(subset.pos, bin_size; threaded=threaded, use_cuda=use_cuda, _ctx=_ctx)
+
+
+    return _register_query_result!(_ctx, result, "coverage_histogram"; parents=provenance_parent_ids(table), parameters=(chrom=chrom, bin_size=Int(bin_size), threaded=threaded, use_cuda=use_cuda, bin_count=length(result)))
 end
 
 """
@@ -241,7 +255,7 @@ end
 
 Compute per-window coverage across genomic intervals.
 """
-function window_coverage(starts, stops, window_size::Integer; threaded::Bool=true, use_cuda::Bool=false)
+function window_coverage(starts, stops, window_size::Integer; threaded::Bool=true, use_cuda::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     window_size <= 0 && throw(ArgumentError("window_size must be positive"))
     length(starts) == length(stops) || throw(ArgumentError("starts and stops must have the same length"))
 
@@ -249,10 +263,14 @@ function window_coverage(starts, stops, window_size::Integer; threaded::Bool=tru
         _ensure_cuda_query!()
         starts_cuda = _is_cuda_backed_array(starts) ? starts : CUDA.CuArray{Int}(Int.(starts))
         stops_cuda = _is_cuda_backed_array(stops) ? stops : CUDA.CuArray{Int}(Int.(stops))
-        return Base.invokelatest(_CUDA_QUERY_WINDOW_IMPL[], starts_cuda, stops_cuda, window_size)
+        result = Base.invokelatest(_CUDA_QUERY_WINDOW_IMPL[], starts_cuda, stops_cuda, window_size)
+        return _register_query_result!(_ctx, result, "window_coverage"; parents=provenance_parent_ids(starts, stops), parameters=(window_size=Int(window_size), threaded=threaded, use_cuda=use_cuda, window_count=length(result)))
     end
 
-    return threaded ? _window_coverage_threaded(starts, stops, window_size) : _window_coverage_serial(starts, stops, window_size)
+    result = threaded ? _window_coverage_threaded(starts, stops, window_size) : _window_coverage_serial(starts, stops, window_size)
+
+
+    return _register_query_result!(_ctx, result, "window_coverage"; parents=provenance_parent_ids(starts, stops), parameters=(window_size=Int(window_size), threaded=threaded, use_cuda=use_cuda, window_count=length(result)))
 end
 
 """
@@ -260,7 +278,7 @@ end
 
 Compute per-window coverage for a filtered chromosome slice.
 """
-function window_coverage(table, chrom::AbstractString, window_size::Integer; sorted::Bool=false, threaded::Bool=true, use_cuda::Bool=false)
+function window_coverage(table, chrom::String, window_size::Integer; sorted::Bool=false, threaded::Bool=true, use_cuda::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     window_size <= 0 && throw(ArgumentError("window_size must be positive"))
 
     columns = Tables.columntable(table)
@@ -276,7 +294,10 @@ function window_coverage(table, chrom::AbstractString, window_size::Integer; sor
         isempty(row_indices) && return Dict{Int,Int}()
     end
 
-    return window_coverage(columns.start[row_indices], columns.stop[row_indices], window_size; threaded=threaded, use_cuda=use_cuda)
+    result = window_coverage(columns.start[row_indices], columns.stop[row_indices], window_size; threaded=threaded, use_cuda=use_cuda, _ctx=_ctx)
+
+
+    return _register_query_result!(_ctx, result, "window_coverage"; parents=provenance_parent_ids(table), parameters=(chrom=chrom, window_size=Int(window_size), sorted=sorted, threaded=threaded, use_cuda=use_cuda, window_count=length(result)))
 end
 
 """
@@ -284,7 +305,7 @@ end
 
 Write a coverage vector to BigWig using run-length encoded spans.
 """
-function _write_bigwig_runs(writer, coverage_vector::AbstractVector{<:Real}; chrom::AbstractString="chr1", start::Integer=1)
+function _write_bigwig_runs(writer, coverage_vector::AbstractVector{<:Real}; chrom::String="chr1", start::Integer=1)
     isempty(coverage_vector) && return nothing
 
     index = firstindex(coverage_vector)
@@ -310,7 +331,7 @@ end
 
 Write a single coverage vector to a BigWig file.
 """
-function write_bigwig(coverage_vector::AbstractVector{<:Real}, output_path::AbstractString; chrom::AbstractString="chr1", start::Integer=1)
+function write_bigwig(coverage_vector::AbstractVector{<:Real}, output_path::String; chrom::String="chr1", start::Integer=1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     open(output_path, "w") do io
         writer = BigWig.Writer(io, [(String(chrom), Int(start) + length(coverage_vector) - 1)])
         try
@@ -319,7 +340,9 @@ function write_bigwig(coverage_vector::AbstractVector{<:Real}, output_path::Abst
             close(writer)
         end
     end
-    return output_path
+
+
+    return _register_query_result!(_ctx, output_path, "write_bigwig"; parents=provenance_parent_ids(coverage_vector), parameters=(chrom=chrom, start=Int(start), output=output_path, span=length(coverage_vector)))
 end
 
 """
@@ -377,11 +400,13 @@ end
 
 Write a chromosome-to-coverage map to a BigWig file.
 """
-function write_bigwig(coverage_vectors::AbstractDict, output_path::AbstractString; starts=1)
+function write_bigwig(coverage_vectors::AbstractDict, output_path::String; starts=1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     open(output_path, "w") do io
         _write_bigwig_coverage_map(io, coverage_vectors; starts=starts)
     end
-    return output_path
+
+
+    return _register_query_result!(_ctx, output_path, "write_bigwig"; parents=provenance_parent_ids(coverage_vectors), parameters=(output=output_path, start_spec=starts isa Integer ? Int(starts) : "dict", chromosome_count=length(coverage_vectors)))
 end
 
 """
@@ -407,6 +432,7 @@ Return the half-open length of an interval.
 """
 function interval_length(start::Integer, stop::Integer)
     start, stop = normalize_interval(start, stop)
+
     return max(0, stop - start)
 end
 
@@ -424,6 +450,7 @@ Test whether a position falls inside a half-open interval.
 """
 function interval_contains(start::Integer, stop::Integer, position::Integer)
     start, stop = normalize_interval(start, stop)
+
     return start <= position < stop
 end
 
@@ -442,6 +469,7 @@ Test whether two half-open intervals overlap.
 function interval_overlaps(left_start::Integer, left_stop::Integer, right_start::Integer, right_stop::Integer)
     left_start, left_stop = normalize_interval(left_start, left_stop)
     right_start, right_stop = normalize_interval(right_start, right_stop)
+
     return max(left_start, right_start) < min(left_stop, right_stop)
 end
 
@@ -461,6 +489,7 @@ function interval_intersection(left_start::Integer, left_stop::Integer, right_st
     interval_overlaps(left_start, left_stop, right_start, right_stop) || return nothing
     left_start, left_stop = normalize_interval(left_start, left_stop)
     right_start, right_stop = normalize_interval(right_start, right_stop)
+
     return max(left_start, right_start), min(left_stop, right_stop)
 end
 
@@ -481,6 +510,7 @@ function interval_union(left_start::Integer, left_stop::Integer, right_start::In
     right_start, right_stop = normalize_interval(right_start, right_stop)
     left_stop < right_start && return nothing
     right_stop < left_start && return nothing
+
     return min(left_start, right_start), max(left_stop, right_stop)
 end
 
@@ -515,6 +545,7 @@ function merge_intervals(intervals::AbstractVector{<:Tuple{<:Integer,<:Integer}}
     end
 
     push!(merged, (current_start, current_stop))
+
     return merged
 end
 

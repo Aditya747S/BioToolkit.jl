@@ -17,6 +17,7 @@ Order = [:type, :function]
 Modules = [BioToolkit]
 Pages = [
     "align.jl",
+    "longread.jl",
     "msa.jl",
     "substitution_matrices_data.jl",
     "motif.jl"
@@ -28,7 +29,8 @@ Order = [:type, :function]
 ```@autodocs
 Modules = [BioToolkit]
 Pages = [
-    "structure.jl"
+    "structure.jl",
+    "coevolution.jl"
 ]
 Order = [:type, :function]
 ```
@@ -69,6 +71,7 @@ Pages = [
     "metabolomics.jl",
     "microbiome.jl",
     "singlecell.jl",
+    "spatial.jl",
     "systemsbio.jl",
     "clinical.jl"
 ]
@@ -80,6 +83,7 @@ Order = [:type, :function]
 Modules = [BioToolkit]
 Pages = [
     "databases.jl",
+    "pipeline.jl",
     "search.jl",
     "query.jl",
     "bioplotting.jl",

@@ -10,13 +10,14 @@ using BioToolkit
         exon_block  = "GCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGCGC" # High GC coding signature
         noise_right = "TAATTTTAATAATATATATAAATTTTAATAATATATATAAT"
         
-        seq = noise_left * exon_block * noise_right
+        seq = BioToolkit.DNASeq(noise_left * exon_block * noise_right)
         
         genes = predict_genes_hmm(seq; p_coding=0.05)
         
         # It should cleanly isolate the single `exon_block` as a Tuple bounds
         @test length(genes) == 1
         start, stop = genes[1]
+            @test all(gene -> gene isa BioToolkit.GeneInterval, genes)
         
         # Since Viterbi boundaries aren't an absolute hard knife cut, 
         # mathematically they'll be very close to the exon_block region (~ idx 42)
@@ -27,16 +28,18 @@ using BioToolkit
     
     @testset "Pure Noise Filtering" begin
         # A sequence completely devoid of GC chunks
-        seq = "ATATAAATTTTAAATATATATAAATTTTAAATATATATAAT"
+        seq = BioToolkit.DNASeq("ATATAAATTTTAAATATATATAAATTTTAAATATATATAAT")
         
         genes = predict_genes_hmm(seq; p_coding=1e-5)
+            @test all(gene -> gene isa BioToolkit.GeneInterval, genes)
         # Should not find any genes as it stays in State 1
         @test isempty(genes)
     end
     
     @testset "Edge Cases" begin
         # Blank sequence
-        genes = predict_genes_hmm("")
+        genes = predict_genes_hmm(BioToolkit.DNASeq(""))
+            @test genes isa Vector{BioToolkit.GeneInterval}
         @test isempty(genes)
     end
 end

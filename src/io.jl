@@ -1,10 +1,358 @@
+# ==============================================================================
+# io.jl — Biological Format I/O
+#
+# Provides high-performance, scientific-grade parsers and writers for common
+# bioinformatics formats (FASTA, FASTQ, VCF, BED, GFF3, GenBank).
+#
+# Design decisions:
+#   - Specialized BioAlphabet dispatch for sequence formats.
+#   - Automatic alphabet inference for untyped reads.
+#   - Byte-level scanning for performance.
+#   - Samtools-compatible .fai indexing for random access.
+# ==============================================================================
+
+# ─── FASTA I/O ────────────────────────────────────────────────────────────────
+
+"""
+    read_fasta(path; alphabet=nothing) -> Vector{SeqRecord{A}}
+
+Read all FASTA records from a file. If `alphabet` is not specified, it is
+inferred from the frequency of characters in the first record.
+"""
+function read_fasta(path::String; alphabet::Type{<:BioAlphabet}=DNAAlphabet, prov_ctx=nothing)
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    _ctx = active_provenance_context(prov_ctx)
+    return read_fasta(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+end
+
+function read_fasta(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fasta") where {A <: BioAlphabet}
+    records = SeqRecord{A}[]
+    header = ""
+    sequence_data = UInt8[]
+    seen_header = false
+
+    for line in eachline(io)
+        stripped = strip(line)
+        isempty(stripped) && continue
+        if startswith(stripped, '>')
+            if !isempty(header)
+                push!(records, SeqRecord(BioSequence{A}(sequence_data; validate=false), identifier=header))
+            end
+            header = String(stripped[2:end])
+            sequence_data = UInt8[]
+            seen_header = true
+        else
+            seen_header || throw(ArgumentError("FASTA sequence data before header"))
+            append!(sequence_data, codeunits(uppercase(stripped)))
+        end
+    end
+
+    if !isempty(header)
+        push!(records, SeqRecord(BioSequence{A}(sequence_data; validate=false), identifier=header))
+    end
+
+    if provenance_hash !== nothing
+        for record in records
+            record.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
+        end
+    end
+
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_fasta"; parents=String[], parameters=(source=provenance_source, alphabet=string(alphabet), record_count=length(records), hash=provenance_hash))
+        for (index, record) in enumerate(records)
+        register_container_provenance!(_ctx, record, "read_fasta_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
+        end
+    end
+
+    return records
+end
+
+"""
+    write_fasta(path, records)
+"""
+@inline function _materialize_records_for_provenance(records, _ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext})
+    _ctx === nothing && return records
+    return records isa AbstractArray ? records : collect(records)
+end
+
+function _register_path_write_provenance!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, operation::AbstractString, output::AbstractString, parents::AbstractVector{<:AbstractString}; record_count::Union{Nothing,Int}=nothing, provenance_hash::Union{Nothing,AbstractString}=nothing)
+    _ctx === nothing && return nothing
+    parameters = Dict{Symbol,Any}(:output => String(output))
+    record_count === nothing || (parameters[:record_count] = record_count)
+    provenance_hash === nothing || (parameters[:hash] = String(provenance_hash))
+    register_provenance!(_ctx, operation; parents=parents, parameters=parameters)
+    return nothing
+end
+
+function write_fasta(path::String, records; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    materialized = _materialize_records_for_provenance(records, _ctx)
+    open(path, "w") do io
+        for record in materialized
+            write(io, ">", record.identifier, "\n")
+            # Break sequence into 60-char lines
+            data = record.sequence.data
+            for i in 1:60:length(data)
+                write(io, view(data, i:min(i+59, length(data))), "\n")
+            end
+        end
+    end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        _register_path_write_provenance!(_ctx, "write_fasta", path, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
+    end
+    
+    return path
+end
+
+# ─── FASTQ I/O ────────────────────────────────────────────────────────────────
+
+"""
+    read_fastq(path; alphabet=DNAAlphabet) -> Vector{FastqRecord{A}}
+"""
+function read_fastq(path::String; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing) where {A <: BioAlphabet}
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return read_fastq(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+end
+
+function read_fastq(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fastq") where {A <: BioAlphabet}
+    records = FastqRecord{A}[]
+    while !eof(io)
+        line1 = strip(readline(io))
+        isempty(line1) && break
+        line1[1] == '@' || throw(ArgumentError("Malformed FASTQ: expected '@'"))
+
+        line2 = strip(readline(io))
+        line3 = strip(readline(io))
+        line3[1] == '+' || throw(ArgumentError("Malformed FASTQ: expected '+'"))
+
+        line4 = strip(readline(io))
+
+        sequence = BioSequence{A}(String(line2))
+        header = String(line1[2:end])
+        identifier = _fastq_identifier(header)
+        push!(records, FastqRecord(sequence, String(line4); identifier=identifier, description=header))
+    end
+
+    if provenance_hash !== nothing
+        for record in records
+            record.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
+        end
+    end
+
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_fastq"; parents=String[], parameters=(source=provenance_source, alphabet=string(alphabet), record_count=length(records), hash=provenance_hash))
+        for (index, record) in enumerate(records)
+        register_container_provenance!(_ctx, record, "read_fastq_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
+        end
+    end
+
+    return records
+end
+
+@inline function _fastq_identifier(header::String)
+    space_index = findfirst(isspace, header)
+    space_index === nothing && return String(header)
+    return String(header[firstindex(header):prevind(header, space_index)])
+end
+
+@inline function _fastq_quality_string(quality)
+    quality isa String && return String(quality)
+    return String(UInt8[UInt8(character) for character in quality])
+end
+
+@inline function _fastq_components(record)
+    throw(ArgumentError("unsupported FASTQ record type: $(typeof(record))"))
+end
+
+"""
+    write_fastq(path, records)
+"""
+function write_fastq(path::String, records; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    materialized = _materialize_records_for_provenance(records, _ctx)
+    open(path, "w") do io
+        for record in materialized
+            identifier, description, sequence, quality = _fastq_components(record)
+            header = isempty(description) ? identifier : description
+            write(io, "@", header, "\n")
+            write(io, sequence, "\n+\n")
+            write(io, quality, "\n")
+        end
+    end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(path)))
+        _register_path_write_provenance!(_ctx, "write_fastq", path, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
+    end
+    
+    return path
+end
+
+# ─── Variant/Interval I/O (VCF, BED, GFF3) ────────────────────────────────────
+
+function _load_optional_module(module_name::Symbol)
+    isdefined(@__MODULE__, module_name) && return getfield(@__MODULE__, module_name)
+    try
+        Base.eval(@__MODULE__, Expr(:import, module_name))
+    catch
+        return nothing
+    end
+    return getfield(@__MODULE__, module_name)
+end
+
+function _open_vcf_input(path::String, f)
+    if endswith(lowercase(path), ".gz")
+        codec = _load_optional_module(:CodecZlib)
+        codec === nothing && throw(ArgumentError("reading .vcf.gz requires CodecZlib.jl"))
+        open(path, "r") do raw
+            stream = codec.GzipDecompressorStream(raw)
+            try
+                return f(stream)
+            finally
+                close(stream)
+            end
+        end
+    end
+
+    open(path, "r") do io
+        return f(io)
+    end
+end
+
+function _open_vcf_output(path::String, f)
+    if endswith(lowercase(path), ".gz")
+        codec = _load_optional_module(:CodecZlib)
+        codec === nothing && throw(ArgumentError("writing .vcf.gz requires CodecZlib.jl"))
+        open(path, "w") do raw
+            stream = codec.GzipCompressorStream(raw)
+            try
+                return f(stream)
+            finally
+                close(stream)
+            end
+        end
+    end
+
+    open(path, "w") do io
+        return f(io)
+    end
+end
+
+@inline function _split_vcf_fields(line::AbstractString)
+    stripped = strip(String(line))
+    isempty(stripped) && return String[]
+    return Base.split(chomp(stripped), '\t'; keepempty=true)
+end
+
+@inline function _parse_vcf_qual(field::AbstractString)
+    stripped = strip(String(field))
+    isempty(stripped) && return missing
+    stripped == "." && return missing
+    parsed = tryparse(Float64, stripped)
+    parsed === nothing && throw(ArgumentError("invalid VCF QUAL value: $(field)"))
+    return Float32(parsed)
+end
+
+function _vcf_header_columns(header::Union{Nothing,VcfHeader}, sample_names::Vector{String})
+    if header === nothing || isempty(header.columns)
+        columns = String["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"]
+    else
+        columns = copy(header.columns)
+    end
+
+    if isempty(sample_names)
+        return columns
+    end
+
+    if length(columns) == 8
+        return vcat(columns, ["FORMAT"], sample_names)
+    elseif length(columns) == 9
+        return vcat(columns, sample_names)
+    elseif length(columns) >= 10
+        return columns
+    end
+
+    return vcat(String["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"], ["FORMAT"], sample_names)
+end
+
+function _vcf_sample_names(header::Union{Nothing,VcfHeader}, records::AbstractVector{<:VariantTextRecord})
+    if header !== nothing && !isempty(header.sample_names)
+        return copy(header.sample_names)
+    end
+
+    sample_count = isempty(records) ? 0 : maximum(length(record.samples) for record in records)
+    return ["sample_$(index)" for index in 1:sample_count]
+end
+
+function _write_vcf_header(io::IO, header::Union{Nothing,VcfHeader}, sample_names::Vector{String})
+    if header === nothing || isempty(header.meta_lines)
+        println(io, "##fileformat=VCFv4.2")
+    else
+        has_fileformat = any(startswith(line, "##fileformat=") for line in header.meta_lines)
+        for line in header.meta_lines
+            println(io, line)
+        end
+        has_fileformat || println(io, "##fileformat=VCFv4.2")
+    end
+
+    println(io, join(_vcf_header_columns(header, sample_names), '\t'))
+    return nothing
+end
+
+function _vcf_record_fields(record::VariantTextRecord, sample_count::Int)
+    fields = String[
+        record.chrom,
+        string(record.pos),
+        record.id,
+        record.ref,
+        record.alt,
+        record.qual === missing ? "." : string(record.qual),
+        isempty(record.filter) ? "PASS" : record.filter,
+        isempty(record.info) ? "." : record.info,
+    ]
+
+    if sample_count > 0
+        push!(fields, isempty(record.format) ? "GT" : record.format)
+        samples = copy(record.samples)
+        if length(samples) > sample_count
+            throw(DimensionMismatch("VCF record sample count mismatch"))
+        elseif length(samples) < sample_count
+            append!(samples, fill(".", sample_count - length(samples)))
+        end
+        append!(fields, samples)
+    end
+
+    return fields
+end
+
+function _write_vcf_records(io::IO, records::AbstractVector{<:VariantTextRecord}; header::Union{Nothing,VcfHeader}=nothing)
+    sample_names = _vcf_sample_names(header, records)
+    _write_vcf_header(io, header, sample_names)
+    sample_count = length(sample_names)
+
+    for record in records
+        println(io, join(_vcf_record_fields(record, sample_count), '\t'))
+    end
+
+    return nothing
+end
+
 """
     parse_vcf_record(line)
 
 Parse a single VCF text line into a structured variant record.
 """
-function parse_vcf_record(line::AbstractString)
-    fields = Base.split(line, '\t'; limit=7)
+function parse_vcf_record(line::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    fields = _split_vcf_fields(line)
     length(fields) < 6 && return nothing
 
     try
@@ -14,9 +362,12 @@ function parse_vcf_record(line::AbstractString)
         id = fields[3]
         ref = fields[4]
         alt = fields[5]
-        qual = fields[6] == "." ? missing : Float32(parse(Float64, fields[6]))
-
-        return VariantTextRecord(chrom, pos, id, ref, alt, qual)
+        qual = _parse_vcf_qual(fields[6])
+        filter = length(fields) >= 7 ? (isempty(fields[7]) ? "." : fields[7]) : "PASS"
+        info = length(fields) >= 8 ? (isempty(fields[8]) ? "." : fields[8]) : "."
+        format = length(fields) >= 9 ? fields[9] : ""
+        samples = length(fields) >= 10 ? String.(fields[10:end]) : String[]
+        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=info, format=format, samples=samples)
     catch err
         err isa ArgumentError && rethrow()
         throw(ArgumentError("malformed VCF record: $(line)"))
@@ -24,32 +375,127 @@ function parse_vcf_record(line::AbstractString)
 end
 
 """
-    read_vcf(input)
+    read_vcf_document(input)
 
-Read VCF records from a file path.
+Read a full VCF document, including header metadata and parsed records.
 """
-function read_vcf(input::AbstractString)
-    open(input, "r") do io
-        return read_vcf(io)
-    end
+function read_vcf_document(input::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    raw_bytes = read(input)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return _open_vcf_input(input, io -> begin
+
+        return read_vcf_document(io, provenance_hash, input; _ctx=_ctx)
+    end)
 end
 
 """
-    read_vcf(io)
+    read_vcf_document(io)
 
-Read VCF records from an IO stream.
+Read a full VCF document, including header metadata and parsed records.
 """
-function read_vcf(io::IO)
+function read_vcf_document(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_vcf_document"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    meta_lines = String[]
+    columns = String[]
     records = VariantTextRecord[]
 
     for raw_line in eachline(io)
-        startswith(raw_line, '#') && continue
-        record = parse_vcf_record(raw_line)
+        line = strip(chomp(String(raw_line)))
+        isempty(line) && continue
+        if startswith(line, "##")
+            push!(meta_lines, line)
+            continue
+        elseif startswith(line, "#CHROM")
+            columns = Base.split(line, '\t'; keepempty=true)
+            continue
+        end
+
+        record = parse_vcf_record(line)
         record === nothing && continue
         push!(records, record)
     end
 
-    return records
+    sample_names = length(columns) >= 10 ? String.(columns[10:end]) : String[]
+    inferred_samples = isempty(records) ? 0 : maximum(length(record.samples) for record in records)
+    if isempty(columns)
+        if inferred_samples > 0
+            sample_names = ["sample_$(index)" for index in 1:inferred_samples]
+            columns = vcat(String["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"], sample_names)
+        else
+            columns = String["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"]
+        end
+    elseif length(columns) == 8 && inferred_samples > 0
+        sample_names = ["sample_$(index)" for index in 1:inferred_samples]
+        columns = vcat(columns, ["FORMAT"], sample_names)
+    elseif length(columns) == 9 && inferred_samples > 0 && isempty(sample_names)
+        sample_names = ["sample_$(index)" for index in 1:inferred_samples]
+        columns = vcat(columns, sample_names)
+    end
+
+    header = VcfHeader(meta_lines, columns, sample_names)
+    document = VcfDocument(header, records)
+    if provenance_hash !== nothing
+        document.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
+        for record in document.records
+            record.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
+        end
+    end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_vcf_document"; parents=String[], parameters=(source=provenance_source, record_count=length(records), sample_count=length(sample_names), hash=provenance_hash))
+        register_container_provenance!(_ctx, document, "read_vcf_document"; parents=[root.id], parameters=(source=provenance_source, record_count=length(records), sample_count=length(sample_names)), provenance_hash=provenance_hash)
+        for (index, record) in enumerate(document.records)
+        register_container_provenance!(_ctx, record, "read_vcf_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, chrom=record.chrom, pos=record.pos), provenance_hash=provenance_hash)
+        end
+    end
+    return document
+end
+
+"""
+    read_vcf(input)
+
+Read VCF records from a file path or IO stream.
+"""
+function read_vcf(input::String; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return read_vcf_document(input; _ctx=_ctx).records
+end
+
+function read_vcf(io::IO; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return read_vcf_document(io; _ctx=_ctx).records
+end
+
+"""
+    write_vcf_document(output, doc)
+
+Write a full VCF document to a file path.
+"""
+function write_vcf_document(output::String, doc::VcfDocument; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _open_vcf_output(output, io -> begin
+        return write_vcf_document(io, doc; _ctx=nothing)
+    end)
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output)))
+        _register_path_write_provenance!(_ctx, "write_vcf_document", output, provenance_parent_ids(doc, doc.records); record_count=length(doc.records), provenance_hash=provenance_hash)
+    end
+    
+    return result
+end
+
+"""
+    write_vcf_document(io, doc)
+
+Write a full VCF document to an IO stream.
+"""
+function write_vcf_document(io::IO, doc::VcfDocument; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    _write_vcf_records(io, doc.records; header=doc.header)
+    _ctx = active_provenance_context(_ctx)
+    return nothing
 end
 
 """
@@ -57,27 +503,36 @@ end
 
 Write VCF records to a file path.
 """
-function write_vcf(output::AbstractString, records)
-    open(output, "w") do io
-        write_vcf(io, records)
+function write_vcf(output::String, records::AbstractVector{<:VariantTextRecord}; header::Union{Nothing,VcfHeader}=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    materialized = _materialize_records_for_provenance(records, _ctx)
+    result = _open_vcf_output(output, io -> begin
+        return write_vcf(io, materialized; header=header, _ctx=_ctx)
+    end)
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output)))
+        _register_path_write_provenance!(_ctx, "write_vcf", output, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
     end
-
-    return output
+    
+    return result
 end
 
-"""
-    write_vcf(io, records)
-
-Write VCF records to an IO stream.
-"""
-function write_vcf(io::IO, records)
-    for record in records
-        qual = record.qual === missing ? "." : string(record.qual)
-        # Performance: single print per record avoids many small syscalls
-        print(io, record.chrom, '\t', record.pos, '\t', record.id, '\t',
-                  record.ref, '\t', record.alt, '\t', qual, '\n')
-    end
+function write_vcf(io::IO, records::AbstractVector{<:VariantTextRecord}; header::Union{Nothing,VcfHeader}=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    _write_vcf_records(io, records; header=header)
+    _ctx = active_provenance_context(_ctx)
     return nothing
+end
+
+function write_vcf(output::String, doc::VcfDocument; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+
+
+    return write_vcf_document(output, doc; _ctx=_ctx)
+end
+
+function write_vcf(io::IO, doc::VcfDocument; prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    return write_vcf_document(io, doc; _ctx=nothing)
 end
 
 """
@@ -165,17 +620,16 @@ end
 Construct a normalized GFF record from text or parsed components.
 """
 function GffRecord(
-    chrom::AbstractString,
-    source::AbstractString,
-    feature::AbstractString,
+    chrom::String,
+    source::String,
+    feature::String,
     start::Integer,
     stop::Integer,
     score::Union{Missing,Float32},
-    strand::AbstractString,
+    strand::String,
     phase::Union{Missing,Int8},
-    attributes::AbstractString,
-    attribute_map::AbstractDict=Dict{String,Vector{String}}(),
-)
+    attributes::String,
+    attribute_map::AbstractDict=Dict{String,Vector{String}}())
     return GffRecord(
         String(chrom),
         String(source),
@@ -186,8 +640,7 @@ function GffRecord(
         String(strand),
         phase,
         String(attributes),
-        Dict{String,Vector{String}}(attribute_map),
-    )
+        Dict{String,Vector{String}}(attribute_map))
 end
 
 """
@@ -211,19 +664,17 @@ function Base.:(==)(left::GenBankFeature, right::GenBankFeature)
     return isequal(left.key, right.key) && isequal(left.location, right.location) && isequal(left.qualifiers, right.qualifiers) && isequal(left.parsed_location, right.parsed_location)
 end
 
-GenBankFeature(key::AbstractString, location::AbstractString, qualifiers::AbstractDict=Dict{String,Vector{String}}()) = GenBankFeature(
+GenBankFeature(key::String, location::String, qualifiers::AbstractDict=Dict{String,Vector{String}}()) = GenBankFeature(
     String(key),
     String(location),
     Dict{String,Vector{String}}(qualifiers),
-    nothing,
-)
+    nothing)
 
-GenBankFeature(key::AbstractString, location::AbstractString, qualifiers::AbstractDict, parsed_location) = GenBankFeature(
+GenBankFeature(key::String, location::String, qualifiers::AbstractDict, parsed_location) = GenBankFeature(
     String(key),
     String(location),
     Dict{String,Vector{String}}(qualifiers),
-    parsed_location,
-)
+    parsed_location)
 
 """
     GenBankRecord
@@ -240,8 +691,9 @@ struct GenBankRecord
     source::String
     organism::String
     comment::String
-    sequence::String
+    sequence::BioSequence
     features::Vector{GenBankFeature}
+    metadata::Dict{Symbol,Any}
 end
 
 """
@@ -250,7 +702,11 @@ end
 Test two GenBank records for value equality.
 """
 function Base.:(==)(left::GenBankRecord, right::GenBankRecord)
-    return isequal(left.locus, right.locus) && isequal(left.locus_line, right.locus_line) && isequal(left.definition, right.definition) && isequal(left.accession, right.accession) && isequal(left.version, right.version) && isequal(left.keywords, right.keywords) && isequal(left.source, right.source) && isequal(left.organism, right.organism) && isequal(left.comment, right.comment) && isequal(left.sequence, right.sequence) && isequal(left.features, right.features)
+    return isequal(left.locus, right.locus) && isequal(left.locus_line, right.locus_line) && isequal(left.definition, right.definition) && isequal(left.accession, right.accession) && isequal(left.version, right.version) && isequal(left.keywords, right.keywords) && isequal(left.source, right.source) && isequal(left.organism, right.organism) && isequal(left.comment, right.comment) && isequal(left.sequence, right.sequence) && isequal(left.features, right.features) && isequal(left.metadata, right.metadata)
+end
+
+function Base.show(io::IO, record::GenBankRecord)
+    print(io, "GenBankRecord(", record.locus, ", ", length(record.sequence), " bp, ", container_provenance_summary(record), ")")
 end
 
 """
@@ -265,12 +721,27 @@ function GenBankRecord(
     version::AbstractString,
     source::AbstractString,
     organism::AbstractString,
-    sequence::AbstractString,
+    sequence,
     features::AbstractVector{GenBankFeature},
     locus_line::AbstractString="",
     keywords::AbstractString="",
     comment::AbstractString="",
-)
+    metadata::AbstractDict=Dict{Symbol,Any}())
+    sequence_typed = if sequence isa BioSequence
+        sequence
+    else
+        sequence_text = String(sequence)
+        if isempty(sequence_text) || validate_sequence(DNAAlphabet, sequence_text)
+            BioSequence{DNAAlphabet}(sequence_text)
+        elseif validate_sequence(RNAAlphabet, sequence_text)
+            BioSequence{RNAAlphabet}(sequence_text)
+        elseif validate_sequence(AminoAcidAlphabet, sequence_text)
+            BioSequence{AminoAcidAlphabet}(sequence_text)
+        else
+            throw(ArgumentError("cannot infer alphabet for GenBank sequence"))
+        end
+    end
+
     return GenBankRecord(
         String(locus),
         String(locus_line),
@@ -281,9 +752,13 @@ function GenBankRecord(
         String(source),
         String(organism),
         String(comment),
-        String(sequence),
+        sequence_typed,
         features isa Vector{GenBankFeature} ? features : GenBankFeature[feature for feature in features],
-    )
+        begin
+            metadata_copy = Dict{Symbol,Any}(metadata)
+            ensure_provenance_id!(metadata_copy)
+            metadata_copy
+        end)
 end
 
 """
@@ -301,7 +776,7 @@ struct GenBankArrowRecord
     source::String
     organism::String
     comment::String
-    sequence::String
+    sequence_text::String
     feature_count::Int32
     feature_keys::String
     feature_locations::String
@@ -315,7 +790,7 @@ const _GENBANK_FEATURE_QUALIFIER_PREFIX = "                     "
 
 Parse a single BED text line into a BED record.
 """
-function parse_bed_record(line::AbstractString)
+function parse_bed_record(line::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     fields = Base.split(strip(line), '\t'; limit=4)
     length(fields) < 3 && return nothing
 
@@ -337,10 +812,15 @@ end
 
 Read BED records from a file path.
 """
-function read_bed(input::AbstractString)
-    open(input, "r") do io
-        return read_bed(io)
+function read_bed(input::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(input, "r") do io
+            return read_bed(io)
+        end
     end
+    raw_bytes = read(input)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return read_bed(IOBuffer(raw_bytes), provenance_hash, input; _ctx=_ctx)
 end
 
 """
@@ -348,7 +828,7 @@ end
 
 Read BED records from an IO stream.
 """
-function read_bed(io::IO)
+function read_bed(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_bed"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = BedRecord[]
 
     for (line_number, raw_line) in enumerate(eachline(io))
@@ -362,6 +842,8 @@ function read_bed(io::IO)
         push!(records, record)
     end
 
+    _ctx = active_provenance_context(_ctx)
+    _ctx !== nothing && register_provenance!(_ctx, "read_bed"; parents=String[], parameters=(source=provenance_source, record_count=length(records), hash=provenance_hash))
     return records
 end
 
@@ -370,11 +852,18 @@ end
 
 Write BED records to a file path.
 """
-function write_bed(output::AbstractString, records)
+function write_bed(output::String, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    materialized = _materialize_records_for_provenance(records, _ctx)
     open(output, "w") do io
-        write_bed(io, records)
+        write_bed(io, materialized; _ctx=nothing)
     end
 
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output)))
+        _register_path_write_provenance!(_ctx, "write_bed", output, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
+    end
+    
     return output
 end
 
@@ -383,10 +872,11 @@ end
 
 Write BED records to an IO stream.
 """
-function write_bed(io::IO, records)
+function write_bed(io::IO, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     for record in records
         print(io, record.chrom, '\t', record.start, '\t', record.stop, '\n')
     end
+    _ctx = active_provenance_context(_ctx)
     return nothing
 end
 
@@ -395,7 +885,7 @@ end
 
 Parse a single GFF3 text line into a structured record.
 """
-function parse_gff_record(line::AbstractString)
+function parse_gff_record(line::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     first_index = firstindex(line)
     tab1 = findnext('\t', line, first_index)
     tab1 === nothing && return nothing
@@ -430,11 +920,16 @@ function parse_gff_record(line::AbstractString)
         strand in ("+", "-", ".") || throw(ArgumentError("GFF strand must be +, -, or ."))
 
         phase_field = SubString(line, nextind(line, tab7), prevind(line, tab8))
-        phase = phase_field == "." ? missing : Int8(parse(Int, phase_field))
+        if phase_field == "."
+            phase = missing
+        else
+            phase_value = parse(Int, phase_field)
+            0 <= phase_value <= 2 || throw(ArgumentError("GFF phase must be 0, 1, or 2"))
+            phase = Int8(phase_value)
+        end
 
         attributes = SubString(line, nextind(line, tab8), lastindex(line))
         attribute_map = _parse_gff_attributes(attributes)
-
         return GffRecord(chrom, source, feature, Int32(start), Int32(stop), score, strand, phase, attributes, attribute_map)
     catch err
         err isa ArgumentError && rethrow()
@@ -447,10 +942,15 @@ end
 
 Read GFF records from a file path.
 """
-function read_gff(input::AbstractString)
-    open(input, "r") do io
-        return read_gff(io)
+function read_gff(input::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(input, "r") do io
+            return read_gff(io)
+        end
     end
+    raw_bytes = read(input)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return read_gff(IOBuffer(raw_bytes), provenance_hash, input; _ctx=_ctx)
 end
 
 """
@@ -458,7 +958,7 @@ end
 
 Read GFF records from an IO stream.
 """
-function read_gff(io::IO)
+function read_gff(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_gff"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = GffRecord[]
 
     for (line_number, raw_line) in enumerate(eachline(io))
@@ -472,6 +972,8 @@ function read_gff(io::IO)
         push!(records, record)
     end
 
+    _ctx = active_provenance_context(_ctx)
+    _ctx !== nothing && register_provenance!(_ctx, "read_gff"; parents=String[], parameters=(source=provenance_source, record_count=length(records), hash=provenance_hash))
     return records
 end
 
@@ -480,11 +982,18 @@ end
 
 Write GFF records to a file path.
 """
-function write_gff(output::AbstractString, records)
+function write_gff(output::String, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    materialized = _materialize_records_for_provenance(records, _ctx)
     open(output, "w") do io
-        write_gff(io, records)
+        write_gff(io, materialized; _ctx=nothing)
     end
 
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output)))
+        _register_path_write_provenance!(_ctx, "write_gff", output, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
+    end
+    
     return output
 end
 
@@ -493,7 +1002,7 @@ end
 
 Write GFF records to an IO stream.
 """
-function write_gff(io::IO, records)
+function write_gff(io::IO, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     for record in records
         score = record.score === missing ? "." : string(record.score)
         phase = record.phase === missing ? "." : string(record.phase)
@@ -502,6 +1011,7 @@ function write_gff(io::IO, records)
                   record.start, '\t', record.stop, '\t', score, '\t',
                   record.strand, '\t', phase, '\t', attributes, '\n')
     end
+    _ctx = active_provenance_context(_ctx)
     return nothing
 end
 
@@ -542,7 +1052,7 @@ end
 
 Parse a GenBank flat-file record from its raw text lines.
 """
-function parse_genbank_record(lines::AbstractVector{<:AbstractString})
+function parse_genbank_record(lines::AbstractVector{<:String})
     isempty(lines) && return nothing
 
     locus = ""
@@ -698,20 +1208,18 @@ function parse_genbank_record(lines::AbstractVector{<:AbstractString})
     if endswith(keywords_text, ".")
         keywords_text = strip(keywords_text[1:end-1])
     end
-
     return GenBankRecord(
         locus,
-        locus_line,
         String(take!(definition)),
         accession,
         version,
-        keywords_text,
         String(take!(source)),
         String(take!(organism)),
-        String(take!(comment)),
         String(take!(sequence)),
         features,
-    )
+        locus_line,
+        keywords_text,
+        String(take!(comment)))
 end
 
 """
@@ -719,7 +1227,7 @@ end
 
 Wrap a GenBank text field to the expected line width.
 """
-function _wrap_genbank_text(prefix::AbstractString, text::AbstractString; continuation_prefix::AbstractString=repeat(" ", ncodeunits(prefix)), width::Int=79, empty_text::AbstractString="")
+function _wrap_genbank_text(prefix::String, text::String; continuation_prefix::String=repeat(" ", ncodeunits(prefix)), width::Int=79, empty_text::String="")
     payload = strip(text)
     isempty(payload) && return isempty(empty_text) ? String[] : [string(prefix, empty_text)]
 
@@ -757,7 +1265,7 @@ end
 Render the LOCUS line for a GenBank record.
 """
 function _format_genbank_locus_line(record::GenBankRecord)
-    isempty(strip(record.locus_line)) && return string("LOCUS       ", rpad(record.locus, 16), lpad(string(ncodeunits(record.sequence)), 11), " bp    DNA     linear   UNK")
+    isempty(strip(record.locus_line)) && return string("LOCUS       ", rpad(record.locus, 16), lpad(string(length(record.sequence)), 11), " bp    DNA     linear   UNK")
     return record.locus_line
 end
 
@@ -766,7 +1274,7 @@ end
 
 Write a wrapped GenBank text section to an IO stream.
 """
-function _write_genbank_wrapped_section(io::IO, prefix::AbstractString, text::AbstractString; continuation_prefix::AbstractString=repeat(" ", ncodeunits(prefix)), width::Int=79, empty_text::AbstractString="")
+function _write_genbank_wrapped_section(io::IO, prefix::String, text::String; continuation_prefix::String=repeat(" ", ncodeunits(prefix)), width::Int=79, empty_text::String="")
     for line in _wrap_genbank_text(prefix, text; continuation_prefix=continuation_prefix, width=width, empty_text=empty_text)
         isempty(line) && continue
         println(io, line)
@@ -793,10 +1301,11 @@ end
 
 Render a GenBank ORIGIN sequence block.
 """
-function _render_genbank_sequence(sequence::AbstractString)
+function _render_genbank_sequence(sequence::BioSequence)
+    sequence_text = String(sequence)
     buffer = IOBuffer()
-    for index in 1:60:length(sequence)
-        chunk = sequence[index:min(index + 59, lastindex(sequence))]
+    for index in 1:60:length(sequence_text)
+        chunk = sequence_text[index:min(index + 59, lastindex(sequence_text))]
         print(buffer, lpad(string(div(index - 1, 60) + 1), 9), " ")
         for chunk_index in 1:10:length(chunk)
             print(buffer, lowercase(chunk[chunk_index:min(chunk_index + 9, lastindex(chunk))]), ' ')
@@ -811,11 +1320,18 @@ end
 
 Write GenBank records to a file path.
 """
-function write_genbank(output_path::AbstractString, records)
+function write_genbank(output_path::String, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    materialized = _materialize_records_for_provenance(records, _ctx)
     open(output_path, "w") do io
-        write_genbank(io, records)
+        write_genbank(io, materialized; _ctx=nothing)
     end
 
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        provenance_hash = bytes2hex(sha256(read(output_path)))
+        _register_path_write_provenance!(_ctx, "write_genbank", output_path, provenance_parent_ids(materialized); record_count=length(materialized), provenance_hash=provenance_hash)
+    end
+    
     return output_path
 end
 
@@ -824,7 +1340,7 @@ end
 
 Write GenBank records to an IO stream.
 """
-function write_genbank(io::IO, records)
+function write_genbank(io::IO, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     for record in records
         println(io, _format_genbank_locus_line(record))
         _write_genbank_wrapped_section(io, "DEFINITION  ", record.definition; continuation_prefix="            ")
@@ -848,6 +1364,7 @@ function write_genbank(io::IO, records)
         print(io, _render_genbank_sequence(record.sequence))
         println(io, "//")
     end
+    _ctx = active_provenance_context(_ctx)
     return nothing
 end
 
@@ -869,11 +1386,10 @@ function _genbank_flatten_record(record::GenBankRecord)
         record.source,
         record.organism,
         record.comment,
-        record.sequence,
+        String(record.sequence),
         Int32(length(record.features)),
         feature_keys,
-        feature_locations,
-    )
+        feature_locations)
 end
 
 """
@@ -881,22 +1397,41 @@ end
 
 Read GenBank records from a file path.
 """
-function read_genbank(input_path::AbstractString)
+function read_genbank(input_path::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    raw_bytes = read(input_path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    _ctx = active_provenance_context(_ctx)
+
+
+    return read_genbank(IOBuffer(raw_bytes), provenance_hash, input_path; _ctx=_ctx)
+end
+
+function read_genbank(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_genbank"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = GenBankRecord[]
     current_lines = String[]
 
-    open(input_path, "r") do io
-        for raw_line in eachline(io)
-            push!(current_lines, raw_line)
-            if strip(raw_line) == "//"
-                record = parse_genbank_record(current_lines)
-                record === nothing || push!(records, record)
-                empty!(current_lines)
-            end
+    for raw_line in eachline(io)
+        push!(current_lines, raw_line)
+        if strip(raw_line) == "//"
+            record = parse_genbank_record(current_lines)
+            record === nothing || push!(records, record)
+            empty!(current_lines)
         end
     end
 
     isempty(current_lines) || push!(records, parse_genbank_record(current_lines))
+    if provenance_hash !== nothing
+        for record in records
+            record.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
+        end
+    end
+    _ctx = active_provenance_context(_ctx)
+    if _ctx !== nothing
+        root = register_provenance!(_ctx, "read_genbank"; parents=String[], parameters=(source=provenance_source, record_count=length(records), hash=provenance_hash))
+        for (index, record) in enumerate(records)
+        register_container_provenance!(_ctx, record, "read_genbank_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, locus=record.locus, accession=record.accession), provenance_hash=provenance_hash)
+        end
+    end
     return records
 end
 
@@ -923,9 +1458,7 @@ function _write_genbank_chunk!(writer, loci, locus_lines, accessions, versions, 
             sequence = copy(sequences),
             feature_count = copy(feature_counts),
             feature_keys = copy(feature_keys),
-            feature_locations = copy(feature_locations),
-        ),
-    )
+            feature_locations = copy(feature_locations)))
 
     empty!(loci)
     empty!(locus_lines)
@@ -950,10 +1483,9 @@ end
 Convert GenBank records into a chunked Arrow table.
 """
 function ingest_genbank(
-    input_path::AbstractString,
-    output_path::AbstractString;
-    chunk_size::Integer=100,
-)
+    input_path::String,
+    output_path::String;
+    chunk_size::Integer=100)
     loci = String[]
     locus_lines = String[]
     accessions = String[]
@@ -987,7 +1519,7 @@ function ingest_genbank(
                         push!(sources, flattened.source)
                         push!(organisms, flattened.organism)
                         push!(comments, flattened.comment)
-                        push!(sequences, flattened.sequence)
+                        push!(sequences, flattened.sequence_text)
                         push!(feature_counts, flattened.feature_count)
                         push!(feature_keys, flattened.feature_keys)
                         push!(feature_locations, flattened.feature_locations)
@@ -1014,7 +1546,7 @@ function ingest_genbank(
                 push!(sources, flattened.source)
                 push!(organisms, flattened.organism)
                 push!(comments, flattened.comment)
-                push!(sequences, flattened.sequence)
+                push!(sequences, flattened.sequence_text)
                 push!(feature_counts, flattened.feature_count)
                 push!(feature_keys, flattened.feature_keys)
                 push!(feature_locations, flattened.feature_locations)
@@ -1028,11 +1560,11 @@ function ingest_genbank(
 end
 
 """
-    _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
+    _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals, filters, infos, formats, sample_counts, samples)
 
 Write a chunk of flattened VCF records to an Arrow writer.
 """
-function _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
+function _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals, filters, infos, formats, sample_counts, samples)
     isempty(chroms) && return nothing
 
     chunk = (
@@ -1042,12 +1574,15 @@ function _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
         ref = copy(refs),
         alt = copy(alts),
         qual = copy(quals),
-    )
+        filter = copy(filters),
+        info = copy(infos),
+        format = copy(formats),
+        sample_count = copy(sample_counts),
+        samples = copy(samples))
 
     Arrow.write(
         writer,
-        chunk,
-    )
+        chunk)
 
     empty!(chroms)
     empty!(positions)
@@ -1055,6 +1590,11 @@ function _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
     empty!(refs)
     empty!(alts)
     empty!(quals)
+    empty!(filters)
+    empty!(infos)
+    empty!(formats)
+    empty!(sample_counts)
+    empty!(samples)
 
     return nothing
 end
@@ -1072,9 +1612,7 @@ function _write_bed_chunk!(writer, chroms, starts, stops)
         (
             chrom = copy(chroms),
             start = copy(starts),
-            stop = copy(stops),
-        ),
-    )
+            stop = copy(stops)))
 
     empty!(chroms)
     empty!(starts)
@@ -1089,19 +1627,23 @@ end
 Convert VCF records into a chunked Arrow table.
 """
 function ingest_vcf(
-    input_path::AbstractString,
-    output_path::AbstractString;
-    chunk_size::Integer=10_000,
-)
+    input_path::String,
+    output_path::String;
+    chunk_size::Integer=10_000)
     chroms = String[]
     positions = Int32[]
     ids = String[]
     refs = String[]
     alts = String[]
     quals = Union{Missing,Float32}[]
+    filters = String[]
+    infos = String[]
+    formats = String[]
+    sample_counts = Int32[]
+    samples = String[]
 
-    open(Arrow.Writer, output_path; file=true) do writer
-        open(input_path, "r") do io
+    _open_vcf_input(input_path, io -> begin
+        open(Arrow.Writer, output_path; file=true) do writer
             for raw_line in eachline(io)
                 startswith(raw_line, '#') && continue
                 record = parse_vcf_record(raw_line)
@@ -1113,15 +1655,20 @@ function ingest_vcf(
                 push!(refs, record.ref)
                 push!(alts, record.alt)
                 push!(quals, record.qual)
+                push!(filters, record.filter)
+                push!(infos, record.info)
+                push!(formats, record.format)
+                push!(sample_counts, Int32(length(record.samples)))
+                push!(samples, join(record.samples, '\t'))
 
                 if length(chroms) >= chunk_size
-                    _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
+                    _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals, filters, infos, formats, sample_counts, samples)
                 end
             end
-        end
 
-        _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals)
-    end
+            _write_vcf_chunk!(writer, chroms, positions, ids, refs, alts, quals, filters, infos, formats, sample_counts, samples)
+        end
+    end)
 
     return output_path
 end
@@ -1132,10 +1679,9 @@ end
 Convert BED records into a chunked Arrow table.
 """
 function ingest_bed(
-    input_path::AbstractString,
-    output_path::AbstractString;
-    chunk_size::Integer=10_000,
-)
+    input_path::String,
+    output_path::String;
+    chunk_size::Integer=10_000)
     chroms = String[]
     starts = Int32[]
     stops = Int32[]
@@ -1182,9 +1728,7 @@ function _write_gff_chunk!(writer, chroms, sources, features, starts, stops, sco
             score = copy(scores),
             strand = copy(strands),
             phase = copy(phases),
-            attributes = copy(attributes),
-        ),
-    )
+            attributes = copy(attributes)))
 
     empty!(chroms)
     empty!(sources)
@@ -1205,10 +1749,9 @@ end
 Convert GFF records into a chunked Arrow table.
 """
 function ingest_gff(
-    input_path::AbstractString,
-    output_path::AbstractString;
-    chunk_size::Integer=10_000,
-)
+    input_path::String,
+    output_path::String;
+    chunk_size::Integer=10_000)
     chroms = String[]
     sources = String[]
     features = String[]
@@ -1253,7 +1796,7 @@ end
 
 Load an Arrow table from disk.
 """
-function load_arrow_table(path::AbstractString)
+function load_arrow_table(path::String)
     return Arrow.Table(path)
 end
 
@@ -1262,7 +1805,7 @@ end
 
 Write a table to an Arrow file.
 """
-function write_arrow_table(output_path::AbstractString, table)
+function write_arrow_table(output_path::String, table)
     Arrow.write(output_path, table)
     return output_path
 end
@@ -1305,7 +1848,6 @@ function read_embl(io::IO)
     if record_start <= length(lines)
         push!(records, _parse_embl_record(@view lines[record_start:end]))
     end
-
     return records
 end
 
@@ -1340,7 +1882,7 @@ end
 
 Parse a single EMBL record from raw text lines.
 """
-function _parse_embl_record(lines::AbstractVector{<:AbstractString})
+function _parse_embl_record(lines::AbstractVector{<:String})
     id = ""
     accession = ""
     description = IOBuffer()
@@ -1423,14 +1965,24 @@ function _parse_embl_record(lines::AbstractVector{<:AbstractString})
         annotations[:accession] = accession
     end
 
+    sequence_text = String(take!(sequence))
+    sequence_typed = if isempty(sequence_text) || validate_sequence(DNAAlphabet, sequence_text)
+        BioSequence{DNAAlphabet}(sequence_text)
+    elseif validate_sequence(RNAAlphabet, sequence_text)
+        BioSequence{RNAAlphabet}(sequence_text)
+    elseif validate_sequence(AminoAcidAlphabet, sequence_text)
+        BioSequence{AminoAcidAlphabet}(sequence_text)
+    else
+        throw(ArgumentError("cannot infer alphabet for EMBL sequence"))
+    end
+
     return AnnotatedSeqRecord(
-        String(take!(sequence));
+        sequence_typed;
         identifier=id,
         name=id,
-        description=strip(String(take!(description))),
+        description=String(strip(String(take!(description)))),
         annotations=annotations,
-        features=features,
-    )
+        features=features)
 end
 
 """
@@ -1449,7 +2001,7 @@ end
 
 Read an ABIF chromatogram file from a path.
 """
-function read_abif(filepath::AbstractString)
+function read_abif(filepath::String)
     open(filepath, "r") do io
         return read_abif(io)
     end
@@ -1523,7 +2075,7 @@ function read_abif(io::IO)
         end
     end
     
-    sequence = isempty(sequence_bytes) ? "" : String(sequence_bytes)
+    sequence = isempty(sequence_bytes) ? BioSequence{DNAAlphabet}(UInt8[]; validate=false) : BioSequence{DNAAlphabet}(String(sequence_bytes); validate=false)
     qualities = qualities
     
     trace_map = Dict{Char, Vector{UInt16}}()

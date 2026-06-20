@@ -1,5 +1,7 @@
 using Test
 using BioToolkit
+ENV["JULIA_CUDA_USE_BINARYBUILDER"] = "true"
+using CUDA
 using Arrow
 using Plots
 using Turing
@@ -8,7 +10,13 @@ using Tables
 include(joinpath(@__DIR__, "..", "ext", "BioToolkitTuringExt.jl"))
 BioToolkitTuringExt.__init__()
 
-const test_files = sort(filter(file -> endswith(file, ".jl") && file != "runtests.jl", readdir(@__DIR__)))
+const provenance_test_files = ["provenance_io_tests.jl", "provenance_utility_tests.jl", "provenance_comprehensive_tests.jl"]
+
+for file in provenance_test_files
+    include(joinpath(@__DIR__, file))
+end
+
+const test_files = sort(filter(file -> endswith(file, ".jl") && file != "runtests.jl" && !(file in provenance_test_files), readdir(@__DIR__)))
 
 for file in test_files
     include(joinpath(@__DIR__, file))
@@ -23,15 +31,23 @@ end
         @test record.alt == "G"
         @test record.qual == Float32(99.5)
 
+        rich_record = BioToolkit.parse_vcf_record("chr1\t42\trs1\tA\tG\t99.5\tPASS\tAC=1;AN=4\tGT:DP\t0/1:12\t1/1:8")
+        @test rich_record.filter == "PASS"
+        @test rich_record.info == "AC=1;AN=4"
+        @test rich_record.format == "GT:DP"
+        @test rich_record.samples == ["0/1:12", "1/1:8"]
+
         compact = BioToolkit.compact_variant_event(record)
         @test compact.chrom == UInt16(1)
         @test compact.pos == 42
         @test compact.hasqual == true
         @test isbitstype(typeof(compact))
+        @test_throws ArgumentError BioToolkit.compact_variant_event(BioToolkit.VariantTextRecord("chr1", 1, "bad", "AT", "G", missing))
 
         mktempdir() do dir
             input_path = joinpath(dir, "sample.vcf")
             output_path = joinpath(dir, "written.vcf")
+            document_path = joinpath(dir, "document.vcf")
 
             open(input_path, "w") do io
                 write(io, "##fileformat=VCFv4.2\n")
@@ -44,24 +60,66 @@ end
 
             BioToolkit.write_vcf(output_path, parsed)
             @test BioToolkit.read_vcf(output_path) == parsed
+
+            header = BioToolkit.VcfHeader(["##fileformat=VCFv4.2", "##source=BioToolkit"], ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT", "s1", "s2"], ["s1", "s2"])
+            doc = BioToolkit.VcfDocument(header, [rich_record])
+            BioToolkit.write_vcf_document(document_path, doc)
+            roundtrip = BioToolkit.read_vcf_document(document_path)
+            @test roundtrip.header.sample_names == ["s1", "s2"]
+            @test roundtrip.records == [rich_record]
+
+            if Base.find_package("CodecZlib") !== nothing
+                gz_path = joinpath(dir, "document.vcf.gz")
+                BioToolkit.write_vcf_document(gz_path, doc)
+                @test BioToolkit.read_vcf_document(gz_path).records == [rich_record]
+            end
+        end
+
+        mktempdir() do dir
+            input_path = joinpath(dir, "format_order.vcf")
+            open(input_path, "w") do io
+                write(io, "##fileformat=VCFv4.2\n")
+                write(io, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n")
+                write(io, "chr1\t7\trs2\tA\tG\t.\tPASS\t.\tAD:GT:DP\t12:0/1:30\t8:1/1:28\n")
+            end
+
+            gm = BioToolkit.GWAS.read_vcf(input_path)
+            @test size(gm) == (2, 1)
+            @test gm[1, 1] == 1.0
+            @test gm[2, 1] == 2.0
         end
     end
 
     @testset "Sequence toolkit" begin
         sequence = "ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG"
         sequence_bytes = Vector{UInt8}(codeunits(sequence))
+        dna = BioToolkit.DNASeq(sequence)
+        rna = BioToolkit.RNASeq("AUGGCCAUUGUAAUGGGCCGCUGAAAGGGUGCCCGAUAG")
+        amino_acids = BioToolkit.AASeq("MAIVMGR")
 
         @test BioToolkit.validate_dna(sequence) == true
+        @test BioToolkit.validate_dna(dna) == true
+        @test BioToolkit.validate_dna(rna) == true
+        @test BioToolkit.alphabet(dna) == BioToolkit.DNAAlphabet
+        @test BioToolkit.alphabet(rna) == BioToolkit.RNAAlphabet
+        @test String(dna) == uppercase(sequence)
+        @test String(rna) == "AUGGCCAUUGUAAUGGGCCGCUGAAAGGGUGCCCGAUAG"
+        @test String(amino_acids) == "MAIVMGR"
         @test BioToolkit.count_nucleotides(sequence) == (A = 9, C = 8, G = 14, T = 8, N = 0)
+        @test BioToolkit.count_nucleotides(BioToolkit.DNASeq("ATGN")) == (A = 1, C = 0, G = 1, T = 1, N = 1)
         @test BioToolkit.transcribe_dna("ATGTTT") == "AUGUUU"
+        @test BioToolkit.transcribe_dna(dna) isa BioToolkit.RNASeq
         @test BioToolkit.melting_temp("ATGC") == 12.0
         @test BioToolkit.melting_temp("AUGC"; rna=true) == 12.0
         @test BioToolkit.dna_molecular_weight("ATGC") ≈ 1253.80 atol=0.1
         @test BioToolkit.dna_molecular_weight("ATGC"; stranded=:double) > BioToolkit.dna_molecular_weight("ATGC")
         @test BioToolkit.reverse_complement("ATGC") == "GCAT"
+        @test BioToolkit.reverse_complement(dna) isa BioToolkit.DNASeq
         @test BioToolkit.reverse_complement(sequence_bytes) == BioToolkit.reverse_complement(sequence)
         @test round(BioToolkit.gc_content(sequence), digits=3) == 0.564
+        @test BioToolkit.gc_content(dna) ≈ BioToolkit.gc_content(sequence)
         @test BioToolkit.translate_dna(sequence; stop_at_stop=true) == "MAIVMGR"
+        @test BioToolkit.translate_dna(dna; stop_at_stop=true) isa BioToolkit.AASeq
         @test BioToolkit.translate_dna(sequence_bytes; stop_at_stop=true) == BioToolkit.translate_dna(sequence; stop_at_stop=true)
         @test !isempty(BioToolkit.find_orfs(sequence; min_aa=5))
         @test BioToolkit.kmer_frequency("ATAT", 2) == Dict("AT" => 2, "TA" => 1)
@@ -70,6 +128,25 @@ end
         @test BioToolkit.relative_codon_adaptiveness("ATGGCCATG")["ATG"] == 1.0
         @test BioToolkit.codon_adaptation_index("ATGGCCATG"; reference="ATGGCCATG") == 1.0
         @test BioToolkit.cai("ATGGCCATG"; reference="ATGGCCATG") == 1.0
+        @test_throws ArgumentError BioToolkit.DNASeq("ATBX")
+    end
+
+    @testset "CUDA extension" begin
+        @test Base.get_extension(BioToolkit, :BioToolkitCUDAExt) !== nothing
+
+        BioToolkit._ensure_cuda_sequence!()
+        BioToolkit._ensure_cuda_query!()
+        BioToolkit._ensure_cuda_phylo!()
+
+        @test BioToolkit._CUDA_SEQUENCE_LOADED[]
+        @test BioToolkit._CUDA_QUERY_LOADED[]
+        @test BioToolkit._CUDA_PHYLO_LOADED[]
+
+        if CUDA.functional()
+            left = CUDA.CuArray{UInt8}(codeunits("ACGT"))
+            right = CUDA.CuArray{UInt8}(codeunits("ACGA"))
+            @test BioToolkit.hamming_distance(left, right; use_cuda=true) == 1
+        end
     end
 
         @testset "BLAST parsing" begin
@@ -130,6 +207,10 @@ end
                 @test records[1].hits[1].hsps[1].evalue == 1e-10
                 @test records[1].hits[1].hsps[1].query_start == 2
                 @test records[1].hits[1].hsps[1].hit_end == 10
+
+                whitespace_blast_xml = replace(blast_xml, "<Hsp_evalue>1e-10</Hsp_evalue>" => "<Hsp_evalue> 1e-10 </Hsp_evalue>")
+                whitespace_records = BioToolkit.parse_blast_xml(IOBuffer(whitespace_blast_xml))
+                @test whitespace_records[1].hits[1].hsps[1].evalue == 1e-10
 
                 tabular = """query1\tsubject1\t100.0\t8\t0\t0\t2\t9\t3\t10\t1e-10\t42.0
 query1\tsubject2\t87.5\t8\t1\t0\t5\t12\t1\t8\t2e-5\t31.0
@@ -256,6 +337,7 @@ DP  - 2023
     @testset "FASTA parsing" begin
         mktempdir() do dir
             fasta_path = joinpath(dir, "sample.fasta")
+            roundtrip_path = joinpath(dir, "roundtrip.fasta")
 
             open(fasta_path, "w") do io
                 write(io, ">seq1\n")
@@ -265,7 +347,16 @@ DP  - 2023
             end
 
             records = BioToolkit.read_fasta(fasta_path)
-            @test records == [("seq1", "ATGC"), ("seq2", "GATTACA")]
+            @test length(records) == 2
+            @test records[1].identifier == "seq1"
+            @test records[1].sequence isa BioToolkit.DNASeq
+            @test records[1].sequence == "ATGC"
+            @test records[2].sequence == BioToolkit.DNASeq("GATTACA")
+
+            BioToolkit.write_fasta(roundtrip_path, records)
+            roundtrip = BioToolkit.read_fasta(roundtrip_path)
+            @test roundtrip[1].sequence == records[1].sequence
+            @test roundtrip[2].identifier == "seq2"
         end
     end
 
@@ -284,23 +375,25 @@ DP  - 2023
                 write(io, "HHHHHHH\n")
             end
 
-            records = BioToolkit.read_fastq(fastq_path)
+            records = BioToolkit.read_fastq(fastq_path; alphabet=BioToolkit.DNAAlphabet)
             @test length(records) == 2
             @test records[1].identifier == "seq1"
             @test records[1].description == "seq1 description"
+            @test records[1].sequence isa BioToolkit.DNASeq
             @test records[1].sequence == "ACGT"
             @test records[1].quality == "!!!!"
             @test records[2].identifier == "seq2"
             @test records[2].sequence == "GATTACA"
+
         end
     end
 
     @testset "FASTQ writing and records" begin
         mktempdir() do dir
             output_path = joinpath(dir, "written.fastq")
-            fastq_record = BioToolkit.FastqRecord("seq1", "seq1 description", "ACGT", "IIII")
+            fastq_record = BioToolkit.FastqRecord(BioToolkit.DNASeq("ACGT"), "IIII"; identifier="seq1", description="seq1 description")
             seq_record = BioToolkit.SeqRecordLite(
-                "GATTACA";
+                BioToolkit.DNASeq("GATTACA");
                 identifier="seq2",
                 description="seq2 description",
                 annotations=Dict(:organism => "synthetic"),
@@ -309,9 +402,10 @@ DP  - 2023
 
             @test length(seq_record) == 7
             @test seq_record.annotations[:organism] == "synthetic"
+            @test fastq_record.sequence isa BioToolkit.DNASeq
 
             BioToolkit.write_fastq(output_path, [fastq_record, seq_record])
-            read_back = BioToolkit.read_fastq(output_path)
+            read_back = BioToolkit.read_fastq(output_path; alphabet=BioToolkit.DNAAlphabet)
 
             @test read_back[1] == fastq_record
             @test read_back[2].sequence == "GATTACA"
@@ -324,34 +418,57 @@ DP  - 2023
     end
 
     @testset "Quality pipeline" begin
-        high_quality = BioToolkit.FastqRecord("high", "high quality", "ACGTAGATCGGAAGAGC", "IIIIIIIIIIIIIIIII")
-        low_quality = BioToolkit.FastqRecord("low", "low quality", "ACGT", "!!!!")
+        high_quality = BioToolkit.FastqRecord(BioToolkit.DNASeq("ACGTAGATCGGAAGAGC"), "IIIIIIIIIIIIIIIII"; identifier="high", description="high quality")
+        low_quality = BioToolkit.FastqRecord(BioToolkit.DNASeq("ACGT"), "!!!!"; identifier="low", description="low quality")
 
         @test BioToolkit.quality_filter(high_quality; min_mean_quality=30, min_base_quality=30)
         @test !BioToolkit.quality_filter(low_quality; min_mean_quality=30, min_base_quality=30)
 
         trimmed_fastq = BioToolkit.adapter_trim(high_quality; adapter="AGATCGGAAGAGC", min_overlap=8)
+        @test trimmed_fastq.sequence isa BioToolkit.DNASeq
         @test trimmed_fastq.sequence == "ACGT"
         @test trimmed_fastq.quality == "IIII"
 
         high_seq = BioToolkit.SeqRecordLite(
-            "ACGTAGATCGGAAGAGC";
+            BioToolkit.DNASeq("ACGTAGATCGGAAGAGC");
             identifier="seq1",
             letter_annotations=Dict(:quality => "IIIIIIIIIIIIIIIII"),
         )
         trimmed_seq = BioToolkit.adapter_trim(high_seq; adapter="AGATCGGAAGAGC", min_overlap=8)
+        @test trimmed_seq.sequence isa BioToolkit.DNASeq
         @test trimmed_seq.sequence == "ACGT"
         @test trimmed_seq.letter_annotations[:quality] == "IIII"
 
         pipeline_input = [high_quality, low_quality]
         pipeline_output = BioToolkit.sequencing_pipeline(pipeline_input; adapter="AGATCGGAAGAGC", min_mean_quality=30, min_base_quality=30, min_length=4)
         @test length(pipeline_output) == 1
+        @test pipeline_output[1].sequence isa BioToolkit.DNASeq
         @test pipeline_output[1].sequence == "ACGT"
 
         seq_pipeline_input = [high_seq]
         seq_pipeline_output = BioToolkit.sequencing_pipeline(seq_pipeline_input; adapter="AGATCGGAAGAGC", min_mean_quality=30, min_base_quality=30, min_length=4)
         @test length(seq_pipeline_output) == 1
+        @test seq_pipeline_output[1].sequence isa BioToolkit.DNASeq
         @test seq_pipeline_output[1].sequence == "ACGT"
+    end
+
+    @testset "Biotypes integration" begin
+        dna = BioToolkit.DNASeq("acgacgacg")
+        rna = BioToolkit.RNASeq("acguacgu")
+        protein = BioToolkit.AASeq("ACDEFGHIKLMNPQRSTVWY")
+
+        @test dna isa BioToolkit.DNASeq
+        @test rna isa BioToolkit.RNASeq
+        @test protein isa BioToolkit.AASeq
+        @test BioToolkit.reverse_complement(dna) isa BioToolkit.DNASeq
+        @test BioToolkit.translate_dna(dna) isa BioToolkit.AASeq
+        @test BioToolkit.protein_mass(protein) > 2000.0
+        @test BioToolkit.extinction_coefficient(protein) == 7115
+
+        typed_record = BioToolkit.SeqRecordLite(dna; identifier="typed", name="typed", description="typed record")
+        @test typed_record.sequence isa BioToolkit.DNASeq
+        @test String(typed_record.sequence) == "ACGACGACG"
+        @test BioToolkit.feature_slice(typed_record, 3:6).sequence == "GACG"
     end
 
     @testset "Intermediate helpers" begin
@@ -380,6 +497,34 @@ DP  - 2023
         @test_throws ArgumentError BioToolkit.format_alignment(BioToolkit.MultipleSequenceAlignment(BioToolkit.SeqRecordLite[]), "unsupported")
     end
 
+    @testset "Phylo metadata" begin
+        tree = BioToolkit.PhyloTree([
+            BioToolkit.PhyloTree("A"; branch_length=0.1),
+            BioToolkit.PhyloTree("B"; branch_length=0.2),
+        ]; name="root", metadata=Dict("posterior" => 0.97, "validated" => true, "source" => "study-1"))
+        BioToolkit.set_metadata!(tree, "n_bootstrap", 42)
+
+        @test tree.metadata["posterior"] == 0.97
+        @test tree.metadata["validated"] == true
+        @test tree.metadata["n_bootstrap"] == 42
+
+        phyloxml = BioToolkit.write_phyloxml(tree)
+        @test occursin("datatype=\"xsd:double\"", phyloxml)
+        @test occursin("datatype=\"xsd:boolean\"", phyloxml)
+        @test occursin("datatype=\"xsd:integer\"", phyloxml)
+        @test occursin("datatype=\"xsd:string\"", phyloxml)
+        roundtrip = BioToolkit.parse_phyloxml(phyloxml)
+
+        @test roundtrip.name == "root"
+        @test roundtrip.metadata["posterior"] == 0.97
+        @test roundtrip.metadata["validated"] == true
+        @test roundtrip.metadata["source"] == "study-1"
+        @test roundtrip.metadata["n_bootstrap"] == 42
+        @test length(roundtrip.children) == 2
+        @test roundtrip.children[1].name == "A"
+        @test roundtrip.children[2].branch_length == 0.2
+    end
+
     @testset "Pairwise alignment" begin
         left = BioToolkit.SeqRecordLite("ACGT"; identifier="left")
         right = BioToolkit.SeqRecordLite("ACGT"; identifier="right")
@@ -400,6 +545,7 @@ DP  - 2023
         @test BioToolkit.needleman_wunsch(left, right; match=2, mismatch=-1, gap=-2).score == alignment.score
         @test BioToolkit.smith_waterman("TTTAGCCTT", "AGC"; match=2, mismatch=-1, gap=-2).score == 6
         @test BioToolkit.pairwise_align("AA", "AA"; substitution_matrix=named_matrix, gap=-4).score == 8
+        @test_throws ArgumentError BioToolkit.pairwise_align("AU", "AA"; substitution_matrix=matrix, gap=-2)
 
         codon_matrix = BioToolkit.named_codon_substitution_matrix(:SCHNEIDER)
         codon_global = BioToolkit.pairwise_align_codons("ATGATG", "ATGATG"; substitution_matrix=codon_matrix, gap=-3)
@@ -408,6 +554,7 @@ DP  - 2023
         @test codon_global.right == "ATGATG"
         @test codon_global.identity == 1.0
         @test codon_local.score == codon_global.score
+        @test_throws ArgumentError BioToolkit.pairwise_align_codons("ATGATG", "ATGATJ"; substitution_matrix=codon_matrix, gap=-3)
 
         gapped_left = BioToolkit.SeqRecordLite("AAAAAA"; identifier="gapped_left")
         gapped_right = BioToolkit.SeqRecordLite("AA"; identifier="gapped_right")
@@ -417,6 +564,120 @@ DP  - 2023
         @test affine_gap.score == linear_gap.score
         @test affine_gap.matches == linear_gap.matches
         @test affine_gap.identity == linear_gap.identity
+        @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap=1)
+        @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap_open=1, gap_extend=-1)
+        @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap=0)
+
+        affine_neg_inf = typemin(Int) ÷ 8
+        affine_safe_add(x::Int, y::Int) = x <= affine_neg_inf ÷ 2 ? affine_neg_inf : x + y
+
+        function reference_affine_global(left_ids::Vector{UInt8}, right_ids::Vector{UInt8}, match::Int, mismatch::Int, gap_open::Int, gap_extend::Int)
+            n = length(left_ids)
+            m = length(right_ids)
+            mstate = fill(affine_neg_inf, n + 1, m + 1)
+            xstate = fill(affine_neg_inf, n + 1, m + 1)
+            ystate = fill(affine_neg_inf, n + 1, m + 1)
+            mstate[1, 1] = 0
+
+            for i in 2:n+1
+                xstate[i, 1] = max(affine_safe_add(mstate[i - 1, 1], gap_open), affine_safe_add(xstate[i - 1, 1], gap_extend))
+            end
+            for j in 2:m+1
+                ystate[1, j] = max(affine_safe_add(mstate[1, j - 1], gap_open), affine_safe_add(ystate[1, j - 1], gap_extend))
+            end
+
+            for j in 2:m+1
+                for i in 2:n+1
+                    score = left_ids[i - 1] == right_ids[j - 1] ? match : mismatch
+                    mstate[i, j] = affine_safe_add(max(mstate[i - 1, j - 1], xstate[i - 1, j - 1], ystate[i - 1, j - 1]), score)
+                    xstate[i, j] = max(affine_safe_add(mstate[i - 1, j], gap_open), affine_safe_add(xstate[i - 1, j], gap_extend))
+                    ystate[i, j] = max(affine_safe_add(mstate[i, j - 1], gap_open), affine_safe_add(ystate[i, j - 1], gap_extend))
+                end
+            end
+
+            return max(mstate[n + 1, m + 1], xstate[n + 1, m + 1], ystate[n + 1, m + 1])
+        end
+
+        function reference_affine_local(left_ids::Vector{UInt8}, right_ids::Vector{UInt8}, match::Int, mismatch::Int, gap_open::Int, gap_extend::Int)
+            n = length(left_ids)
+            m = length(right_ids)
+            mstate = zeros(Int, n + 1, m + 1)
+            xstate = zeros(Int, n + 1, m + 1)
+            ystate = zeros(Int, n + 1, m + 1)
+            best = 0
+
+            for j in 2:m+1
+                for i in 2:n+1
+                    score = left_ids[i - 1] == right_ids[j - 1] ? match : mismatch
+                    mstate[i, j] = max(0, max(mstate[i - 1, j - 1], xstate[i - 1, j - 1], ystate[i - 1, j - 1]) + score)
+                    xstate[i, j] = max(0, max(mstate[i - 1, j] + gap_open, xstate[i - 1, j] + gap_extend))
+                    ystate[i, j] = max(0, max(mstate[i, j - 1] + gap_open, ystate[i, j - 1] + gap_extend))
+                    best = max(best, mstate[i, j], xstate[i, j], ystate[i, j])
+                end
+            end
+
+            return best
+        end
+
+        dna_affine_cases = [
+            ("ATTTGCC", "A", 1, -4, -3, -1),
+            ("AAAAAA", "AA", 2, -1, -4, -1),
+            ("ACGT", "ACGT", 2, -3, -5, -2),
+            ("", "AAAA", 2, -3, -3, -1),
+            ("AAAA", "", 2, -3, -3, -1),
+        ]
+
+        for (left_seq, right_seq, match_score, mismatch_score, gap_open_score, gap_extend_score) in dna_affine_cases
+            left_ids = Vector{UInt8}(codeunits(left_seq))
+            right_ids = Vector{UInt8}(codeunits(right_seq))
+
+            expected_global = reference_affine_global(left_ids, right_ids, match_score, mismatch_score, gap_open_score, gap_extend_score)
+            expected_local = reference_affine_local(left_ids, right_ids, match_score, mismatch_score, gap_open_score, gap_extend_score)
+
+            observed_global = BioToolkit.pairwise_align(left_seq, right_seq; match=match_score, mismatch=mismatch_score, gap_open=gap_open_score, gap_extend=gap_extend_score).score
+            observed_local = BioToolkit.local_align(left_seq, right_seq; match=match_score, mismatch=mismatch_score, gap_open=gap_open_score, gap_extend=gap_extend_score).score
+
+            @test observed_global == expected_global
+            @test observed_local == expected_local
+        end
+
+        codon_affine_cases = [
+            ("ATGATG", "ATGATG", 2, -1, -3, -1),
+            ("ATGTTTCCC", "ATGCCC", 3, -2, -4, -1),
+            ("", "ATGATG", 2, -1, -3, -1),
+        ]
+
+        for (left_seq, right_seq, match_score, mismatch_score, gap_open_score, gap_extend_score) in codon_affine_cases
+            left_tokens = [left_seq[(3 * i - 2):(3 * i)] for i in 1:(ncodeunits(left_seq) ÷ 3)]
+            right_tokens = [right_seq[(3 * j - 2):(3 * j)] for j in 1:(ncodeunits(right_seq) ÷ 3)]
+
+            token_lookup = Dict{String,UInt8}()
+            next_token_id = UInt8(1)
+            for token in left_tokens
+                if !haskey(token_lookup, token)
+                    token_lookup[token] = next_token_id
+                    next_token_id = UInt8(Int(next_token_id) + 1)
+                end
+            end
+            for token in right_tokens
+                if !haskey(token_lookup, token)
+                    token_lookup[token] = next_token_id
+                    next_token_id = UInt8(Int(next_token_id) + 1)
+                end
+            end
+
+            left_ids = UInt8[token_lookup[token] for token in left_tokens]
+            right_ids = UInt8[token_lookup[token] for token in right_tokens]
+
+            expected_global = reference_affine_global(left_ids, right_ids, match_score, mismatch_score, gap_open_score, gap_extend_score)
+            expected_local = reference_affine_local(left_ids, right_ids, match_score, mismatch_score, gap_open_score, gap_extend_score)
+
+            observed_global = BioToolkit.pairwise_align_codons(left_seq, right_seq; match=match_score, mismatch=mismatch_score, gap_open=gap_open_score, gap_extend=gap_extend_score).score
+            observed_local = BioToolkit.local_align_codons(left_seq, right_seq; match=match_score, mismatch=mismatch_score, gap_open=gap_open_score, gap_extend=gap_extend_score).score
+
+            @test observed_global == expected_global
+            @test observed_local == expected_local
+        end
     end
 
     @testset "Local alignment (Smith-Waterman)" begin
@@ -730,6 +991,7 @@ DP  - 2023
         @test annotated.identifier == "ACC1"
         @test annotated.annotations[:locus] == "TEST"
         @test length(annotated.features) == 2
+        @test BioToolkit.feature_sequence(annotated, annotated.features[1]) isa BioToolkit.DNASeq
         @test BioToolkit.feature_sequence(annotated, annotated.features[1]) == "ACGT"
         @test BioToolkit.feature_sequence(annotated, annotated.features[2]) == "ACGTACGT"
         @test BioToolkit.feature_extract(annotated, annotated.features[1]) == "ACGT"
@@ -883,9 +1145,10 @@ DP  - 2023
         @test BioToolkit.motif_entropy(frequencies) >= 0.0
         @test BioToolkit.motif_relative_entropy(frequencies) > 0.0
 
-        discovery_sequences = ["TTTACGTTTT", "GGGACGTGGG", "CCCACGTCCC"]
+        discovery_sequences = [BioToolkit.DNASeq("TTTACGTTTT"), BioToolkit.DNASeq("GGGACGTGGG"), BioToolkit.DNASeq("CCCACGTCCC")]
         discoveries = BioToolkit.discover_motifs(discovery_sequences; k=4, top_n=1, min_support=2, max_mismatches=0)
         @test length(discoveries) == 1
+        @test discoveries[1].seed isa BioToolkit.DNASeq
         @test discoveries[1].seed == "ACGT"
         @test discoveries[1].support == 3
         @test discoveries[1].information_content > 0.0
@@ -893,6 +1156,7 @@ DP  - 2023
 
         scan_hits = BioToolkit.motif_scan(discovery_sequences[1], discoveries[1].pwm; threshold=0.0)
         @test any(hit -> hit.start == 4, scan_hits)
+        @test scan_hits[1].window isa BioToolkit.DNASeq
         @test BioToolkit.motif_scan(discovery_sequences[1], discoveries[1].pwm; threshold=100.0) == BioToolkit.MotifHit[]
 
         both_strand_hits = BioToolkit.motif_scan_both_strands("TTTACGTTTTGGGACGTGGG", discoveries[1].pwm; threshold=0.0)

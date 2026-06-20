@@ -165,6 +165,12 @@ using BioToolkit
         bootstrap = bootstrap_trees(alignment; replicates=3, method=:hamming, constructor=:nj)
         @test length(bootstrap) == 3
 
+        rng_a = MersenneTwister(42)
+        rng_b = MersenneTwister(42)
+        bootstrap_a = bootstrap_trees(alignment; replicates=3, method=:hamming, constructor=:nj, rng=rng_a)
+        bootstrap_b = bootstrap_trees(alignment; replicates=3, method=:hamming, constructor=:nj, rng=rng_b)
+        @test write_newick.(bootstrap_a) == write_newick.(bootstrap_b)
+
         annotated = bootstrap_support([tree, tree], tree)
         @test all(node.support >= 0.0 for node in get_nonterminals(annotated))
 

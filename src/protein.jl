@@ -1,8 +1,23 @@
-# Protein statistics — high-performance implementations of ExPASy ProtParam-style analyses
-# All lookup tables are 256-element byte-indexed arrays for O(1) access (no Dict overhead).
-# Optional GPU support is intentionally kept off the startup path.
+# ==============================================================================
+# protein.jl — Protein property calculations (ProtParam-style)
+#
+# High-performance, table-driven implementations of ExPASy ProtParam analyses.
+# All lookup tables use 256-element byte-indexed arrays for O(1) per-residue
+# access with excellent cache locality.
+#
+# Primary API functions accept `BioSequence{AminoAcidAlphabet}`.
+#
+# References:
+#   - Pace et al. (1995) Protein Sci 4(11):2411-2423 (extinction coefficient)
+#   - Guruprasad et al. (1990) Protein Eng 4(2):155-161 (instability index)
+#   - Kyte & Doolittle (1982) JMB 157(1):105-132 (hydropathicity/GRAVY)
+#   - Ikai (1980) J Biochem 88(6):1895-1898 (aliphatic index)
+#   - Bjellqvist et al. (1993) Electrophoresis 14(10):1023-1031 (pI)
+# ==============================================================================
 
-# ─── Amino acid mass tables (indexed by UInt8 of uppercase ASCII letter) ───────
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+
+# ─── Amino acid mass tables (indexed by UInt8) ────────────────────────────────
 
 const _AA_MASS_MONO = fill(0.0, 256)
 const _AA_MASS_AVG  = fill(0.0, 256)
@@ -138,8 +153,7 @@ const _DIWV_RAW = Dict{String,Float64}(
     "LW" => 24.68, "LC" => 1.0, "LM" => 1.0, "LH" => 1.0, "LY" => 1.0,
     "LF" => 1.0, "LQ" => 33.6, "LN" => 1.0, "LI" => 1.0, "LR" => 20.26,
     "LD" => 1.0, "LP" => 20.26, "LT" => 1.0, "LK" => -7.49, "LE" => 1.0,
-    "LV" => 1.0, "LS" => 1.0, "LG" => 1.0, "LA" => 1.0, "LL" => 1.0,
-)
+    "LV" => 1.0, "LS" => 1.0, "LG" => 1.0, "LA" => 1.0, "LL" => 1.0)
 
 for (dipeptide, value) in _DIWV_RAW
     code1 = _AA_CODE[Int(UInt8(dipeptide[1])) + 1]
@@ -161,9 +175,15 @@ const _PK_H      = 6.04    # Histidine
 const _PK_K      = 10.54   # Lysine
 const _PK_R      = 12.48   # Arginine
 
+@inline function _register_protein_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
+    return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
+end
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ══════════════════════════════════════════════════════════════════════════════
+
+@inline _protein_sequence_from_text(sequence::AbstractString) = BioSequence{AminoAcidAlphabet}(String(sequence))
 
 """
     protein_mass(sequence; type="monoisotopic")
@@ -171,12 +191,26 @@ const _PK_R      = 12.48   # Arginine
 Compute the molecular weight of a protein sequence in Daltons.
 The result includes the terminal water mass contribution for the peptide chain.
 """
-function protein_mass(sequence::AbstractString; type::AbstractString="monoisotopic")
+function protein_mass(sequence::BioSequence{AminoAcidAlphabet}; type::String="monoisotopic", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _protein_mass(sequence.data, type)
+
+
+    return _register_protein_result!(_ctx, result, "protein_mass"; parents=provenance_parent_ids(sequence), parameters=(type=type, mass=result))
+end
+
+# Removed protein_mass(::AbstractString) - use AASeq instead
+function protein_mass(sequence::AbstractString; type::String="monoisotopic", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return protein_mass(_protein_sequence_from_text(sequence); type=type, _ctx=_ctx)
+end
+
+function _protein_mass(bytes::AbstractVector{UInt8}, type::String)
     mass_table = type == "monoisotopic" ? _AA_MASS_MONO : _AA_MASS_AVG
     water = type == "monoisotopic" ? 18.01524 : 18.01056
     mass = water
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         residue_mass = mass_table[Int(byte) + 1]
         residue_mass == 0.0 && throw(ArgumentError("unknown amino acid '$(Char(byte))'"))
         mass += residue_mass
@@ -191,10 +225,24 @@ end
 Compute the molar extinction coefficient at 280 nm.
 Uses the Pace formula: ε = 1490×nY + 5500×nW + 125×nC.
 """
-function extinction_coefficient(sequence::AbstractString)
+function extinction_coefficient(sequence::BioSequence{AminoAcidAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _extinction_coefficient(sequence.data)
+
+
+    return _register_protein_result!(_ctx, result, "extinction_coefficient"; parents=provenance_parent_ids(sequence), parameters=(coefficient=result))
+end
+
+# Removed extinction_coefficient(::AbstractString) - use AASeq instead
+function extinction_coefficient(sequence::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return extinction_coefficient(_protein_sequence_from_text(sequence); _ctx=_ctx)
+end
+
+function _extinction_coefficient(bytes::AbstractVector{UInt8})
     n_y = 0; n_w = 0; n_c = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         ch = byte | 0x20  # lowercase
         n_y += (ch == UInt8('y'))
         n_w += (ch == UInt8('w'))
@@ -210,11 +258,24 @@ end
 Compute the Guruprasad instability index for a protein sequence.
 Values below 40 suggest a stable protein in vitro.
 """
-function instability_index(sequence::AbstractString)
-    len = ncodeunits(sequence)
+function instability_index(sequence::BioSequence{AminoAcidAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _instability_index(sequence.data)
+
+
+    return _register_protein_result!(_ctx, result, "instability_index"; parents=provenance_parent_ids(sequence), parameters=(instability_index=result))
+end
+
+# Removed instability_index(::AbstractString) - use AASeq instead
+function instability_index(sequence::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return instability_index(_protein_sequence_from_text(sequence); _ctx=_ctx)
+end
+
+function _instability_index(bytes::AbstractVector{UInt8})
+    len = length(bytes)
     len < 2 && throw(ArgumentError("sequence must have at least 2 residues"))
 
-    bytes = codeunits(sequence)
     diwv = _INSTABILITY_DIWV
     aa_code = _AA_CODE
     total = 0.0
@@ -236,12 +297,26 @@ end
 Estimate the protein isoelectric point using an IPC-style bisection search.
 `precision` controls the pH interval at which the search stops.
 """
-function isoelectric_point(sequence::AbstractString; precision::Real=0.01)
+function isoelectric_point(sequence::BioSequence{AminoAcidAlphabet}; precision::Real=0.01, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _isoelectric_point(sequence.data, precision)
+
+
+    return _register_protein_result!(_ctx, result, "isoelectric_point"; parents=provenance_parent_ids(sequence), parameters=(precision=Float64(precision), pI=result))
+end
+
+# Removed isoelectric_point(::AbstractString) - use AASeq instead
+function isoelectric_point(sequence::AbstractString; precision::Real=0.01, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return isoelectric_point(_protein_sequence_from_text(sequence); precision=precision, _ctx=_ctx)
+end
+
+function _isoelectric_point(bytes::AbstractVector{UInt8}, precision::Real)
     # Count charged residues in one pass
     n_d = 0; n_e = 0; n_c = 0; n_y = 0
     n_h = 0; n_k = 0; n_r = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         ch = byte | 0x20
         ch == UInt8('d') && (n_d += 1)
         ch == UInt8('e') && (n_e += 1)
@@ -291,14 +366,28 @@ end
 
 Calculate the Grand Average of Hydropathicity (GRAVY) using Kyte-Doolittle values.
 """
-function gravy(sequence::AbstractString)
-    len = ncodeunits(sequence)
+function gravy(sequence::BioSequence{AminoAcidAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _gravy(sequence.data)
+
+
+    return _register_protein_result!(_ctx, result, "gravy"; parents=provenance_parent_ids(sequence), parameters=(gravy=result))
+end
+
+# Removed gravy(::AbstractString) - use AASeq instead
+function gravy(sequence::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return gravy(_protein_sequence_from_text(sequence); _ctx=_ctx)
+end
+
+function _gravy(bytes::AbstractVector{UInt8})
+    len = length(bytes)
     len == 0 && throw(ArgumentError("sequence must not be empty"))
 
     total = 0.0
     hydro = _HYDROPATHICITY
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         total += hydro[Int(byte) + 1]
     end
 
@@ -310,13 +399,27 @@ end
 
 Compute the aliphatic index from the protein sequence.
 """
-function aliphatic_index(sequence::AbstractString)
-    len = ncodeunits(sequence)
+function aliphatic_index(sequence::BioSequence{AminoAcidAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _aliphatic_index(sequence.data)
+
+
+    return _register_protein_result!(_ctx, result, "aliphatic_index"; parents=provenance_parent_ids(sequence), parameters=(aliphatic_index=result))
+end
+
+# Removed aliphatic_index(::AbstractString) - use AASeq instead
+function aliphatic_index(sequence::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return aliphatic_index(_protein_sequence_from_text(sequence); _ctx=_ctx)
+end
+
+function _aliphatic_index(bytes::AbstractVector{UInt8})
+    len = length(bytes)
     len == 0 && throw(ArgumentError("sequence must not be empty"))
 
     n_a = 0; n_v = 0; n_i = 0; n_l = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         ch = byte | 0x20
         n_a += (ch == UInt8('a'))
         n_v += (ch == UInt8('v'))
@@ -324,12 +427,7 @@ function aliphatic_index(sequence::AbstractString)
         n_l += (ch == UInt8('l'))
     end
 
-    x_a = 100.0 * n_a / len
-    x_v = 100.0 * n_v / len
-    x_i = 100.0 * n_i / len
-    x_l = 100.0 * n_l / len
-
-    return x_a + 2.9 * x_v + 3.9 * (x_i + x_l)
+    return (100.0 * n_a / len) + 2.9 * (100.0 * n_v / len) + 3.9 * (100.0 * (n_i + n_l) / len)
 end
 
 """
@@ -337,8 +435,22 @@ end
 
 Return a bundled ProtParam-style summary of protein properties.
 """
-function protparam(sequence::AbstractString)
-    len = ncodeunits(sequence)
+function protparam(sequence::BioSequence{AminoAcidAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    result = _protparam(sequence.data)
+
+
+    return _register_protein_result!(_ctx, result, "protparam"; parents=provenance_parent_ids(sequence), parameters=(length=result.length, molecular_weight_mono=result.molecular_weight_mono))
+end
+
+# Removed protparam(::AbstractString) - use AASeq instead
+function protparam(sequence::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+
+
+    return protparam(_protein_sequence_from_text(sequence); _ctx=_ctx)
+end
+
+function _protparam(bytes::AbstractVector{UInt8})
+    len = length(bytes)
     len == 0 && throw(ArgumentError("sequence must not be empty"))
 
     # Single pass to count all residues and accumulate mass/hydropathicity
@@ -349,7 +461,7 @@ function protparam(sequence::AbstractString)
     n_d = 0; n_e = 0; n_r = 0; n_k = 0
     n_c = 0; n_y = 0; n_w = 0; n_h = 0
 
-    @inbounds for byte in codeunits(sequence)
+    @inbounds for byte in bytes
         mass_mono += _AA_MASS_MONO[Int(byte) + 1]
         mass_avg  += _AA_MASS_AVG[Int(byte) + 1]
         hydro_sum += _HYDROPATHICITY[Int(byte) + 1]
@@ -375,10 +487,10 @@ function protparam(sequence::AbstractString)
         negative_residues = n_d + n_e,
         positive_residues = n_r + n_k,
         extinction_coefficient = 1490 * n_y + 5500 * n_w + 125 * n_c,
-        instability_index = len >= 2 ? instability_index(sequence) : NaN,
+        instability_index = len >= 2 ? _instability_index(bytes) : NaN,
         aliphatic_index = x_a + 2.9 * x_v + 3.9 * (x_i + x_l),
         gravy = hydro_sum / len,
-        isoelectric_point = isoelectric_point(sequence),
-    )
+        isoelectric_point = _isoelectric_point(bytes, 0.01))
 end
 
+# (The previous overloads are now integrated directly above)

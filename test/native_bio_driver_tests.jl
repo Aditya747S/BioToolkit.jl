@@ -3,7 +3,7 @@ using BigWig
 
 @testset "Native bio driver helpers" begin
     @testset "Sequence utilities" begin
-        dimers = BioToolkit.check_primer_dimers("AAAAAA", "TTTTTT")
+        dimers = BioToolkit.check_primer_dimers(BioToolkit.DNASeq("AAAAAA"), BioToolkit.DNASeq("TTTTTT"))
         @test dimers.has_dimer
         @test dimers.max_3prime_match >= 4
 
@@ -12,7 +12,7 @@ using BigWig
         @test !isempty(amplicons)
         @test amplicons[1].chrom == "chr1"
 
-        guide_score = BioToolkit.score_grna_efficiency("GAGTCCGAGCAGAAGAAGAATGG")
+        guide_score = BioToolkit.score_grna_efficiency(BioToolkit.DNASeq("GAGTCCGAGCAGAAGAAGAATGG"))
         @test 0.0 <= guide_score <= 1.0
     end
 

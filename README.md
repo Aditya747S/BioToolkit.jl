@@ -17,7 +17,10 @@ Unlike wrappers around existing tools, BioToolkit features **original, optimized
     *   **Sequence & Protein Analysis**: GC content, translation, codon usage, melting temps, ProtParam stats.
     *   **Structural Biology**: PDB/mmCIF parsing, RMSD/Kabsch superposition, SASA, contact maps.
     *   **Phylogenetics & PopGen**: Neighbor-joining, consensus trees, $F$-statistics, GWAS scanning.
-    *   **Omics**: Differential expression, single-cell analysis, epigenomics, metabolomics.
+    *   **Omics**: Differential expression, single-cell analysis, epigenomics, metabolomics, and systems-biology modeling.
+*   **DESeq2 + edgeR-style Normalization**: Complete DESeq2 workflow for differential expression analysis, including median-ratio size factors, edgeR-style TMM normalization, dispersion modeling, and Wald testing. See [Examples/deseq2_example.jl](Examples/deseq2_example.jl) for details.
+*   **limma-style Empirical Bayes**: Pure-Julia moderated linear modeling with fitFDist/squeezeVar/eBayes-style variance moderation via `limma_fit` in `SystemsBio`.
+*   **Single-Cell Interop**: Seurate/Scanpy-like API for H5AD I/O, marker-based cell type annotation, and ambient RNA removal. See [Examples/counts_matrix_projection.jl](Examples/counts_matrix_projection.jl) for details.
 
 ## Performance Highlights
 
@@ -107,10 +110,11 @@ Simply installing and importing these packages enables the extra functionality i
 
 *   **[API Overview](BioToolkit.md)**: Detailed book-level overview of modules.
 *   **[Benchmark Report](benchmark_report.md)**: Detailed performance comparisons.
+*   **[Module-Specific Docs](src/)**: In-depth documentation for each module (e.g., `structure.md`, `singlecell_interop.md`).
 
 ## Project Status
 
-BioToolkit is currently in **Alpha/Active Development**. There can be rough edges please use this package only after careful testing.
+BioToolkit is currently in **Alpha/Active Development**. There can be rough edges. The core API is mostly stable, but some modules are still being fleshed out. Performance optimizations are ongoing, and more workflows will be added over time.
 
 ### Development Setup
 For development, clone the repo and instantiate dependencies:
@@ -134,11 +138,6 @@ If possible use [Revise.jl](https://timholy.github.io/Revise.jl/stable/) for liv
 using Revise
 using BioToolkit
 ```
-
-## Why a monolithic package?
-BioToolkit is designed as a single, comprehensive package to provide a unified interface for many bioinformatics tasks. This approach reduces the complexity of managing multiple dependencies and ensures seamless integration between different modules. Also this means that users dont need to change the formats/datatypes when switching between different functionalities, which can be a common source of errors and inefficiencies in multi-package ecosystems like R's biocomputing library. 
-
-Also, the directory structure in src/ is such that one can think of this BioToolkit as a collection of submodules, this gives a clean codebase and a unified API. The design also allows for easy extension, where new functionalities can be added as submodules without affecting the existing codebase.
 
 ## 🤝 Contributing
 

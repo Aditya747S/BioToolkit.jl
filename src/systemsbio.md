@@ -1,34 +1,98 @@
-# systemsbio.jl
+# `systemsbio.jl` - Systems Biology and Multi-Omics
 
-## Purpose
-This file implements systems biology routines for network inference, module detection, limma-style modeling, gene-set enrichment, and multi-omics factor analysis.
+## Overview
 
-## Main types
-- `GeneNetwork` stores a weighted gene graph, node mappings, connectivity scores, and module assignments.
-- `SoftThresholdResult` stores the power sweep used for scale-free network selection.
-- `LimmaResult` stores coefficients, errors, statistics, p-values, q-values, variances, and labels.
-- `NetworkInferenceResult` stores a directed graph and BIC score for inferred networks.
-- `MultiOmicsFactorAnalysisResult` stores factor loadings and explained variance across assays.
+`systemsbio.jl` implements WGCNA-like module discovery, topological overlap, module eigengenes, limma/voom modeling, empirical Bayes moderation, duplicate correlation, batch-effect removal, GSEA integration, Bayesian network inference, MOFA/CCA-style multi-omics integration, WNN-like integration, GRN inference, NMF gene programs, sparse CCA, and causal regression.
 
-## Public functions
-- `pick_soft_threshold(counts; powers)` evaluates scale-free fit across candidate powers.
-- `find_modules(counts; power, tom_threshold, edge_threshold, min_module_size)` builds a gene co-expression network and module assignment.
-- `module_eigengenes(counts, modules)` computes module-level eigengenes.
-- `module_dendrogram(network)` converts module assignments into a tree-like summary.
-- `limma_fit(counts, design; coefficient_names)` fits a moderated linear model.
-- `limma_deresults(result; coefficient_index)` converts a `LimmaResult` into `DEResult` rows.
-- `gsea(results, database; permutations, min_size, max_size, seed)` runs gene-set enrichment on ranked results.
-- `infer_network` and `multi_omics_factor_analysis` are exported analysis entry points for network inference and multi-omics integration.
+### Purpose
 
-## How it is used
-The usual workflow is to start with count data, call `pick_soft_threshold` or `find_modules` to build a co-expression network, and then use `module_eigengenes` or `module_dendrogram` to summarize the module structure.
+This documentation covers the public API implemented in `systemsbio.jl`, with concrete descriptions for the result types and workflow functions exposed by BioToolkit.
 
-For differential modeling, `limma_fit` and `limma_deresults` provide moderated linear statistics that can be passed straight into `gsea`. The network and factor-analysis entry points let the same module cover both graph-based and latent-factor systems biology workflows.
+---
 
-## Implementation notes
-- The network routines depend on weighted and unweighted graph primitives from `Graphs` and `SimpleWeightedGraphs`.
-- `limma_fit` uses empirical Bayes-style variance moderation.
-- `gsea` applies Benjamini-Hochberg correction after permutation-based p-value estimation.
+## Design Decisions
 
-## Why it matters
-Systems biology is where single-gene measurements become interpretable modules and pathways. This file provides the network, model, and enrichment pieces needed to make that transition inside BioToolkit.
+| Decision | Rationale |
+|---|---|
+| **Concrete workflow coverage** | Each section maps to a real analysis task implemented by the module. |
+| **Typed results** | Important model outputs and summaries are represented with explicit structs. |
+| **Downstream compatibility** | Results are shaped for plotting, tabulation, or reuse in other BioToolkit modules. |
+| **Source-aligned API names** | Entries use implemented/exported names rather than speculative aliases. |
+| **Readable defaults** | Examples show the minimal flow without hiding required biological inputs. |
+
+---
+
+## 1. Core Types
+
+Result containers capture networks, limma/voom fits, inferred graphs, and multi-omics factors.
+
+| API | Description |
+|---|---|
+| `GeneNetwork` | Weighted gene network with graph, gene mappings, modules, and connectivity. |
+| `SoftThresholdResult` | Power scan result for scale-free topology and connectivity. |
+| `LimmaResult` | Moderated linear-model coefficients, statistics, p-values, q-values, and metadata. |
+| `VoomResult` | Log-CPM matrix, precision weights, fitted trend, effective library sizes, and design. |
+| `NetworkInferenceResult` | Inferred directed network plus gene/node mappings and BIC score. |
+| `MultiOmicsFactorAnalysisResult` | Latent factors, feature loadings, assay-specific loadings, and explained variance. |
+
+## 2. Networks and Modules
+
+Network functions build coexpression modules and graph summaries.
+
+| API | Description |
+|---|---|
+| `pick_soft_threshold` | Scans powers to choose scale-free coexpression threshold. |
+| `find_modules` | Builds adjacency/TOM network and assigns modules. |
+| `module_eigengenes` | Computes first-PC eigengene per module. |
+| `module_dendrogram` | Creates a phylogenetic-style module dendrogram. |
+| `infer_network` | Infers directed regulatory/dependency network by score search. |
+| `causal_grn_inference` | Builds causal-GRN candidate edges from expression associations. |
+| `gene_program_nmf` | Finds nonnegative gene programs. |
+
+## 3. limma, voom, and Enrichment
+
+Statistical modeling functions implement limma-style empirical Bayes workflows.
+
+| API | Description |
+|---|---|
+| `voom_transform` | Transforms counts to log-CPM and precision weights. |
+| `voom_with_quality_weights` | Adds sample quality weights to voom output. |
+| `estimate_limma_hyperparameters` | Estimates prior variance/degrees of freedom for moderation. |
+| `limma_moderate_ttest` | Runs moderated t-test for one response/design. |
+| `limma_fit` | Fits limma/voom model over a count matrix. |
+| `limma_deresults` | Converts `LimmaResult` to differential-expression rows. |
+| `eBayes` | Applies empirical Bayes moderation to a fit. |
+| `contrasts_fit` | Applies contrast matrix to limma coefficients. |
+| `duplicateCorrelation` | Estimates within-block duplicate correlation. |
+| `remove_batch_effect_limma` | Removes batch effects with limma-style linear modeling. |
+| `gsea` | Runs GSEA over DE or limma results. |
+
+## 4. Multi-Omics Integration and Causal Models
+
+Integration helpers compute shared latent factors, anchors, and causal estimates.
+
+| API | Description |
+|---|---|
+| `multi_omics_factor_analysis` | Computes shared factors across assays. |
+| `mofa_plus_integration` | MOFA+-style integration wrapper. |
+| `mofa_plus_em` | Expectation-maximization MOFA-like factorization. |
+| `cca_integration` | Canonical correlation analysis integration. |
+| `sparse_cca_integration` | Sparse CCA integration. |
+| `anchor_based_integration` | Finds anchors between reference and query assays. |
+| `totalvi_like_integration` | Integrates RNA and protein counts in totalVI-like latent space. |
+| `causal_ate_regression` | Estimates average treatment effect by regression adjustment. |
+
+---
+
+## Complete Usage Example
+
+```julia
+using BioToolkit
+
+soft = pick_soft_threshold(counts)
+network = find_modules(counts; power=soft.best_power)
+voom = voom_transform(counts, design_matrix)
+fit = limma_fit(counts, design_matrix)
+factors = multi_omics_factor_analysis([rna_matrix, protein_matrix])
+```
+

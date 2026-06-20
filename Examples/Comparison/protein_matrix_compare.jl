@@ -22,7 +22,7 @@ end
 function parse_inventory(output::AbstractString)
     match_result = match(r"python_named_matrix_inventory=([A-Z0-9.,_]+)", output)
     match_result === nothing && throw(ArgumentError("missing Python named matrix inventory"))
-    return split(match_result.captures[1], ',')
+    return Base.split(match_result.captures[1], ',')
 end
 
 function main()

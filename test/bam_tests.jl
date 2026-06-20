@@ -24,10 +24,26 @@ using Test
         @test roundtrip.header == header
         @test roundtrip.records == records
 
+        stream_reader = BioToolkit.read_bam(bam_path; materialize=false)
+        @test stream_reader isa BioToolkit.AbstractBamRecordReader
+        @test stream_reader.header == header
+        @test collect(stream_reader) == records
+
         region = BioToolkit.GenomicInterval("chr1", 10, 15)
         region_hits = BioToolkit.read_bam(bam_path, region)
         @test length(region_hits) == 1
         @test region_hits.records[1].qname == "read1"
         @test region_hits.records[1].refname == "chr1"
+
+        region_stream = BioToolkit.read_bam(bam_path, region; materialize=false)
+        @test region_stream isa BioToolkit.AbstractBamRecordReader
+        @test collect(region_stream) == [records[1]]
+
+        missing_region_stream = BioToolkit.read_bam(bam_path, BioToolkit.GenomicInterval("chrX", 1, 50); materialize=false)
+        @test missing_region_stream isa BioToolkit.AbstractBamRecordReader
+        @test isempty(collect(missing_region_stream))
+
+        @test_throws ArgumentError BioToolkit.read_bam(joinpath(dir, "unsupported.cram"))
+        @test_throws ArgumentError BioToolkit.write_bam(joinpath(dir, "unsupported.cram"), bam)
     end
 end
