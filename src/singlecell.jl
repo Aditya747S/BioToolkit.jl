@@ -4,7 +4,7 @@ using CUDA
 using JSON
 using Mmap
 using Optim
-using DifferentialEquations
+using OrdinaryDiffEq
 using SparseArrays
 using Statistics
 using LinearAlgebra
