@@ -5,7 +5,7 @@
 [Benchmark report](benchmark_report.md) | [API reference](api.md)
 
 [![License: Custom](https://img.shields.io/badge/License-Custom-yellow.svg)](https://github.com/Aditya747S/BioToolkit.jl/blob/main/LICENSE)
-[![Julia Version](https://img.shields.io/badge/Julia-1.9%2B-blue.svg)](https://julialang.org/)
+[![Julia Version](https://img.shields.io/badge/Julia-1.10%2B-blue.svg)](https://julialang.org/)
 
 BioToolkit features original, optimized implementations of core algorithms. It is designed as a cohesive toolkit rather than a bundle of wrappers, so sequence I/O, phylogenetics, structural biology, and omics workflows all live in one namespace.
 
@@ -51,7 +51,7 @@ using Pkg
 Pkg.add(url="https://github.com/Aditya747S/BioToolkit.jl.git")
 ```
 
-BioToolkit targets Julia 1.9 and newer.
+BioToolkit targets Julia 1.10 and newer.
 
 ## Optional backends
 

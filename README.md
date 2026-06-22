@@ -1,7 +1,7 @@
 # BioToolkit.jl
 
 [![License: Custom](https://img.shields.io/badge/License-Custom-yellow.svg)](LICENSE)
-[![Julia Version](https://img.shields.io/badge/Julia-1.9%2B-blue.svg)](https://julialang.org/)
+[![Julia Version](https://img.shields.io/badge/Julia-1.10%2B-blue.svg)](https://julialang.org/)
 
 **BioToolkit.jl** is a comprehensive, high-performance bioinformatics toolkit for Julia. It provides a unified, Biopython-inspired API for a vast range of workflows: from sequence analysis and structural biology to population genetics, single-cell omics, and GPU-accelerated genomics.
 
@@ -47,7 +47,7 @@ using Pkg
 Pkg.add(url="https://github.com/Aditya747S/BioToolkit.jl.git")
 ```
 
-BioToolkit targets Julia 1.9 and newer.
+BioToolkit targets Julia 1.10 and newer.
 
 ## Quick Start
 
