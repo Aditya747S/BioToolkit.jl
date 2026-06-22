@@ -2,13 +2,6 @@ using Test
 using DataFrames
 using Tables
 using Graphs
-using BioToolkit
-
-function _node_by_operation(ctx::BioToolkit.ProvenanceContext, operation::AbstractString)
-    matches = [node for node in values(ctx.nodes) if node.operation == operation]
-    @test !isempty(matches)
-    return first(matches)
-end
 
 @testset "Provenance utilities" begin
     @testset "Protein" begin

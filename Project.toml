@@ -76,14 +76,16 @@ SimpleWeightedGraphs = "1"
 SpecialFunctions = "2"
 Turing = "0.43, 0.44, 0.45"
 UUIDs = "1"
-julia = "1.9"
+julia = "1.10"
 
 [extras]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 Turing = "fce5fe82-541a-59a6-adf8-730c64b5f9a0"
 
 [targets]
-test = ["Test", "CUDA", "Flux", "Plots", "Turing"]
+test = ["Test", "CUDA", "Flux", "Logging", "Plots", "Printf", "Turing"]

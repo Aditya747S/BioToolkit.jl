@@ -95,7 +95,15 @@ include("browser.jl")
 
 function _export_public_bindings!(mod::Module)
 	for name in names(mod; all=true, imported=true)
-		startswith(string(name), "_") && continue
+		name_str = string(name)
+		# Skip private, anonymous, and built-in module-level names.
+		# `eval` and `include` are injected into every Module by Julia and
+		# must never be re-exported — doing so causes "conflicts with an
+		# existing identifier" warnings in every consumer of `using BioToolkit`.
+		startswith(name_str, "_") && continue
+		startswith(name_str, "#") && continue
+		name === :eval && continue
+		name === :include && continue
 		isdefined(mod, name) || continue
 		value = getfield(mod, name)
 		value isa Union{Function,Type} || continue

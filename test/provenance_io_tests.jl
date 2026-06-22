@@ -1,18 +1,3 @@
-using Test
-using BioToolkit
-
-function _write_text_file(path::AbstractString, text::AbstractString)
-    open(path, "w") do io
-        write(io, text)
-    end
-    return path
-end
-
-function _node_by_operation(ctx::ProvenanceContext, operation::AbstractString)
-    matches = [node for node in values(ctx.nodes) if node.operation == operation]
-    @test !isempty(matches)
-    return first(matches)
-end
 
 @testset "Provenance I/O" begin
     @testset "FASTA and FASTQ" begin

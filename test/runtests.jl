@@ -12,11 +12,14 @@ BioToolkitTuringExt.__init__()
 
 const provenance_test_files = ["provenance_io_tests.jl", "provenance_utility_tests.jl", "provenance_comprehensive_tests.jl"]
 
+# Shared helpers must be loaded before any provenance test file that uses them.
+include(joinpath(@__DIR__, "test_helpers.jl"))
+
 for file in provenance_test_files
     include(joinpath(@__DIR__, file))
 end
 
-const test_files = sort(filter(file -> endswith(file, ".jl") && file != "runtests.jl" && !(file in provenance_test_files), readdir(@__DIR__)))
+const test_files = sort(filter(file -> endswith(file, ".jl") && file != "runtests.jl" && file != "test_helpers.jl" && !(file in provenance_test_files), readdir(@__DIR__)))
 
 for file in test_files
     include(joinpath(@__DIR__, file))
