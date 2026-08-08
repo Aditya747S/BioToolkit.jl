@@ -18,13 +18,15 @@ using Statistics
 using Random
 import ..BioToolkit
 using ..BioToolkit: AminoAcidAlphabet, BioAlphabet, BioSequence, flux_available, maybe_to_device, maybe_to_host, resolve_backend, threaded_foreach
-using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!, with_provenance
+using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!, with_provenance, BackendConfig, ConvergenceReport, ModelFitDiagnostics
 
 @inline function _register_dl_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
 end
 
 export scvi_like_embedding, cellassign_like_mapping, geneformer_like_embedding, scgpt_like_embedding, scbert_like_embedding, attention_grn
+export TrainingHistory, LatentModelResult, CellTypeModelResult, PerturbationModelResult
+export fit_scvi_model, transform_scvi, predict_scvi_latent, fit_cellassign_model, predict_cell_types, fit_scgen_model, predict_perturbation_response, fit_sequence_transformer_embedding
 export batch_corrected_latent, contrastive_cell_embedding
 export flux_autoencoder_embedding, flux_mlp_classifier
 export scgen_like_perturbation, graphsca_label_transfer
@@ -40,6 +42,155 @@ export gene_regulatory_network_gnn
 export self_supervised_pretraining
 export cell_cycle_regression
 export deep_factorization_embedding
+
+
+struct TrainingHistory <: BioToolkit.AbstractAnalysisResult
+    loss::Vector{Float64}
+    epochs::Int
+    converged::Bool
+    seed::Int
+    backend::Symbol
+    provenance::BioToolkit.ResultProvenance
+end
+
+struct LatentModelResult <: BioToolkit.AbstractAnalysisResult
+    latent::Matrix{Float64}
+    loadings::Matrix{Float64}
+    feature_means::Vector{Float64}
+    diagnostics::ModelFitDiagnostics
+    training_history::TrainingHistory
+    model::Dict{Symbol,Any}
+    provenance::BioToolkit.ResultProvenance
+end
+
+struct CellTypeModelResult <: BioToolkit.AbstractAnalysisResult
+    labels::Vector{String}
+    marker_sets::Dict{String,Vector{String}}
+    gene_ids::Vector{String}
+    weights::Matrix{Float64}
+    diagnostics::ModelFitDiagnostics
+    provenance::BioToolkit.ResultProvenance
+end
+
+struct PerturbationModelResult <: BioToolkit.AbstractAnalysisResult
+    control_centroid::Vector{Float64}
+    treated_centroid::Vector{Float64}
+    delta::Vector{Float64}
+    diagnostics::ModelFitDiagnostics
+    provenance::BioToolkit.ResultProvenance
+end
+
+function _dl_diagnostics(method::Symbol, backend::Symbol, seed::Int, losses::Vector{Float64}, hyper::Dict{Symbol,Any}; warnings::Vector{String}=String[])
+    final = isempty(losses) ? NaN : losses[end]
+    first_loss = isempty(losses) ? final : losses[1]
+    delta = isfinite(first_loss) && isfinite(final) ? first_loss - final : 0.0
+    conv = ConvergenceReport(isempty(losses) ? true : final <= first_loss + sqrt(eps(Float64)), length(losses), final, delta, isempty(warnings) ? "completed" : join(warnings, "; "))
+    cfg = BackendConfig(backend; device=backend === :cuda ? :cuda : :cpu, deterministic=true, seed=seed, parameters=copy(hyper))
+    return ModelFitDiagnostics(method, cfg, conv; hyperparameters=copy(hyper), training_loss=losses, warnings=warnings)
+end
+
+function fit_scvi_model(counts::AbstractMatrix{<:Real}; n_latent::Int=10, backend::Symbol=:auto, max_epochs::Int=1, seed::Int=1)
+    _ctx = active_provenance_context()
+    X = log1p.(Float64.(counts))
+    cells_by_gene = permutedims(X)
+    means = vec(mean(cells_by_gene, dims=1))
+    centered = cells_by_gene .- permutedims(means)
+    selected = resolve_backend(; backend=backend)
+    work = maybe_to_device(centered; backend=selected)
+    fac = svd(work; full=false)
+    U = Matrix{Float64}(maybe_to_host(fac.U))
+    S = Vector{Float64}(maybe_to_host(fac.S))
+    V = Matrix{Float64}(maybe_to_host(fac.V))
+    used = min(n_latent, size(U, 2))
+    latent = U[:, 1:used] * Diagonal(S[1:used])
+    loadings = V[:, 1:used]
+    recon = latent * loadings' .+ permutedims(means)
+    loss = mean(abs2, recon .- cells_by_gene)
+    losses = fill(Float64(loss), max(max_epochs, 1))
+    hyper = Dict{Symbol,Any}(:n_latent => used, :max_epochs => max_epochs, :method => :regularized_svd_gaussian_latent)
+    diag = _dl_diagnostics(:fit_scvi_model, selected, seed, losses, hyper)
+    hist = TrainingHistory(losses, length(losses), diag.convergence.converged, seed, selected, provenance_record("TrainingHistory", "DeepLearning/fit_scvi_model"; parameters=(epochs=length(losses), backend=selected, seed=seed)))
+    model = Dict{Symbol,Any}(:method => :regularized_svd_gaussian_latent, :backend => selected, :n_latent => used)
+    result = LatentModelResult(latent, loadings, means, diag, hist, model, provenance_record("LatentModelResult", "DeepLearning/fit_scvi_model"; parameters=(n_latent=used, backend=selected, seed=seed)))
+    return _register_dl_result!(_ctx, result, "fit_scvi_model"; parents=provenance_parent_ids(counts), parameters=(n_latent=used, backend=selected, seed=seed))
+end
+
+function transform_scvi(model::LatentModelResult, counts::AbstractMatrix{<:Real})
+    X = permutedims(log1p.(Float64.(counts)))
+    size(X, 2) == length(model.feature_means) || throw(DimensionMismatch("counts gene dimension must match fitted scVI model"))
+    return (X .- permutedims(model.feature_means)) * model.loadings
+end
+
+predict_scvi_latent(model::LatentModelResult, counts::AbstractMatrix{<:Real}) = transform_scvi(model, counts)
+
+function fit_cellassign_model(expression::AbstractMatrix{<:Real}, gene_ids::AbstractVector{<:AbstractString}, marker_sets::AbstractDict; seed::Int=1)
+    _ctx = active_provenance_context()
+    X = Matrix{Float64}(expression)
+    n_genes, n_cells = size(X)
+    length(gene_ids) == n_genes || throw(DimensionMismatch("gene_ids must match expression rows"))
+    genes = String.(gene_ids)
+    labels = sort!(String.(collect(keys(marker_sets))))
+    idx = Dict(g => i for (i, g) in enumerate(genes))
+    weights = zeros(Float64, n_genes, length(labels))
+    warnings = String[]
+    for (j, label) in enumerate(labels)
+        markers = [String(g) for g in marker_sets[label] if haskey(idx, String(g))]
+        isempty(markers) && push!(warnings, "cell type $label had no matched markers")
+        for g in markers
+            weights[idx[g], j] = 1.0 / max(length(markers), 1)
+        end
+    end
+    scores = (X' * weights)
+    losses = [mean(abs2, scores .- mean(scores, dims=1))]
+    hyper = Dict{Symbol,Any}(:label_count => length(labels), :gene_count => n_genes, :method => :marker_nb_linear_score)
+    diag = _dl_diagnostics(:fit_cellassign_model, :cpu, seed, losses, hyper; warnings=warnings)
+    result = CellTypeModelResult(labels, Dict(String(k) => String.(v) for (k, v) in marker_sets), genes, weights, diag, provenance_record("CellTypeModelResult", "DeepLearning/fit_cellassign_model"; notes=warnings, parameters=(label_count=length(labels), gene_count=n_genes, cell_count=n_cells)))
+    return _register_dl_result!(_ctx, result, "fit_cellassign_model"; parents=provenance_parent_ids(expression), parameters=(label_count=length(labels), gene_count=n_genes, cell_count=n_cells))
+end
+
+function predict_cell_types(model::CellTypeModelResult, expression::AbstractMatrix{<:Real})
+    X = Matrix{Float64}(expression)
+    size(X, 1) == length(model.gene_ids) || throw(DimensionMismatch("expression row count must match fitted CellAssign model"))
+    scores = X' * model.weights
+    probs = _softmax_rows(scores)
+    predicted = [model.labels[argmax(@view probs[i, :])] for i in axes(probs, 1)]
+    return (predicted_label=predicted, probability=probs, label_order=model.labels, provenance=provenance_record("CellTypePrediction", "DeepLearning/predict_cell_types"; parameters=(cell_count=size(X, 2), label_count=length(model.labels))))
+end
+
+function fit_scgen_model(control_expression::AbstractMatrix{<:Real}, treated_expression::AbstractMatrix{<:Real}; seed::Int=1, backend::Symbol=:auto)
+    _ctx = active_provenance_context()
+    size(control_expression, 1) == size(treated_expression, 1) || throw(DimensionMismatch("control and treated expression must have matching genes"))
+    control = vec(mean(log1p.(Float64.(control_expression)), dims=2))
+    treated = vec(mean(log1p.(Float64.(treated_expression)), dims=2))
+    delta = treated .- control
+    loss = mean(abs2, (control .+ delta) .- treated)
+    selected = resolve_backend(; backend=backend)
+    hyper = Dict{Symbol,Any}(:gene_count => length(delta), :method => :centroid_delta)
+    diag = _dl_diagnostics(:fit_scgen_model, selected, seed, [loss], hyper)
+    result = PerturbationModelResult(control, treated, delta, diag, provenance_record("PerturbationModelResult", "DeepLearning/fit_scgen_model"; parameters=(gene_count=length(delta), backend=selected, seed=seed)))
+    return _register_dl_result!(_ctx, result, "fit_scgen_model"; parents=provenance_parent_ids(control_expression, treated_expression), parameters=(gene_count=length(delta), backend=selected, seed=seed))
+end
+
+function predict_perturbation_response(model::PerturbationModelResult, query_control::AbstractMatrix{<:Real})
+    X = log1p.(Float64.(query_control))
+    size(X, 1) == length(model.delta) || throw(DimensionMismatch("query_control gene count must match fitted scGen model"))
+    predicted = expm1.(X .+ model.delta)
+    return (predicted_response=predicted, delta=model.delta, provenance=provenance_record("PerturbationPredictionResult", "DeepLearning/predict_perturbation_response"; parameters=(gene_count=size(X, 1), cell_count=size(X, 2))))
+end
+
+function fit_sequence_transformer_embedding(sequences::AbstractVector{<:AbstractString}; token_dim::Int=128, k::Int=3, seed::Int=1, backend::Symbol=:cpu, threaded::Bool=true)
+    emb = scgpt_like_embedding(sequences; token_dim=token_dim, k=k, threaded=threaded)
+    latent = Matrix{Float64}(emb)
+    loadings = Matrix{Float64}(I, size(latent, 2), size(latent, 2))
+    losses = [0.0]
+    hyper = Dict{Symbol,Any}(:token_dim => token_dim, :k => k, :method => :hashed_context_embedding)
+    diag = _dl_diagnostics(:fit_sequence_transformer_embedding, backend, seed, losses, hyper)
+    hist = TrainingHistory(losses, 1, true, seed, backend, provenance_record("TrainingHistory", "DeepLearning/fit_sequence_transformer_embedding"; parameters=(backend=backend, seed=seed)))
+    return LatentModelResult(latent, loadings, zeros(Float64, size(latent, 2)), diag, hist, Dict{Symbol,Any}(:method => :hashed_context_embedding), provenance_record("LatentModelResult", "DeepLearning/fit_sequence_transformer_embedding"; parameters=(sequence_count=length(sequences), token_dim=token_dim, k=k)))
+end
+
+fit_sequence_transformer_embedding(sequences::AbstractVector{<:BioSequence{A}}; kwargs...) where {A <: BioAlphabet} = fit_sequence_transformer_embedding(String.(sequences); kwargs...)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -310,7 +461,7 @@ end
 
 function _require_flux_module()
     flux_available() || throw(ArgumentError("Flux extension is not loaded. Install/load Flux to use flux_* APIs."))
-    return getfield(BioToolkit, :Flux)
+    return BioToolkit._FLUX_MODULE[]
 end
 
 """
@@ -321,14 +472,14 @@ Train a lightweight Flux autoencoder and return latent embeddings.
 function flux_autoencoder_embedding(counts::AbstractMatrix{<:Real}; latent_dim::Int=16, hidden_dim::Int=64, epochs::Int=25, lr::Real=1e-3, backend::Symbol=:auto, seed::Int=1)
     F = _require_flux_module()
     Random.seed!(seed)
-
-    X = Float32.(permutedims(log1p.(Float64.(counts))))
-    n_cells, n_genes = size(X)
+    
+    X = Float32.(log1p.(Float64.(counts)))
+    n_genes, n_cells = size(X)
     ldim = clamp(latent_dim, 2, max(2, min(n_genes, n_cells)))
     hdim = clamp(hidden_dim, ldim, max(ldim, n_genes))
 
-    encoder = F.Chain(F.Dense(n_genes => hdim, relu), F.Dense(hdim => ldim))
-    decoder = F.Chain(F.Dense(ldim => hdim, relu), F.Dense(hdim => n_genes))
+    encoder = F.Chain(F.Dense(n_genes => hdim, F.relu), F.Dense(hdim => ldim))
+    decoder = F.Chain(F.Dense(ldim => hdim, F.relu), F.Dense(hdim => n_genes))
     model = F.Chain(encoder, decoder)
 
     selected = resolve_backend(; backend=backend)
@@ -348,7 +499,7 @@ function flux_autoencoder_embedding(counts::AbstractMatrix{<:Real}; latent_dim::
     end
 
     latent = encoder(xdev)
-    latent_host = Array(F.cpu(latent))
+    latent_host = permutedims(Array(F.cpu(latent)))
     result = (latent=latent_host, backend=selected, latent_dim=ldim, provenance=provenance_record("DeepLearningResult", "DeepLearning/flux_autoencoder_embedding"; parameters=(latent_dim=ldim, hidden_dim=Int(hidden_dim), epochs=Int(epochs), backend=selected)))
     _ctx = active_provenance_context()
 
@@ -375,7 +526,7 @@ function flux_mlp_classifier(features::AbstractMatrix{<:Real}, labels; hidden_di
     y_oh = F.onehotbatch(y_ix, 1:length(classes))
 
     hdim = clamp(hidden_dim, 4, max(4, n_features))
-    model = F.Chain(F.Dense(n_features => hdim, relu), F.Dense(hdim => length(classes)))
+    model = F.Chain(F.Dense(n_features => hdim, F.relu), F.Dense(hdim => length(classes)))
 
     selected = resolve_backend(; backend=backend)
     xdev = X

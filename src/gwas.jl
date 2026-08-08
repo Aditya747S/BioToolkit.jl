@@ -66,6 +66,7 @@ export burden_test, skat_test, conditional_fdr, storey_pi0_estimate, gwas_power_
 export twas_scan, smr_test, liftover, functional_annotation, ld_expand_credible_set, estimate_effective_n, he_regression_variance_components, reml_variance_components
 export simulate_genotypes, simulate_phenotype, dosage_to_hardcall, info_score_from_dosage, popcorn_genetic_correlation, ebi_lookup
 export save_gwas_result, load_gwas_result
+export PackedGenotypes, packed_genotypes_from_dosage, packed_genotypes_from_gt, genotype_dosage, genotype_missingness, genotype_and, genotype_or
 
 const _GWAS_MIGRATION_GUIDE = """
 ### Migrating from SnpArrays.jl and JWAS.jl
@@ -106,6 +107,117 @@ end
 
 GenotypeMatrix(decoded::AbstractMatrix{<:Real}, bim::DataFrame, fam::DataFrame; prefix::String="") =
     GenotypeMatrix(UInt8[], Matrix{Float64}(decoded), bim, fam, String(prefix))
+
+
+"""
+    PackedGenotypes
+
+Two-bit packed diploid genotype vector. Codes are 0=hom-ref, 1=het,
+2=hom-alt, 3=missing. This stores four genotypes per byte and provides
+bounds-checked random access plus dosage conversion.
+"""
+struct PackedGenotypes <: AbstractVector{UInt8}
+    blocks::Vector{UInt8}
+    n::Int
+    metadata::Dict{Symbol,Any}
+end
+
+function PackedGenotypes(codes::AbstractVector{<:Integer}; metadata::AbstractDict=Dict{Symbol,Any}())
+    n = length(codes)
+    blocks = zeros(UInt8, cld(n, 4))
+    pg = PackedGenotypes(blocks, n, Dict{Symbol,Any}(metadata))
+    for (i, code) in enumerate(codes)
+        _packed_setindex!(pg, UInt8(code), i)
+    end
+    return pg
+end
+
+Base.IndexStyle(::Type{PackedGenotypes}) = IndexLinear()
+Base.size(pg::PackedGenotypes) = (pg.n,)
+Base.length(pg::PackedGenotypes) = pg.n
+
+@inline function _packed_check_code(code::UInt8)
+    code <= 0x03 || throw(ArgumentError("packed genotype code must be 0, 1, 2, or 3"))
+    return code
+end
+
+@inline function _packed_location(i::Integer)
+    i >= 1 || throw(BoundsError())
+    zero_index = Int(i) - 1
+    return div(zero_index, 4) + 1, 2 * mod(zero_index, 4)
+end
+
+@inline function Base.getindex(pg::PackedGenotypes, i::Int)
+    1 <= i <= pg.n || throw(BoundsError(pg, i))
+    block, shift = _packed_location(i)
+    return UInt8((pg.blocks[block] >> shift) & 0x03)
+end
+
+@inline function _packed_setindex!(pg::PackedGenotypes, code::UInt8, i::Int)
+    1 <= i <= pg.n || throw(BoundsError(pg, i))
+    code = _packed_check_code(code)
+    block, shift = _packed_location(i)
+    mask = UInt8(0x03 << shift)
+    pg.blocks[block] = (pg.blocks[block] & ~mask) | UInt8(code << shift)
+    return pg
+end
+
+function Base.setindex!(pg::PackedGenotypes, code::Integer, i::Int)
+    return _packed_setindex!(pg, UInt8(code), i)
+end
+
+function packed_genotypes_from_dosage(dosage::AbstractVector{<:Real}; metadata::AbstractDict=Dict{Symbol,Any}())
+    codes = Vector{UInt8}(undef, length(dosage))
+    for (i, value) in enumerate(dosage)
+        codes[i] = !isfinite(Float64(value)) ? 0x03 : UInt8(clamp(round(Int, value), 0, 2))
+    end
+    return PackedGenotypes(codes; metadata=metadata)
+end
+
+function packed_genotypes_from_gt(gt::AbstractVector{<:AbstractString}; metadata::AbstractDict=Dict{Symbol,Any}())
+    codes = Vector{UInt8}(undef, length(gt))
+    for (i, value) in enumerate(gt)
+        dosage = _vcf_gt_to_dosage(value)
+        codes[i] = isfinite(dosage) ? UInt8(Int(dosage)) : 0x03
+    end
+    return PackedGenotypes(codes; metadata=metadata)
+end
+
+function genotype_dosage(pg::PackedGenotypes)
+    out = Vector{Float64}(undef, length(pg))
+    for i in eachindex(pg)
+        code = pg[i]
+        out[i] = code == 0x03 ? NaN : Float64(code)
+    end
+    return out
+end
+
+function genotype_missingness(pg::PackedGenotypes)
+    isempty(pg) && return 0.0
+    missing = count(i -> pg[i] == 0x03, eachindex(pg))
+    return missing / length(pg)
+end
+
+function genotype_and(left::PackedGenotypes, right::PackedGenotypes)
+    length(left) == length(right) || throw(DimensionMismatch("packed genotype vectors must have equal length"))
+    out = Vector{UInt8}(undef, length(left))
+    for i in eachindex(left)
+        a = left[i]; b = right[i]
+        out[i] = (a == 0x03 || b == 0x03) ? 0x03 : UInt8((a > 0 && b > 0) ? 1 : 0)
+    end
+    return PackedGenotypes(out)
+end
+
+function genotype_or(left::PackedGenotypes, right::PackedGenotypes)
+    length(left) == length(right) || throw(DimensionMismatch("packed genotype vectors must have equal length"))
+    out = Vector{UInt8}(undef, length(left))
+    for i in eachindex(left)
+        a = left[i]; b = right[i]
+        out[i] = (a == 0x03 && b == 0x03) ? 0x03 : UInt8((a > 0 || b > 0) ? 1 : 0)
+    end
+    return PackedGenotypes(out)
+end
+
 
 """
     BedReader

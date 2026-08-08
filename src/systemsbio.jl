@@ -23,7 +23,8 @@ export GeneNetwork, SoftThresholdResult, LimmaResult, VoomResult, NetworkInferen
 export pick_soft_threshold, find_modules, module_eigengenes, module_dendrogram, voom_transform, voom_with_quality_weights, estimate_limma_hyperparameters, limma_moderate_ttest, eBayes, contrasts_fit, duplicateCorrelation, remove_batch_effect_limma, limma_fit, limma_deresults, gsea, infer_network, multi_omics_factor_analysis
 export mofa_plus_integration, cca_integration, anchor_based_integration, totalvi_like_integration, causal_grn_inference, gene_program_nmf
 export mofa_plus_em, sparse_cca_integration
-export causal_ate_regression
+export causal_ate_regression, flux_balance_analysis, grn_reconstruction_mi, protein_interaction_network_alignment
+
 
 struct GeneNetwork
     graph::SimpleWeightedGraph{Int,Float64}
@@ -1535,4 +1536,149 @@ function causal_ate_regression(df::DataFrame, treatment::Symbol, outcome::Symbol
     return provenance_result!(_ctx, (ate=ate, std_error=se, zscore=z, pvalue=p, coefficients=β, covariates=covariates), "causal_ate_regression")
 end
 
+using Optim: Fminbox, BFGS, optimize, converged
+
+function flux_balance_analysis(stoichiometry::AbstractMatrix{<:Real}, lower_bounds::AbstractVector{<:Real}, upper_bounds::AbstractVector{<:Real}, objective_weights::AbstractVector{<:Real})
+    _ctx = active_provenance_context()
+    S = Float64.(stoichiometry)
+    lb = Float64.(lower_bounds)
+    ub = Float64.(upper_bounds)
+    c = Float64.(objective_weights)
+    
+    f(v) = -dot(c, v) + 1e6 * sum((S * v).^2)
+    
+    init_v = (lb + ub) ./ 2.0
+    res = optimize(f, lb, ub, init_v, Fminbox(BFGS()))
+    
+    v_opt = res.minimizer
+    obj_val = dot(c, v_opt)
+    
+    result = (fluxes=v_opt, objective_value=obj_val, status=converged(res) ? "converged" : "failed")
+    return provenance_result!(_ctx, result, "flux_balance_analysis"; parents=String[])
 end
+
+function ksg_mi(x::Vector{Float64}, y::Vector{Float64}; k::Int=3)
+    n = length(x)
+    dists = [max(abs(x[i] - x[j]), abs(y[i] - y[j])) for i in 1:n, j in 1:n]
+    
+    eps_val = zeros(n)
+    for i in 1:n
+        sorted_d = sort(dists[i, :])
+        eps_val[i] = sorted_d[k + 1]
+    end
+    
+    nx = zeros(Int, n)
+    ny = zeros(Int, n)
+    for i in 1:n
+        nx[i] = count(j -> abs(x[i] - x[j]) < eps_val[i], 1:n) - 1
+        ny[i] = count(j -> abs(y[i] - y[j]) < eps_val[i], 1:n) - 1
+    end
+    
+    mi = digamma(k) - mean(digamma.(nx .+ 1) .+ digamma.(ny .+ 1)) + digamma(n)
+    return max(0.0, mi)
+end
+
+function grn_reconstruction_mi(expression::AbstractMatrix{<:Real}; estimator::Symbol=:pearson)
+    _ctx = active_provenance_context()
+    
+    n_genes, n_samples = size(expression)
+    mi_matrix = zeros(n_genes, n_genes)
+    
+    if estimator == :pearson
+        r_matrix = cor(permutedims(expression))
+        r_matrix[.!isfinite.(r_matrix)] .= 0.0
+        for i in 1:n_genes, j in i:n_genes
+            r = r_matrix[i, j]
+            mi = -0.5 * log(max(1.0 - r^2, 1e-12))
+            mi_matrix[i, j] = mi
+            mi_matrix[j, i] = mi
+        end
+    elseif estimator == :spearman
+        # Simple Spearman rank correlation
+        ranks = zeros(Float64, n_genes, n_samples)
+        for i in 1:n_genes
+            ranks[i, :] .= sortperm(sortperm(expression[i, :]))
+        end
+        r_matrix = cor(permutedims(ranks))
+        r_matrix[.!isfinite.(r_matrix)] .= 0.0
+        for i in 1:n_genes, j in i:n_genes
+            r = r_matrix[i, j]
+            mi = -0.5 * log(max(1.0 - r^2, 1e-12))
+            mi_matrix[i, j] = mi
+            mi_matrix[j, i] = mi
+        end
+    elseif estimator == :kraskov
+        for i in 1:n_genes
+            for j in i:n_genes
+                mi = ksg_mi(Vector{Float64}(expression[i, :]), Vector{Float64}(expression[j, :]))
+                mi_matrix[i, j] = mi
+                mi_matrix[j, i] = mi
+            end
+        end
+    else
+        throw(ArgumentError("unknown estimator: $estimator"))
+    end
+    
+    return provenance_result!(_ctx, mi_matrix, "grn_reconstruction_mi"; parents=String[], parameters=(estimator=estimator,))
+end
+
+function protein_interaction_network_alignment(net1::SimpleGraph, net2::SimpleGraph; alpha::Real=0.82, max_iter::Int=50, tol::Float64=1e-5)
+    _ctx = active_provenance_context()
+    n1 = nv(net1)
+    n2 = nv(net2)
+    
+    A = zeros(n1, n1)
+    for e in edges(net1)
+        A[src(e), dst(e)] = 1.0
+        A[dst(e), src(e)] = 1.0
+    end
+    for i in 1:n1
+        s = sum(A[i, :])
+        if s > 0
+            A[i, :] ./= s
+        end
+    end
+    
+    B = zeros(n2, n2)
+    for e in edges(net2)
+        B[src(e), dst(e)] = 1.0
+        B[dst(e), src(e)] = 1.0
+    end
+    for i in 1:n2
+        s = sum(B[i, :])
+        if s > 0
+            B[i, :] ./= s
+        end
+    end
+    
+    E = fill(1.0 / (n1 * n2), n1, n2)
+    R = copy(E)
+    
+    for iter in 1:max_iter
+        R_next = alpha .* (A * R * B') .+ (1 - alpha) .* E
+        if norm(R_next .- R) < tol
+            R = R_next
+            break
+        end
+        R = R_next
+    end
+    
+    alignment_map = Dict{Int,Int}()
+    R_temp = copy(R)
+    for _ in 1:min(n1, n2)
+        val, idx = findmax(R_temp)
+        if val <= 0.0
+            break
+        end
+        u, v = idx[1], idx[2]
+        alignment_map[u] = v
+        R_temp[u, :] .= -1.0
+        R_temp[:, v] .= -1.0
+    end
+    
+    result = (alignment_matrix=R, alignment_map=alignment_map)
+    return provenance_result!(_ctx, result, "protein_interaction_network_alignment"; parents=String[])
+end
+
+end
+

@@ -23,8 +23,10 @@ using SpecialFunctions
 using ..GenomicRanges: GenomicInterval, IntervalCollection, CoverageSegment, build_collection, coverage as interval_coverage, promoters
 using ..DifferentialExpression: CountMatrix, DEResult, differential_expression, benjamini_hochberg
 using ..SingleCell: SingleCellExperiment, count_matrix as singlecell_count_matrix, normalize_counts, run_pca, run_umap, cluster_cells, summarize_clusters
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, BioSequence, DNAAlphabet, HMM, viterbi
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ThreadSafeProvenanceContext, active_provenance_context, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, register_provenance!, stamp_provenance!, update_provenance!
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, BioSequence, DNAAlphabet, HMM, viterbi, MotifProfile, MotifPWM, MotifHit, motif_scan_both_strands, read_fasta, SeqRecord, motif_enrichment_peaks
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ThreadSafeProvenanceContext, active_provenance_context, metadata_provenance, new_provenance_id, provenance_parent_ids, register_provenance!, stamp_provenance!, update_provenance!, provenance_result!
+
+
 
 export SparseCoverageVector, Peak, PeakSet, Epigenome
 export PeakSupport
@@ -38,6 +40,12 @@ export compute_motif_deviations, detect_footprints
 export directionality_index, detect_tads
 export chromhmm_like_segmentation, hic_ice_normalize, hic_kr_normalize, hic_ab_compartments, tobias_like_footprints, parse_bismark_coverage
 export insulation_score, compartment_boundary_candidates
+export ATACExperiment, ATACFragment, ATACQCResult, FragmentSizeDistribution, NucleosomeMetricsResult
+export atac_experiment, tss_enrichment, fragment_size_distribution, nucleosome_metrics, frip_score
+export insertion_bias_correction, atac_peak_calling, atac_qc_report
+export CrossCorrelationResult, StrandCorrelationProfile, cross_correlation_profile, nsc_rsc_metrics
+export IDRResult, idr_analysis, consensus_peaks, chipseq_motif_enrichment, diffbind_like_workflow
+
 
 struct SparseCoverageVector
     positions::Vector{Int}
@@ -59,6 +67,12 @@ struct Peak
     score::Float64
     pvalue::Float64
     qvalue::Float64
+end
+
+# Convenience constructor: Peak(chrom, left, right, score)
+function Peak(chrom::AbstractString, left::Integer, right::Integer, score::Real)
+    summit = (left + right) ÷ 2
+    Peak(string(chrom, ":", left, "-", right), String(chrom), Int(left), Int(right), Int(summit), Float64(score), 1.0, 1.0)
 end
 
 struct PeakSet
@@ -1494,4 +1508,765 @@ function compartment_boundary_candidates(insulation; q::Real=0.2)
     return out
 end
 
+# ==============================================================================
+# ATAC-seq workflow
+# ==============================================================================
+
+struct ATACFragment
+    chrom::String
+    left::Int
+    right::Int
+    insert_size::Int
+    strand::Char
+    barcode::String
+    sample_id::String
 end
+
+struct FragmentSizeDistribution
+    sizes::Vector{Int}
+    counts::Vector{Int}
+    mean_size::Float64
+    median_size::Float64
+    mode_size::Int
+    nucleosome_free::Float64      # fraction < 147 bp
+    mono_nucleosome::Float64      # fraction 147-294 bp
+    di_nucleosome::Float64        # fraction 294-441 bp
+    tri_plus_nucleosome::Float64  # fraction >= 441 bp
+end
+
+struct ATACExperiment
+    fragments::Vector{ATACFragment}
+    fragments_by_chrom::Dict{String,Vector{Int}}
+    sample_ids::Vector{String}
+    metadata::Dict{String,Any}
+end
+
+struct ATACQCResult <: AbstractAnalysisResult
+    sample_id::String
+    total_fragments::Int
+    unique_fragments::Int
+    duplication_rate::Float64
+    frip::Float64
+    tss_enrichment::Float64
+    nucleosome_signal::Float64
+    median_insert_size::Float64
+    fraction_nucleosome_free::Float64
+    fraction_mono_nucleosome::Float64
+    provenance::ResultProvenance
+end
+
+ATACQCResult(sample_id, total_fragments, unique_fragments, duplication_rate, frip, tss_enrichment, nucleosome_signal, median_insert_size, fraction_nucleosome_free, fraction_mono_nucleosome) =
+    ATACQCResult(sample_id, total_fragments, unique_fragments, duplication_rate, frip, tss_enrichment, nucleosome_signal, median_insert_size, fraction_nucleosome_free, fraction_mono_nucleosome, provenance_record("ATACQCResult", "epigenetics"))
+
+struct NucleosomeMetricsResult <: AbstractAnalysisResult
+    sample_id::String
+    nucleosome_signal::Float64
+    nucleosome_periodicity::Float64
+    mononucleosome_fraction::Float64
+    dinucleosome_fraction::Float64
+    fraction_small::Float64
+    estimated_nucleosome_spacing::Float64
+    provenance::ResultProvenance
+end
+
+NucleosomeMetricsResult(sample_id, nucleosome_signal, nucleosome_periodicity, mononucleosome_fraction, dinucleosome_fraction, fraction_small, estimated_nucleosome_spacing) =
+    NucleosomeMetricsResult(sample_id, nucleosome_signal, nucleosome_periodicity, mononucleosome_fraction, dinucleosome_fraction, fraction_small, estimated_nucleosome_spacing, provenance_record("NucleosomeMetricsResult", "epigenetics"))
+
+Base.length(exp::ATACExperiment) = length(exp.fragments)
+Base.isempty(exp::ATACExperiment) = isempty(exp.fragments)
+
+function atac_experiment(fragments::AbstractVector{<:GenomicInterval}; barcodes::AbstractVector{<:AbstractString}=fill("unknown", length(fragments)), sample_ids::AbstractVector{<:AbstractString}=fill("default", length(fragments)), strands::AbstractVector{Char}=fill('+', length(fragments)))
+    n = length(fragments)
+    n == length(barcodes) || throw(DimensionMismatch("barcodes length must match fragments"))
+    n == length(sample_ids) || throw(DimensionMismatch("sample_ids length must match fragments"))
+    n == length(strands) || throw(DimensionMismatch("strands length must match fragments"))
+
+    atac_frags = ATACFragment[]
+    sizehint!(atac_frags, n)
+    for i in 1:n
+        frag = fragments[i]
+        insert_size = frag.right - frag.left + 1
+        push!(atac_frags, ATACFragment(frag.chrom, frag.left, frag.right, insert_size, strands[i], String(barcodes[i]), String(sample_ids[i])))
+    end
+
+    fragments_by_chrom = Dict{String,Vector{Int}}()
+    for (idx, frag) in enumerate(atac_frags)
+        push!(get!(fragments_by_chrom, frag.chrom, Int[]), idx)
+    end
+
+    unique_samples = sort!(unique(String.(sample_ids)))
+    metadata_dict = Dict{String,Any}(
+        "fragment_count" => n,
+        "sample_count" => length(unique_samples),
+        "chrom_count" => length(fragments_by_chrom))
+
+    return ATACExperiment(atac_frags, fragments_by_chrom, unique_samples, metadata_dict)
+end
+
+function atac_experiment(fragments_by_sample::AbstractDict; barcodes_by_sample::AbstractDict=Dict{String,Vector{String}}())
+    all_frags = GenomicInterval[]
+    all_barcodes = String[]
+    all_samples = String[]
+    all_strands = Char[]
+
+    for (sample_id, frags) in fragments_by_sample
+        bc_list = get(barcodes_by_sample, sample_id, fill("unknown", length(frags)))
+        for (j, frag) in enumerate(frags)
+            push!(all_frags, frag)
+            push!(all_barcodes, String(bc_list[j]))
+            push!(all_samples, String(sample_id))
+            push!(all_strands, '+')
+        end
+    end
+
+    return atac_experiment(all_frags; barcodes=all_barcodes, sample_ids=all_samples, strands=all_strands)
+end
+
+function fragment_size_distribution(exp::ATACExperiment; max_size::Int=1000)
+    sizes = [min(frag.insert_size, max_size) for frag in exp.fragments]
+    size_counts = zeros(Int, max_size)
+    for s in sizes
+        size_counts[s] += 1
+    end
+
+    total = length(sizes)
+    total == 0 && return FragmentSizeDistribution(collect(1:max_size), zeros(Int, max_size), 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0)
+
+    mean_size = mean(Float64.(sizes))
+    median_size = median(Float64.(sizes))
+    mode_size = argmax(size_counts)
+
+    nucleosome_free = sum(size_counts[1:146]) / total
+    mono_nucleosome = sum(size_counts[147:294]) / total
+    di_nucleosome = sum(size_counts[295:441]) / total
+    tri_plus = sum(size_counts[442:end]) / total
+
+    result = FragmentSizeDistribution(collect(1:max_size), size_counts, mean_size, median_size, mode_size, nucleosome_free, mono_nucleosome, di_nucleosome, tri_plus)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "fragment_size_distribution";
+            parameters=(total_fragments=total, max_size=max_size, mean_size=mean_size, median_size=median_size))
+    end
+    return result
+end
+
+function nucleosome_metrics(exp::ATACExperiment; min_size::Int=50, max_size::Int=500)
+    sizes = [frag.insert_size for frag in exp.fragments if min_size <= frag.insert_size <= max_size]
+    isempty(sizes) && return NucleosomeMetricsResult(exp.sample_ids[1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    size_counts = zeros(Int, max_size - min_size + 1)
+    for s in sizes
+        size_counts[s - min_size + 1] += 1
+    end
+
+    total = sum(size_counts)
+    total == 0 && return NucleosomeMetricsResult(exp.sample_ids[1], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    mononucleosome_count = sum(size_counts[97:244])
+    dinucleosome_count = sum(size_counts[245:392])
+    small_count = sum(size_counts[1:96])
+
+    mono_fraction = mononucleosome_count / total
+    di_fraction = dinucleosome_count / total
+    small_fraction = small_count / total
+
+    nucleosome_signal = (mono_fraction + di_fraction) / max(small_fraction, eps(Float64))
+
+    autocorr = zeros(Float64, 50)
+    centered = Float64.(size_counts) .- mean(Float64.(size_counts))
+    var_total = sum(centered .^ 2)
+    var_total > 0 || return NucleosomeMetricsResult(exp.sample_ids[1], nucleosome_signal, 0.0, mono_fraction, di_fraction, small_fraction, 0.0)
+
+    for lag in 1:49
+        n_lag = length(centered) - lag
+        autocorr[lag] = sum(centered[1:n_lag] .* centered[lag+1:end]) / var_total
+    end
+
+    periodicity = 0.0
+    estimated_spacing = 0.0
+    if length(autocorr) > 10
+        peak_region = autocorr[10:end]
+        if !isempty(peak_region)
+            peak_lag = argmax(peak_region) + 9
+            periodicity = autocorr[peak_lag]
+            estimated_spacing = Float64(peak_lag)
+        end
+    end
+
+    sample_id = isempty(exp.sample_ids) ? "unknown" : exp.sample_ids[1]
+    result = NucleosomeMetricsResult(sample_id, nucleosome_signal, periodicity, mono_fraction, di_fraction, small_fraction, estimated_spacing)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "nucleosome_metrics";
+            parameters=(sample_id=sample_id, nucleosome_signal=nucleosome_signal, periodicity=periodicity, mono_fraction=mono_fraction))
+    end
+    return result
+end
+
+function tss_enrichment(exp::ATACExperiment, tss_sites::AbstractVector{<:GenomicInterval}; flank::Int=1000, bin_width::Int=10)
+    tss_by_chrom = Dict{String,Vector{Int}}()
+    for (idx, tss) in enumerate(tss_sites)
+        push!(get!(tss_by_chrom, tss.chrom, Int[]), idx)
+    end
+
+    num_bins = 2 * div(flank, bin_width) + 1
+    profile = zeros(Float64, num_bins)
+    center_bin = div(num_bins, 2) + 1
+
+    for (chrom, chrom_indices) in tss_by_chrom
+        chrom_frags = get(exp.fragments_by_chrom, chrom, Int[])
+        isempty(chrom_frags) && continue
+
+        for tss_idx in chrom_indices
+            tss = tss_sites[tss_idx]
+            tss_pos = tss.left
+
+            for frag_idx in chrom_frags
+                frag = exp.fragments[frag_idx]
+                frag_mid = (frag.left + frag.right) ÷ 2
+                offset = frag_mid - tss_pos
+                abs(offset) > flank && continue
+
+                bin = center_bin + div(offset, bin_width)
+                if 1 <= bin <= num_bins
+                    profile[bin] += 1.0
+                end
+            end
+        end
+    end
+
+    center_width = 11
+    center_left = max(1, center_bin - div(center_width, 2))
+    center_right = min(num_bins, center_bin + div(center_width, 2))
+    center_mean = mean(profile[center_left:center_right])
+
+    flank_left = max(1, center_bin - div(num_bins, 3))
+    flank_right = center_left - 1
+    flank_right2 = center_right + 1
+    flank_left2 = min(num_bins, center_bin + div(num_bins, 3))
+
+    flank_values = Float64[]
+    if flank_right >= flank_left
+        append!(flank_values, profile[flank_left:flank_right])
+    end
+    if flank_left2 >= flank_right2
+        append!(flank_values, profile[flank_right2:flank_left2])
+    end
+    flank_mean = isempty(flank_values) ? eps(Float64) : mean(flank_values)
+
+    enrichment = center_mean / max(flank_mean, eps(Float64))
+
+    positions = collect(range(-flank, flank, length=num_bins))
+    result = (positions=positions, profile=profile, enrichment=enrichment, center_mean=center_mean, flank_mean=flank_mean)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "tss_enrichment";
+            parameters=(total_fragments=length(exp.fragments), tss_count=length(tss_sites), flank=flank, enrichment=enrichment))
+    end
+    return result
+end
+
+function frip_score(exp::ATACExperiment, peaks::PeakSet)
+    total_fragments = length(exp.fragments)
+    total_fragments == 0 && return 0.0
+
+    peak_lookup = Dict{String,Vector{Int}}()
+    for (idx, peak) in enumerate(peaks.peaks)
+        push!(get!(peak_lookup, peak.chrom, Int[]), idx)
+    end
+
+    fragments_in_peaks = 0
+    for (chrom, chrom_indices) in exp.fragments_by_chrom
+        chrom_peaks = get(peak_lookup, chrom, Int[])
+        isempty(chrom_peaks) && continue
+
+        for frag_idx in chrom_indices
+            frag = exp.fragments[frag_idx]
+            for peak_idx in chrom_peaks
+                peak = peaks.peaks[peak_idx]
+                if frag.left <= peak.right && frag.right >= peak.left
+                    fragments_in_peaks += 1
+                    break
+                end
+            end
+        end
+    end
+
+    frip = fragments_in_peaks / total_fragments
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "frip_score";
+            parameters=(total_fragments=total_fragments, fragments_in_peaks=fragments_in_peaks, frip=frip, peak_count=length(peaks.peaks)))
+    end
+    return frip
+end
+
+const _TN5_INSERTION_MOTIFS = Dict(
+    "Tn5_5prime" => r"CTGTCTCTTATACACATCT",
+    "Tn5_3prime" => r"AGATGTGTATAAGAGACAG")
+
+function insertion_bias_correction(exp::ATACExperiment; motif_window::Int=10)
+    insertion_counts = Dict{String,Int}()
+    for frag in exp.fragments
+        left_key = "$(frag.chrom):$(frag.left)"
+        right_key = "$(frag.chrom):$(frag.right)"
+        insertion_counts[left_key] = get(insertion_counts, left_key, 0) + 1
+        insertion_counts[right_key] = get(insertion_counts, right_key, 0) + 1
+    end
+
+    total_insertions = sum(values(insertion_counts))
+    total_insertions == 0 && return (bias_profile=Dict{String,Float64}(), correction_factors=Dict{String,Float64}(), total_insertions=0)
+
+    motif_counts = Dict{String,Int}()
+    for motif_name in keys(_TN5_INSERTION_MOTIFS)
+        motif_counts[motif_name] = 0
+    end
+
+    for (pos_key, count) in insertion_counts
+        motif_counts["background"] = get(motif_counts, "background", 0) + count
+    end
+
+    expected_freq = 1.0 / max(length(insertion_counts), 1)
+    correction_factors = Dict{String,Float64}()
+    for (pos_key, count) in insertion_counts
+        observed_freq = count / total_insertions
+        correction_factors[pos_key] = observed_freq / max(expected_freq, eps(Float64))
+    end
+
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "insertion_bias_correction";
+            parameters=(total_insertions=total_insertions, unique_sites=length(insertion_counts)))
+    end
+    return (bias_profile=motif_counts, correction_factors=correction_factors, total_insertions=total_insertions)
+end
+
+function atac_qc_report(exp::ATACExperiment, peaks::PeakSet, tss_sites::AbstractVector{<:GenomicInterval}; flank::Int=1000)
+    total_fragments = length(exp.fragments)
+    unique_barcode_set = Set{String}()
+    for frag in exp.fragments
+        push!(unique_barcode_set, frag.barcode)
+    end
+    unique_fragments = length(unique_barcode_set)
+    duplication_rate = total_fragments > 0 ? 1.0 - (unique_fragments / total_fragments) : 0.0
+
+    frip = frip_score(exp, peaks)
+
+    tss_result = tss_enrichment(exp, tss_sites; flank=flank)
+    tss_enrich = tss_result.enrichment
+
+    nuc_metrics = nucleosome_metrics(exp)
+    nucleosome_signal = nuc_metrics.nucleosome_signal
+
+    frag_dist = fragment_size_distribution(exp)
+    median_insert = frag_dist.median_size
+
+    sample_id = isempty(exp.sample_ids) ? "unknown" : exp.sample_ids[1]
+    result = ATACQCResult(sample_id, total_fragments, unique_fragments, duplication_rate, frip, tss_enrich, nucleosome_signal, median_insert, frag_dist.nucleosome_free, frag_dist.mono_nucleosome)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "atac_qc_report";
+            parameters=(sample_id=sample_id, total_fragments=total_fragments, frip=frip, tss_enrichment=tss_enrich, nucleosome_signal=nucleosome_signal))
+    end
+    return result
+end
+
+function atac_peak_calling(exp::ATACExperiment; pvalue_threshold::Real=0.01, min_depth::Int=1, merge_gap::Int=0)
+    coverage_dict = calculate_coverage([GenomicInterval(frag.chrom, frag.left, frag.right, '+') for frag in exp.fragments])
+    peaks = call_peaks(coverage_dict; pvalue_threshold=pvalue_threshold, min_depth=min_depth, merge_gap=merge_gap)
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "atac_peak_calling";
+            parameters=(fragment_count=length(exp.fragments), pvalue_threshold=Float64(pvalue_threshold), peak_count=length(peaks.peaks)))
+    end
+    return peaks
+end
+
+# ==============================================================================
+# ChIP-seq full workflow
+# ==============================================================================
+
+struct StrandCorrelationProfile <: AbstractAnalysisResult
+    chrom::String
+    shifts::Vector{Int}
+    correlations::Vector{Float64}
+    provenance::ResultProvenance
+end
+
+struct CrossCorrelationResult <: AbstractAnalysisResult
+    nsc::Float64
+    rsc::Float64
+    quality_tag::String
+    phantom_peak_shift::Int
+    fragment_peak_shift::Int
+    provenance::ResultProvenance
+end
+
+struct IDRResult <: AbstractAnalysisResult
+    peak_pairs::Vector{Tuple{Peak, Peak}}
+    local_idr::Vector{Float64}
+    global_idr::Vector{Float64}
+    status::Symbol
+    provenance::ResultProvenance
+end
+
+function cross_correlation_profile(fragments::AbstractVector, chrom::String, center::Real; bin_size::Int=1, max_shift::Int=1000)
+    _ctx = active_provenance_context()
+    
+    pos_coords = Int[]
+    neg_coords = Int[]
+    for f in fragments
+        if f.chrom == chrom
+            if f.strand == '+'
+                push!(pos_coords, f.left)
+            elseif f.strand == '-'
+                push!(neg_coords, f.right)
+            end
+        end
+    end
+    
+    if isempty(pos_coords) || isempty(neg_coords)
+        result = StrandCorrelationProfile(chrom, collect(0:bin_size:max_shift), zeros(length(0:bin_size:max_shift)), provenance_record("StrandCorrelationProfile", "epigenetics"))
+        return provenance_result!(_ctx, result, "cross_correlation_profile"; parents=String[])
+    end
+    
+    min_val = min(minimum(pos_coords), minimum(neg_coords))
+    max_val = max(maximum(pos_coords), maximum(neg_coords))
+    
+    bin_edges = min_val:bin_size:(max_val + bin_size)
+    nbins = length(bin_edges) - 1
+    
+    pos_cov = zeros(Float64, nbins)
+    neg_cov = zeros(Float64, nbins)
+    
+    for c in pos_coords
+        b = floor(Int, (c - min_val) / bin_size) + 1
+        if 1 <= b <= nbins
+            pos_cov[b] += 1.0
+        end
+    end
+    for c in neg_coords
+        b = floor(Int, (c - min_val) / bin_size) + 1
+        if 1 <= b <= nbins
+            neg_cov[b] += 1.0
+        end
+    end
+    
+    shifts = collect(0:bin_size:max_shift)
+    correlations = zeros(Float64, length(shifts))
+    
+    for (idx, s) in enumerate(shifts)
+        sb = round(Int, s / bin_size)
+        if sb >= nbins
+            correlations[idx] = 0.0
+            continue
+        end
+        
+        x = @view pos_cov[1:(nbins - sb)]
+        y = @view neg_cov[(sb + 1):nbins]
+        
+        std_x = std(x)
+        std_y = std(y)
+        if std_x > 0 && std_y > 0
+            correlations[idx] = cor(x, y)
+        else
+            correlations[idx] = 0.0
+        end
+    end
+    
+    result = StrandCorrelationProfile(chrom, shifts, correlations, provenance_record("StrandCorrelationProfile", "epigenetics"))
+    return provenance_result!(_ctx, result, "cross_correlation_profile"; parents=String[])
+end
+
+function nsc_rsc_metrics(profile::StrandCorrelationProfile)
+    _ctx = active_provenance_context()
+    
+    shifts = profile.shifts
+    cors = profile.correlations
+    
+    rho_bg = minimum(cors)
+    if rho_bg <= 0
+        rho_bg = 1e-5
+    end
+    
+    phantom_range = findall(s -> 30 <= s <= 100, shifts)
+    phantom_peak_shift = 50
+    rho_phantom = rho_bg
+    if !isempty(phantom_range)
+        max_idx = argmax(cors[phantom_range])
+        phantom_peak_shift = shifts[phantom_range[max_idx]]
+        rho_phantom = cors[phantom_range[max_idx]]
+    end
+    
+    frag_range = findall(s -> 100 <= s <= 500, shifts)
+    fragment_peak_shift = 200
+    rho_max = rho_bg
+    if !isempty(frag_range)
+        max_idx = argmax(cors[frag_range])
+        fragment_peak_shift = shifts[frag_range[max_idx]]
+        rho_max = cors[frag_range[max_idx]]
+    end
+    
+    if isempty(frag_range)
+        max_idx = argmax(cors)
+        fragment_peak_shift = shifts[max_idx]
+        rho_max = cors[max_idx]
+    end
+    
+    nsc = rho_max / rho_bg
+    
+    denom = rho_phantom - rho_bg
+    rsc = abs(denom) > 1e-9 ? (rho_max - rho_bg) / denom : 1.0
+    
+    quality_tag = if rsc >= 1.0
+        "High"
+    elseif rsc >= 0.5
+        "Medium"
+    else
+        "Low"
+    end
+    
+    result = CrossCorrelationResult(nsc, rsc, quality_tag, phantom_peak_shift, fragment_peak_shift, provenance_record("CrossCorrelationResult", "epigenetics"))
+    return provenance_result!(_ctx, result, "nsc_rsc_metrics"; parents=String[])
+end
+
+function fit_idr_gmm(u::Vector{Float64}, v::Vector{Float64}; max_iter::Int=30)
+    n = length(u)
+    mu1 = 1.0
+    sigma1 = 1.0
+    rho = 0.5
+    mu0 = -1.0
+    sigma0 = 1.0
+    pi1 = 0.5
+    
+    for iter in 1:max_iter
+        d1 = zeros(n)
+        cov1 = [sigma1^2 rho*sigma1^2; rho*sigma1^2 sigma1^2]
+        inv_cov1 = inv(cov1)
+        det_cov1 = det(cov1)
+        for i in 1:n
+            diff = [u[i] - mu1, v[i] - mu1]
+            d1[i] = exp(-0.5 * (diff' * inv_cov1 * diff)) / (2 * pi * sqrt(det_cov1) + 1e-12)
+        end
+        
+        d0 = zeros(n)
+        cov0 = [sigma0^2 0.0; 0.0 sigma0^2]
+        inv_cov0 = inv(cov0)
+        det_cov0 = det(cov0)
+        for i in 1:n
+            diff = [u[i] - mu0, v[i] - mu0]
+            d0[i] = exp(-0.5 * (diff' * inv_cov0 * diff)) / (2 * pi * sqrt(det_cov0) + 1e-12)
+        end
+        
+        resp1 = (pi1 .* d1) ./ (pi1 .* d1 .+ (1.0 - pi1) .* d0 .+ 1e-12)
+        
+        sum_resp1 = sum(resp1)
+        sum_resp0 = n - sum_resp1
+        
+        if sum_resp1 > 1e-4 && sum_resp0 > 1e-4
+            pi1 = sum_resp1 / n
+            mu1 = sum(resp1 .* (u .+ v)) / (2 * sum_resp1)
+            var1_u = sum(resp1 .* (u .- mu1).^2) / sum_resp1
+            var1_v = sum(resp1 .* (v .- mu1).^2) / sum_resp1
+            sigma1 = sqrt(0.5 * (var1_u + var1_v))
+            cov_uv = sum(resp1 .* (u .- mu1) .* (v .- mu1)) / sum_resp1
+            rho = clamp(cov_uv / (sigma1^2 + 1e-9), 0.0, 0.99)
+            
+            resp0 = 1.0 .- resp1
+            mu0 = sum(resp0 .* (u .+ v)) / (2 * sum_resp0)
+            var0_u = sum(resp0 .* (u .- mu0).^2) / sum_resp0
+            var0_v = sum(resp0 .* (v .- mu0).^2) / sum_resp0
+            sigma0 = sqrt(0.5 * (var0_u + var0_v))
+        else
+            break
+        end
+    end
+    
+    d1 = zeros(n)
+    cov1 = [sigma1^2 rho*sigma1^2; rho*sigma1^2 sigma1^2]
+    inv_cov1 = inv(cov1)
+    det_cov1 = det(cov1)
+    for i in 1:n
+        diff = [u[i] - mu1, v[i] - mu1]
+        d1[i] = exp(-0.5 * (diff' * inv_cov1 * diff)) / (2 * pi * sqrt(det_cov1) + 1e-12)
+    end
+    d0 = zeros(n)
+    cov0 = [sigma0^2 0.0; 0.0 sigma0^2]
+    inv_cov0 = inv(cov0)
+    det_cov0 = det(cov0)
+    for i in 1:n
+        diff = [u[i] - mu0, v[i] - mu0]
+        d0[i] = exp(-0.5 * (diff' * inv_cov0 * diff)) / (2 * pi * sqrt(det_cov0) + 1e-12)
+    end
+    
+    local_idr = (1.0 - pi1) .* d0 ./ (pi1 .* d1 .+ (1.0 - pi1) .* d0 .+ 1e-12)
+    return clamp.(local_idr, 0.0, 1.0)
+end
+
+function pair_peaks(ps1::PeakSet, ps2::PeakSet)
+    pairs = Tuple{Peak, Peak}[]
+    by_chrom2 = Dict{String, Vector{Peak}}()
+    for p2 in ps2.peaks
+        push!(get!(by_chrom2, p2.chrom, Peak[]), p2)
+    end
+    
+    for p1 in ps1.peaks
+        candidates = get(by_chrom2, p1.chrom, Peak[])
+        best_p2 = nothing
+        max_overlap = 0
+        for p2 in candidates
+            overlap_len = min(p1.right, p2.right) - max(p1.left, p2.left) + 1
+            if overlap_len > max_overlap
+                max_overlap = overlap_len
+                best_p2 = p2
+            end
+        end
+        if best_p2 !== nothing
+            push!(pairs, (p1, best_p2))
+        end
+    end
+    return pairs
+end
+
+function idr_analysis(replicate_peaks::Vector{PeakSet}; score_col::Symbol=:score, idr_threshold::Real=0.05)
+    _ctx = active_provenance_context()
+    
+    if length(replicate_peaks) < 2
+        throw(ArgumentError("replicate_peaks must contain at least 2 PeakSets"))
+    end
+    
+    pairs = pair_peaks(replicate_peaks[1], replicate_peaks[2])
+    n = length(pairs)
+    
+    if n < 5
+        result = IDRResult(pairs, zeros(n), zeros(n), :failed, provenance_record("IDRResult", "epigenetics"))
+        return provenance_result!(_ctx, result, "idr_analysis"; parents=String[])
+    end
+    
+    function get_score(p::Peak, col::Symbol)
+        if col === :score
+            return p.score
+        elseif col === :pvalue
+            return p.pvalue
+        elseif col === :qvalue
+            return p.qvalue
+        else
+            return p.score
+        end
+    end
+    
+    scores1 = [get_score(p[1], score_col) for p in pairs]
+    scores2 = [get_score(p[2], score_col) for p in pairs]
+    
+    r1 = sortperm(sortperm(scores1)) ./ (n + 1)
+    r2 = sortperm(sortperm(scores2)) ./ (n + 1)
+    
+    r1 = clamp.(r1, 1e-5, 1.0 - 1e-5)
+    r2 = clamp.(r2, 1e-5, 1.0 - 1e-5)
+    
+    u = [sqrt(2.0) * SpecialFunctions.erfinv(2.0 * val - 1.0) for val in r1]
+    v = [sqrt(2.0) * SpecialFunctions.erfinv(2.0 * val - 1.0) for val in r2]
+    
+    local_idr = fit_idr_gmm(u, v)
+    
+    p_order = sortperm(local_idr)
+    global_idr_sorted = zeros(n)
+    running_sum = 0.0
+    for i in 1:n
+        running_sum += local_idr[p_order[i]]
+        global_idr_sorted[i] = running_sum / i
+    end
+    global_idr = zeros(n)
+    global_idr[p_order] = global_idr_sorted
+    
+    result = IDRResult(pairs, local_idr, global_idr, :ok, provenance_record("IDRResult", "epigenetics"))
+    return provenance_result!(_ctx, result, "idr_analysis"; parents=String[])
+end
+
+function consensus_peaks(idr_result::IDRResult; idr_threshold::Real=0.05)
+    _ctx = active_provenance_context()
+    
+    consensus_list = Peak[]
+    idx = 1
+    for (i, (p1, p2)) in enumerate(idr_result.peak_pairs)
+        if idr_result.global_idr[i] <= idr_threshold
+            chrom = p1.chrom
+            left = min(p1.left, p2.left)
+            right = max(p1.right, p2.right)
+            summit = round(Int, 0.5 * (p1.summit + p2.summit))
+            score = 0.5 * (p1.score + p2.score)
+            pvalue = 0.5 * (p1.pvalue + p2.pvalue)
+            qvalue = 0.5 * (p1.qvalue + p2.qvalue)
+            push!(consensus_list, Peak("consensus_$(idx)", chrom, left, right, summit, score, pvalue, qvalue))
+            idx += 1
+        end
+    end
+    
+    result = PeakSet(consensus_list)
+    return provenance_result!(_ctx, result, "consensus_peaks"; parents=String[])
+end
+
+function chipseq_motif_enrichment(peaks::PeakSet, background_peaks::PeakSet, genome_fasta::AbstractString, motif_profile::MotifProfile; threshold::Real=5.0)
+    _ctx = active_provenance_context()
+    
+    records = read_fasta(genome_fasta)
+    genome = Dict(r.identifier => r.sequence for r in records)
+    
+    peak_seqs = BioSequence[]
+    for peak in peaks.peaks
+        if haskey(genome, peak.chrom)
+            chrom_seq = genome[peak.chrom]
+            left = max(1, peak.left)
+            right = min(length(chrom_seq), peak.right)
+            if left < right
+                push!(peak_seqs, chrom_seq[left:right])
+            end
+        end
+    end
+    
+    bg_seqs = BioSequence[]
+    for peak in background_peaks.peaks
+        if haskey(genome, peak.chrom)
+            chrom_seq = genome[peak.chrom]
+            left = max(1, peak.left)
+            right = min(length(chrom_seq), peak.right)
+            if left < right
+                push!(bg_seqs, chrom_seq[left:right])
+            end
+        end
+    end
+    
+    enrich_res = motif_enrichment_peaks(peak_seqs, bg_seqs, motif_profile.pwm; threshold=threshold)
+    
+    df = DataFrame(
+        motif_name = [motif_profile.name],
+        pvalue = [enrich_res.pvalue],
+        fold_enrichment = [enrich_res.fold_enrichment],
+        peak_hits = [enrich_res.peak_hits],
+        peak_total = [enrich_res.peak_total],
+        bg_hits = [enrich_res.bg_hits],
+        bg_total = [enrich_res.bg_total],
+        fdr = [enrich_res.pvalue]
+    )
+    
+    return provenance_result!(_ctx, df, "chipseq_motif_enrichment"; parents=String[])
+end
+
+function diffbind_like_workflow(bam_or_fragments, samples::Vector{String}, conditions::AbstractVector; consensus_peaks::PeakSet)
+    _ctx = active_provenance_context()
+    
+    cond_symbols = Symbol.(conditions)
+    
+    fragments_dict = if bam_or_fragments isa AbstractDict
+        bam_or_fragments
+    else
+        Dict(samples[i] => bam_or_fragments[i] for i in 1:length(samples))
+    end
+    
+    de_results = differential_binding(fragments_dict, consensus_peaks, cond_symbols)
+    
+    return provenance_result!(_ctx, de_results, "diffbind_like_workflow"; parents=String[])
+end
+
+end
+

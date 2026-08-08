@@ -64,12 +64,16 @@ Order = [:type, :function]
 ```@autodocs
 Modules = [BioToolkit]
 Pages = [
+    "geneannotation.jl",
+    "tximport.jl",
     "differentialexpression.jl",
     "enrichment.jl",
     "epigenetics.jl",
+    "flowcytometry.jl",
     "gwas.jl",
     "metabolomics.jl",
     "microbiome.jl",
+    "hurdle_de.jl",
     "singlecell.jl",
     "spatial.jl",
     "systemsbio.jl",
@@ -89,7 +93,8 @@ Pages = [
     "bioplotting.jl",
     "hmm.jl",
     "gene_prediction.jl",
-    "lazy_gpu.jl"
+    "lazy_gpu.jl",
+    "bioconductor_compat.jl"
 ]
 Order = [:type, :function]
 ```

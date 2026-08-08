@@ -270,7 +270,8 @@ end
 
 Return `true` if the Flux extension has been loaded.
 """
-flux_available() = isdefined(@__MODULE__, :Flux)
+const _FLUX_MODULE = Ref{Any}(nothing)
+flux_available() = _FLUX_MODULE[] !== nothing
 
 """
     resolve_backend(; backend=:auto)

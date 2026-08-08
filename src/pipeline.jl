@@ -18,6 +18,8 @@ export template_read_fasta_node, template_align_reads_node, template_count_featu
 export terra_workspace_plan, anvil_workspace_manifest, distributed_pipeline_map
 export retry_execute_pipeline, containerized_node
 export slurm_array_plan
+export AbstractBioWorkflowNode, BioWorkflowNode, BioWorkflow, WorkflowExecutionResult
+export bio_workflow_node, add_workflow_node!, validate_workflow, workflow_execution_levels
 
 struct FileArtifact
     path::String
@@ -40,6 +42,188 @@ mutable struct PipelineGraph
     index_node::Vector{Symbol}
     nodes::Dict{Symbol,PipelineNode}
     cache_dir::String
+end
+
+abstract type AbstractBioWorkflowNode end
+
+"""
+    BioWorkflowNode{F,I,O}
+
+A typed scientific workflow node. `I` is the ordered input tuple type and `O`
+is the required output type. `version` is part of cache identity so a model or
+method revision cannot silently reuse a result from a prior implementation.
+"""
+struct BioWorkflowNode{F,I<:Tuple,O} <: AbstractBioWorkflowNode
+    id::Symbol
+    func::F
+    input_types::Type{I}
+    output_type::Type{O}
+    dependencies::Vector{Symbol}
+    parameters::NamedTuple
+    version::String
+    cache::Bool
+end
+
+mutable struct BioWorkflow
+    graph::SimpleDiGraph
+    node_index::Dict{Symbol,Int}
+    index_node::Vector{Symbol}
+    nodes::Dict{Symbol,AbstractBioWorkflowNode}
+    cache_dir::String
+end
+
+struct WorkflowExecutionResult
+    outputs::Dict{Symbol,Any}
+    node_status::Dict{Symbol,Symbol}
+    replayed_nodes::Vector{Symbol}
+end
+
+function BioWorkflow(; cache_dir::AbstractString=".biotoolkit_workflow_cache", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    mkpath(cache_dir)
+    workflow = BioWorkflow(SimpleDiGraph(0), Dict{Symbol,Int}(), Symbol[], Dict{Symbol,AbstractBioWorkflowNode}(), String(cache_dir))
+    return _register_pipeline_result!(_ctx, workflow, "BioWorkflow"; parameters=(cache_dir=String(cache_dir), node_count=0))
+end
+
+function bio_workflow_node(
+    id::Symbol,
+    func::F,
+    input_types::Type{I},
+    output_type::Type{O};
+    dependencies::AbstractVector{Symbol}=Symbol[],
+    parameters::NamedTuple=NamedTuple(),
+    version::AbstractString="1",
+    cache::Bool=true,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx)) where {F,I<:Tuple,O}
+
+    length(input_types.parameters) == length(dependencies) || throw(ArgumentError("node $(id) declares $(length(input_types.parameters)) input types but has $(length(dependencies)) dependencies"))
+    isempty(version) && throw(ArgumentError("workflow node version must not be empty"))
+    node = BioWorkflowNode{F,I,O}(id, func, input_types, output_type, Symbol[dependencies...], parameters, String(version), cache)
+    return _register_pipeline_result!(
+        _ctx,
+        node,
+        "bio_workflow_node";
+        parameters=(
+            node_id=String(id),
+            input_types=string.(input_types.parameters),
+            output_type=string(output_type),
+            dependencies=String.(dependencies),
+            version=String(version),
+            cache=cache))
+end
+
+function add_workflow_node!(workflow::BioWorkflow, node::AbstractBioWorkflowNode; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    node_id = getfield(node, :id)
+    haskey(workflow.nodes, node_id) && throw(ArgumentError("workflow node $(node_id) already exists"))
+    # Dependencies not represented by a workflow node are external inputs that
+    # must be supplied to `run`; only workflow-node dependencies form graph edges.
+    for dependency in getfield(node, :dependencies)
+        haskey(workflow.node_index, dependency) || continue
+    end
+
+    add_vertex!(workflow.graph)
+    index = nv(workflow.graph)
+    workflow.node_index[node_id] = index
+    push!(workflow.index_node, node_id)
+    workflow.nodes[node_id] = node
+    for dependency in getfield(node, :dependencies)
+        haskey(workflow.node_index, dependency) || continue
+        add_edge!(workflow.graph, workflow.node_index[dependency], index)
+    end
+    _ctx === nothing || register_provenance!(_ctx, "add_workflow_node!"; parameters=(node_id=String(node_id), dependency_count=length(getfield(node, :dependencies))))
+    return workflow
+end
+
+function validate_workflow(workflow::BioWorkflow; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    # A dependency absent from `workflow.nodes` is an external input. Its value
+    # is checked just before the consuming node is evaluated.
+    _cycle_dfs(workflow.graph) && throw(ArgumentError("workflow graph contains a cycle"))
+    _ctx === nothing || register_provenance!(_ctx, "validate_workflow"; parameters=(node_count=length(workflow.nodes), edge_count=ne(workflow.graph)))
+    return true
+end
+
+function workflow_execution_levels(workflow::BioWorkflow; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    validate_workflow(workflow; _ctx=_ctx)
+    indegrees = indegree(workflow.graph)
+    ready = sort!(findall(==(0), indegrees))
+    levels = Vector{Vector{Symbol}}()
+    while !isempty(ready)
+        push!(levels, [workflow.index_node[index] for index in ready])
+        next_ready = Int[]
+        for node_index in ready, neighbor in outneighbors(workflow.graph, node_index)
+            indegrees[neighbor] -= 1
+            indegrees[neighbor] == 0 && push!(next_ready, neighbor)
+        end
+        ready = sort!(next_ready)
+    end
+    return levels
+end
+
+function _workflow_state_hash(node::BioWorkflowNode, values::Tuple)
+    io = IOBuffer()
+    serialize(io, node.id)
+    serialize(io, node.version)
+    serialize(io, node.input_types)
+    serialize(io, node.output_type)
+    serialize(io, node.parameters)
+    serialize(io, values)
+    return bytes2hex(SHA.sha1(take!(io)))
+end
+
+@inline _workflow_cache_path(workflow::BioWorkflow, node::BioWorkflowNode, digest::String) = joinpath(workflow.cache_dir, "$(node.id)_$(digest).jls")
+
+function _run_workflow_node(workflow::BioWorkflow, node::BioWorkflowNode, outputs::Dict{Symbol,Any})
+    node_values = tuple((get(outputs, dependency, nothing) for dependency in node.dependencies)...)
+    any(value -> value === nothing, node_values) && throw(ArgumentError("workflow node $(node.id) is missing a dependency output"))
+    for (value, expected) in zip(node_values, node.input_types.parameters)
+        value isa expected || throw(ArgumentError("workflow node $(node.id) expected $(expected), received $(typeof(value))"))
+    end
+
+    digest = _workflow_state_hash(node, node_values)
+    cache_path = _workflow_cache_path(workflow, node, digest)
+    if node.cache && isfile(cache_path)
+        return deserialize(cache_path), :replayed_from_cache
+    end
+
+    result = node.func(node_values...; node.parameters...)
+    result isa node.output_type || throw(ArgumentError("workflow node $(node.id) declared output $(node.output_type), received $(typeof(result))"))
+    node.cache && serialize(cache_path, result)
+    return result, :computed
+end
+
+"""
+    Base.run(workflow::BioWorkflow, inputs=Dict(); prov_ctx=nothing)
+
+Execute a type-checked workflow in topological order. Each node records whether
+it was computed or replayed from a content-addressed, versioned checkpoint.
+"""
+function Base.run(workflow::BioWorkflow, inputs::AbstractDict{Symbol,<:Any}=Dict{Symbol,Any}(); prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    levels = workflow_execution_levels(workflow; _ctx=_ctx)
+    outputs = Dict{Symbol,Any}(inputs)
+    statuses = Dict{Symbol,Symbol}()
+    replayed = Symbol[]
+    for level in levels
+        for node_id in level
+            node = workflow.nodes[node_id]::BioWorkflowNode
+            result, status = _run_workflow_node(workflow, node, outputs)
+            outputs[node_id] = result
+            statuses[node_id] = status
+            status == :replayed_from_cache && push!(replayed, node_id)
+            _ctx === nothing || register_provenance!(
+                _ctx,
+                "run_bio_workflow_node";
+                parents=provenance_parent_ids((outputs[dependency] for dependency in node.dependencies)...),
+                parameters=(
+                    node_id=String(node.id),
+                    input_types=string.(node.input_types.parameters),
+                    output_type=string(node.output_type),
+                    version=node.version,
+                    cache=node.cache,
+                    status=String(status)))
+        end
+    end
+    result = WorkflowExecutionResult(outputs, statuses, replayed)
+    return _register_pipeline_result!(_ctx, result, "run_bio_workflow"; parents=provenance_parent_ids(values(outputs)...), parameters=(node_count=length(workflow.nodes), replayed_count=length(replayed)))
 end
 
 function PipelineGraph(; cache_dir::AbstractString=".biotoolkit_cache", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))

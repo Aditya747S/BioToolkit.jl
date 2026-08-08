@@ -14,10 +14,11 @@ using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, AASeq, AminoAcidAlphabet, BioSequence
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_container_provenance!, register_provenance!
 
-export MassSpecExperiment, Spectrum, MassSpecPeak, PeakDetectionResult, AlignmentResult, DifferentialAbundanceResult, SparsePLSDAResult, DeNovoResult
+export MassSpecExperiment, Spectrum, MassSpecPeak, PeakDetectionResult, AlignmentResult, DifferentialAbundanceResult, SparsePLSDAResult, DeNovoResult, KinaseActivityResult, PhosphoQCResult
 export read_mzml, detect_peaks, align_samples, qrilc_impute, differential_abundance, mixed_model_abundance, sparse_pls_da, stream_mass_spec, build_spectrum_graph, de_novo_sequence
 export dia_like_quantification, phosphosite_localization, glycoproteomics_motif_table, project_peptides_to_structure
-export protein_inference_top3, ptm_site_enrichment
+export protein_inference_top3, ptm_site_enrichment, kinase_activity_inference, phosphoproteomics_qc, normalize_label_free, dspikein_calibration
+
 
 struct Spectrum
     rt::Float64
@@ -32,6 +33,11 @@ struct MassSpecExperiment
 end
 
 MassSpecExperiment(spectra::Vector{Spectrum}) = MassSpecExperiment(spectra, zeros(Float32, 0, length(spectra)), DataFrame())
+# Convenience ctor: (spectra, metadata_dict) — wraps metadata in design DataFrame
+function MassSpecExperiment(spectra::Vector{Spectrum}, metadata::AbstractDict)
+    design = isempty(metadata) ? DataFrame() : DataFrame(; (Symbol(k) => [v] for (k, v) in metadata)...)
+    MassSpecExperiment(spectra, zeros(Float32, 0, length(spectra)), design)
+end
 
 struct MassSpecPeak
     rt::Float64
@@ -680,4 +686,124 @@ function ptm_site_enrichment(modified_sites::AbstractVector{<:AbstractString}, b
     return _register_proteomics_result!(_ctx, out, "ptm_site_enrichment"; parents=provenance_parent_ids(modified_sites, background_sites), parameters=(modified_count=length(modified_sites), background_count=length(background_sites)))
 end
 
+struct KinaseActivityResult <: AbstractAnalysisResult
+    kinases::Vector{String}
+    enrichment_scores::Vector{Float64}
+    pvalues::Vector{Float64}
+    provenance::ResultProvenance
 end
+
+function kinase_activity_inference(phospho_sites::DataFrame, kinase_substrate_db::DataFrame)
+    _ctx = active_provenance_context()
+    
+    sites = String.(phospho_sites.site)
+    lfcs = Float64.(phospho_sites.log2_fc)
+    
+    mean_all = mean(lfcs)
+    std_all = std(lfcs)
+    
+    kinases = String.(unique(kinase_substrate_db.kinase))
+    scores = Float64[]
+    pvals = Float64[]
+    
+    for kinase in kinases
+        sub_sites = String.(kinase_substrate_db[kinase_substrate_db.kinase .== kinase, :site])
+        sub_lfcs = [lfcs[findfirst(==(s), sites)] for s in sub_sites if s in sites]
+        n_sub = length(sub_lfcs)
+        
+        if n_sub < 2 || std_all <= eps(Float64)
+            push!(scores, 0.0)
+            push!(pvals, 1.0)
+        else
+            z = (mean(sub_lfcs) - mean_all) / (std_all / sqrt(n_sub))
+            push!(scores, z)
+            push!(pvals, 2 * ccdf(Normal(), abs(z)))
+        end
+    end
+    
+    result = KinaseActivityResult(kinases, scores, pvals, provenance_record("KinaseActivityResult", "proteomics"))
+    return provenance_result!(_ctx, result, "kinase_activity_inference"; parents=String[])
+end
+
+struct PhosphoQCResult <: AbstractAnalysisResult
+    summary::DataFrame
+    provenance::ResultProvenance
+end
+
+function phosphoproteomics_qc(ms_exp::MassSpecExperiment; localization_threshold::Real=0.75)
+    _ctx = active_provenance_context()
+    
+    n_spectra = length(ms_exp.spectra)
+    n_neutral_loss = count(s -> any(mz -> 97.0 <= mz <= 99.0, s.mz), ms_exp.spectra)
+    
+    localized_count = round(Int, n_neutral_loss * localization_threshold)
+    ratio = n_spectra > 0 ? localized_count / n_spectra : 0.0
+    
+    df = DataFrame(
+        Metric = ["Total Spectra", "Phosphate Neutral Loss Spectra", "Localized Sites", "Localization Ratio"],
+        Value = [Float64(n_spectra), Float64(n_neutral_loss), Float64(localized_count), ratio]
+    )
+    
+    result = PhosphoQCResult(df, provenance_record("PhosphoQCResult", "proteomics"))
+    return provenance_result!(_ctx, result, "phosphoproteomics_qc"; parents=String[])
+end
+
+function normalize_label_free(mats::AbstractMatrix{<:Real}; method::Symbol=:median)
+    _ctx = active_provenance_context()
+    
+    n_rows, n_cols = size(mats)
+    normalized = Matrix{Float64}(mats)
+    
+    if method == :median
+        for j in 1:n_cols
+            col_med = median(normalized[:, j])
+            normalized[:, j] .-= col_med
+        end
+    elseif method == :quantile
+        sorted_mats = zeros(n_rows, n_cols)
+        ranks = zeros(Int, n_rows, n_cols)
+        for j in 1:n_cols
+            p = sortperm(normalized[:, j])
+            ranks[p, j] = 1:n_rows
+            sorted_mats[:, j] = normalized[p, j]
+        end
+        row_means = mean(sorted_mats, dims=2)
+        for j in 1:n_cols
+            for i in 1:n_rows
+                normalized[i, j] = row_means[ranks[i, j]]
+            end
+        end
+    elseif method == :vsn
+        for j in 1:n_cols
+            col_mean = mean(normalized[:, j])
+            col_std = std(normalized[:, j])
+            s = col_std > 0 ? col_std : 1.0
+            normalized[:, j] .= asinh.((normalized[:, j] .- col_mean) ./ s)
+        end
+    else
+        throw(ArgumentError("unknown normalization method: $method"))
+    end
+    
+    return provenance_result!(_ctx, normalized, "normalize_label_free"; parents=String[], parameters=(method=method,))
+end
+
+function dspikein_calibration(spike_counts::AbstractVector{<:Real}, sample_counts::AbstractMatrix{<:Real}, spike_concentrations::AbstractVector{<:Real})
+    _ctx = active_provenance_context()
+    
+    log_spikes = log10.(spike_counts .+ 1e-8)
+    log_concs = log10.(spike_concentrations .+ 1e-8)
+    
+    X = hcat(ones(length(log_spikes)), log_spikes)
+    beta = X \ log_concs
+    
+    calibrated = zeros(Float64, size(sample_counts))
+    for j in 1:size(sample_counts, 2)
+        log_sample = log10.(sample_counts[:, j] .+ 1e-8)
+        calibrated[:, j] .= 10.0 .^ (beta[1] .+ beta[2] .* log_sample)
+    end
+    
+    return provenance_result!(_ctx, calibrated, "dspikein_calibration"; parents=String[])
+end
+
+end
+

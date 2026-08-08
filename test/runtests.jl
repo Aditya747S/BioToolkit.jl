@@ -10,6 +10,12 @@ using Tables
 include(joinpath(@__DIR__, "..", "ext", "BioToolkitTuringExt.jl"))
 BioToolkitTuringExt.__init__()
 
+if Base.find_package("Flux") !== nothing
+    include(joinpath(@__DIR__, "..", "ext", "BioToolkitFluxExt.jl"))
+    BioToolkitFluxExt.__init__()
+    @test BioToolkit.flux_available()
+end
+
 const provenance_test_files = ["provenance_io_tests.jl", "provenance_utility_tests.jl", "provenance_comprehensive_tests.jl"]
 
 # Shared helpers must be loaded before any provenance test file that uses them.
@@ -570,6 +576,28 @@ DP  - 2023
         @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap=1)
         @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap_open=1, gap_extend=-1)
         @test_throws ArgumentError BioToolkit.pairwise_align(left, right; gap=0)
+
+        posterior = BioToolkit.pairhmm_align("ACGT", "ACGT")
+        @test posterior isa BioToolkit.PosteriorAlignmentResult
+        @test size(posterior.posterior_matrix) == (5, 5, 3)
+        @test posterior.consensus_alignment.identity == 1.0
+        @test isfinite(posterior.log_likelihood)
+
+        soft_score = BioToolkit.soft_alignment_score("ACGT", "ACGT", BioToolkit.DifferentiableScoring([2.0, -1.0, -2.0]; temperature=0.5))
+        @test isfinite(soft_score)
+        @test soft_score > 0
+
+        graph = BioToolkit.SequenceGraph([BioToolkit.DNASeq("AC"), BioToolkit.DNASeq("GT")], [(1, 2)])
+        graph_alignment = BioToolkit.align_to_graph(BioToolkit.DNASeq("ACGT"), graph)
+        @test graph_alignment isa BioToolkit.GraphAlignmentResult
+        @test graph_alignment.graph_path == [1, 2]
+        @test graph_alignment.query_alignment.identity == 1.0
+
+        profile_a = BioToolkit.AlignmentProfileHMM(UInt8.(collect("ACGT")), Float32[1 0 0 0; 0 1 0 0])
+        profile_b = BioToolkit.AlignmentProfileHMM(UInt8.(collect("ACGT")), Float32[1 0 0 0; 0 0 1 0])
+        profile_alignment = BioToolkit.align_profiles(profile_a, profile_b)
+        @test profile_alignment isa BioToolkit.ProfileAlignmentResult
+        @test length(profile_alignment.path) >= 2
 
         affine_neg_inf = typemin(Int) ÷ 8
         affine_safe_add(x::Int, y::Int) = x <= affine_neg_inf ÷ 2 ? affine_neg_inf : x + y

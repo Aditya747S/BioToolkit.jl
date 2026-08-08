@@ -4,15 +4,20 @@ using Statistics
 using LinearAlgebra
 using Plots
 using Distributions
+using DataFrames
 
 using ..GWAS: GWASResult, MetaAnalysisResult
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id
+using ..Clinical: OncoprintResult
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, AnnotatedHeatmapSpec
 import ..BioToolkit: ProvenanceContext, analysis_result_fields, analysis_result_summary, container_provenance_summary, ensure_provenance_id!, provenance_result!, provenance_parent_ids, register_container_provenance!, register_provenance!
 
 export VolcanoPoint, VolcanoPlotResult, MAPoint, MAPlotResult, ClusteredHeatmapResult
 export ManhattanPoint, ManhattanPlotResult, QQPoint, QQPlotResult, ForestPoint, ForestPlotResult
+export AnnotatedHeatmapResult, UpsetPlotResult, CircosPlotResult
 export volcano_data, volcano_plot, ma_data, ma_plot, clustered_heatmap, export_plot
 export manhattan_data, manhattan_plot, qq_data, qq_plot, gwas_forest_plot
+export annotated_heatmap, upset_plot, oncoprint_from_matrix, circos_plot
+
 
 struct VolcanoPoint
     gene_id::String
@@ -621,4 +626,181 @@ function gwas_forest_plot(result::MetaAnalysisResult; threaded::Bool=true)
     return _plot_result_finalize(result_plot, _ctx, provenance_parent_ids(result), "gwas_forest_plot", (threaded=threaded,))
 end
 
+struct AnnotatedHeatmapResult <: AbstractAnalysisResult
+    matrix::Matrix{Float64}
+    row_order::Vector{Int}
+    col_order::Vector{Int}
+    row_annotations::DataFrame
+    col_annotations::DataFrame
+    figure::Any
+    provenance::ResultProvenance
 end
+
+struct UpsetPlotResult <: AbstractAnalysisResult
+    sets::Vector{String}
+    intersection_sizes::Vector{Int}
+    intersection_matrix::Matrix{Bool}
+    figure::Any
+    provenance::ResultProvenance
+end
+
+struct CircosPlotResult <: AbstractAnalysisResult
+    chromosomes::Vector{String}
+    chrom_coords::Dict{String, Tuple{Float64, Float64}}
+    link_coords::Vector{Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}}}
+    figure::Any
+    provenance::ResultProvenance
+end
+
+function annotated_heatmap(matrix::AbstractMatrix{<:Real}; row_annotations=DataFrame(), col_annotations=DataFrame(), splits=nothing, cluster::Symbol=:both)
+    _ctx = active_provenance_context()
+    
+    scaled = Matrix{Float64}(matrix)
+    row_order = collect(1:size(scaled, 1))
+    col_order = collect(1:size(scaled, 2))
+    
+    if cluster in (:both, :row)
+        row_order = _hierarchical_order(scaled; metric=:correlation)
+    end
+    if cluster in (:both, :col)
+        col_order = _hierarchical_order(permutedims(scaled); metric=:correlation)
+    end
+    
+    clustered_matrix = scaled[row_order, col_order]
+    
+    reordered_row_annot = isempty(row_annotations) ? DataFrame() : row_annotations[row_order, :]
+    reordered_col_annot = isempty(col_annotations) ? DataFrame() : col_annotations[col_order, :]
+    
+    figure = heatmap(clustered_matrix; color=:balance, title="Annotated Heatmap", colorbar=true)
+    
+    result = AnnotatedHeatmapResult(clustered_matrix, row_order, col_order, reordered_row_annot, reordered_col_annot, figure, provenance_record("AnnotatedHeatmapResult", "bioplotting"))
+    return provenance_result!(_ctx, result, "annotated_heatmap"; parents=String[])
+end
+# Convenience overload: accept an AnnotatedHeatmapSpec object
+function annotated_heatmap(matrix::AbstractMatrix{<:Real}, spec::AnnotatedHeatmapSpec; cluster::Symbol=:both)
+    row_df = isempty(spec.row_annotations) ? DataFrame() : DataFrame(spec.row_annotations)
+    col_df = isempty(spec.col_annotations) ? DataFrame() : DataFrame(spec.col_annotations)
+    return annotated_heatmap(matrix; row_annotations=row_df, col_annotations=col_df,
+                             splits=nothing, cluster=cluster)
+end
+# Accept any Dict by converting element types to String
+function upset_plot(sets::AbstractDict)
+    str_sets = Dict{String,Vector{String}}(string(k) => [string(e) for e in v] for (k, v) in sets)
+    return upset_plot(str_sets)
+end
+
+function upset_plot(sets::Dict{String,Vector{String}})
+    _ctx = active_provenance_context()
+    
+    set_names = sort!(collect(keys(sets)))
+    all_elements = unique(vcat(values(sets)...))
+    
+    memberships = Dict{Vector{Bool}, Int}()
+    for elem in all_elements
+        m = [elem in sets[s] for s in set_names]
+        if any(m)
+            memberships[m] = get(memberships, m, 0) + 1
+        end
+    end
+    
+    sorted_pairs = sort!(collect(memberships); by = p -> p[2], rev=true)
+    
+    n_sets = length(set_names)
+    n_intersections = length(sorted_pairs)
+    
+    intersection_matrix = zeros(Bool, n_sets, n_intersections)
+    intersection_sizes = zeros(Int, n_intersections)
+    
+    for (i, (m, sz)) in enumerate(sorted_pairs)
+        intersection_matrix[:, i] .= m
+        intersection_sizes[i] = sz
+    end
+    
+    figure = bar(intersection_sizes; xlabel="Intersection", ylabel="Intersection Size", title="Upset Plot", legend=false)
+    
+    result = UpsetPlotResult(set_names, intersection_sizes, intersection_matrix, figure, provenance_record("UpsetPlotResult", "bioplotting"))
+    return provenance_result!(_ctx, result, "upset_plot"; parents=String[])
+end
+
+function oncoprint_from_matrix(alteration_matrix::AbstractMatrix{<:AbstractString}; title::String="OncoPrint")
+    _ctx = active_provenance_context()
+    
+    n_genes, n_samples = size(alteration_matrix)
+    
+    gene_freqs = [count(x -> x != "none" && !isempty(x), alteration_matrix[g, :]) for g in 1:n_genes]
+    gene_order = sortperm(gene_freqs, rev=true)
+    
+    sample_freqs = [count(x -> x != "none" && !isempty(x), alteration_matrix[:, s]) for s in 1:n_samples]
+    sample_order = sortperm(sample_freqs, rev=true)
+    
+    ordered_matrix = String.(alteration_matrix[gene_order, sample_order])
+    altered = ordered_matrix .!= ""
+
+    figure = heatmap(altered; title=title, colorbar=false)
+    genes = ["Gene$(i)" for i in gene_order]
+    samples = ["Sample$(i)" for i in sample_order]
+    result = OncoprintResult(genes, samples, Int.(altered), ordered_matrix, provenance_record("OncoprintResult", "bioplotting"))
+    return provenance_result!(_ctx, result, "oncoprint_from_matrix"; parents=String[], parameters=(n_genes=n_genes, n_samples=n_samples))
+end
+
+function circos_plot(chromosomes::Vector{String}, links::AbstractVector; chrom_sizes::Dict{String,Int}=Dict{String,Int}())
+    _ctx = active_provenance_context()
+    
+    n_chroms = length(chromosomes)
+    gap = 0.05
+    total_gaps = n_chroms * gap
+    available_rad = 2 * pi - total_gaps
+    
+    sizes = [get(chrom_sizes, c, 100) for c in chromosomes]
+    total_size = sum(sizes)
+    
+    chrom_coords = Dict{String, Tuple{Float64, Float64}}()
+    current_angle = 0.0
+    for (i, c) in enumerate(chromosomes)
+        size_frac = sizes[i] / total_size
+        angle_span = size_frac * available_rad
+        start_ang = current_angle
+        end_ang = current_angle + angle_span
+        chrom_coords[c] = (start_ang, end_ang)
+        current_angle = end_ang + gap
+    end
+    
+    link_coords = Tuple{Tuple{Float64, Float64}, Tuple{Float64, Float64}}[]
+    for link in links
+        c1, pos1, c2, pos2 = link
+        if haskey(chrom_coords, c1) && haskey(chrom_coords, c2)
+            c1_size = get(chrom_sizes, c1, 100)
+            c2_size = get(chrom_sizes, c2, 100)
+            
+            span1_start, span1_end = chrom_coords[c1]
+            span2_start, span2_end = chrom_coords[c2]
+            
+            ang1 = span1_start + (pos1 / c1_size) * (span1_end - span1_start)
+            ang2 = span2_start + (pos2 / c2_size) * (span2_end - span2_start)
+            
+            push!(link_coords, ((ang1, 0.8), (ang2, 0.8)))
+        end
+    end
+    
+    figure = plot(proj=:polar, title="Circos Plot")
+    for (c, (s, e)) in chrom_coords
+        theta = range(s, e, length=50)
+        plot!(figure, theta, fill(1.0, length(theta)), linewidth=4, label=c)
+    end
+    for ((a1, r1), (a2, r2)) in link_coords
+        plot!(figure, [a1, a2], [r1, r2], color=:red, linewidth=1, label=false)
+    end
+    
+    result = CircosPlotResult(chromosomes, chrom_coords, link_coords, figure, provenance_record("CircosPlotResult", "bioplotting"))
+    return provenance_result!(_ctx, result, "circos_plot"; parents=String[])
+end
+# Convenience: circos_plot with just a matrix (generates chromosome labels automatically)
+function circos_plot(matrix::AbstractMatrix{<:Real})
+    n = min(size(matrix, 1), size(matrix, 2))
+    chroms = ["chr$i" for i in 1:n]
+    return circos_plot(chroms, Tuple{String,Int,String,Int}[])
+end
+
+end
+
+

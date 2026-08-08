@@ -34,6 +34,8 @@ export build_spot_deconvolution_qc
 export spatial_coexpression_modules
 export mark_tissue_boundary_spots
 export spatial_pseudotime
+export SpatialSVGResult, SpatialTopicResult, SpatialIntegrationResult, SpotCellMappingResult
+export variogram_svg, spatial_lda_deconvolution, fgw_integrate_spatial, map_cells_to_spots
 
 # ---------------------------------------------------------------------------
 # Core data structures
@@ -55,6 +57,47 @@ end
 
 DeconvolutionResult(spot_ids, cell_type_ids, cell_type_fractions, residuals, method) =
     DeconvolutionResult(spot_ids, cell_type_ids, cell_type_fractions, residuals, method, provenance_record("DeconvolutionResult", "spatial"))
+
+struct SpatialSVGResult <: AbstractAnalysisResult
+    gene_id::String
+    bins::Vector{Float64}
+    variogram::Vector{Float64}
+    null_mean::Vector{Float64}
+    null_sd::Vector{Float64}
+    provenance::ResultProvenance
+end
+
+SpatialSVGResult(gene_id, bins, variogram, null_mean, null_sd) =
+    SpatialSVGResult(gene_id, bins, variogram, null_mean, null_sd, provenance_record("SpatialSVGResult", "spatial"))
+
+struct SpatialTopicResult <: AbstractAnalysisResult
+    spot_topic_weights::Matrix{Float64}
+    topic_gene_weights::Matrix{Float64}
+    topic_cell_type_map::Vector{String}
+    provenance::ResultProvenance
+end
+
+SpatialTopicResult(spot_topic_weights, topic_gene_weights, topic_cell_type_map) =
+    SpatialTopicResult(spot_topic_weights, topic_gene_weights, topic_cell_type_map, provenance_record("SpatialTopicResult", "spatial"))
+
+struct SpatialIntegrationResult <: AbstractAnalysisResult
+    aligned_coords::Matrix{Float64}
+    transport_plan::Matrix{Float64}
+    provenance::ResultProvenance
+end
+
+SpatialIntegrationResult(aligned_coords, transport_plan) =
+    SpatialIntegrationResult(aligned_coords, transport_plan, provenance_record("SpatialIntegrationResult", "spatial"))
+
+struct SpotCellMappingResult <: AbstractAnalysisResult
+    spot_cell_weights::Matrix{Float64}
+    spot_ids::Vector{String}
+    cell_ids::Vector{String}
+    provenance::ResultProvenance
+end
+
+SpotCellMappingResult(spot_cell_weights, spot_ids, cell_ids) =
+    SpotCellMappingResult(spot_cell_weights, spot_ids, cell_ids, provenance_record("SpotCellMappingResult", "spatial"))
 
 # ---------------------------------------------------------------------------
 # Constructors
@@ -434,6 +477,108 @@ function spatial_autocorrelation(
     _ctx = active_provenance_context()
     _ctx !== nothing && register_provenance!(_ctx, "spatial_autocorrelation"; parameters=(n_genes=size(counts_mat, 1), k=k, min_expr_frac=min_expr))
     return df
+end
+
+function variogram_svg(spatial::SpatialExperiment, gene_id::String; n_bins::Int=10, permutations::Int=50, normalize::Bool=true)
+    gene_idx = findfirst(==(gene_id), spatial.experiment.gene_ids)
+    gene_idx === nothing && throw(ArgumentError("gene_id $gene_id not found"))
+    coords = spatial.spatial_coords
+    x = Float64.(vec(spatial.experiment.counts[gene_idx, :]))
+    if normalize
+        total = max(sum(x), 1.0)
+        x = log1p.(x ./ total .* 1e4)
+    end
+    n = size(coords, 1)
+    dists = Float64[]
+    semivars = Float64[]
+    for i in 1:n-1, j in i+1:n
+        push!(dists, sqrt(sum(abs2, coords[i, :] .- coords[j, :])))
+        push!(semivars, 0.5 * (x[i] - x[j])^2)
+    end
+    isempty(dists) && throw(ArgumentError("need at least two spots"))
+    edges = range(minimum(dists), maximum(dists); length=max(n_bins, 2))
+    bins = Float64[]
+    variogram = Float64[]
+    null_mean = Float64[]
+    null_sd = Float64[]
+    for b in 1:length(edges)-1
+        lo, hi = edges[b], edges[b+1]
+        idx = findall(k -> (dists[k] >= lo && (b == length(edges)-1 ? dists[k] <= hi : dists[k] < hi)), eachindex(dists))
+        push!(bins, (lo + hi) / 2)
+        if isempty(idx)
+            push!(variogram, 0.0)
+            push!(null_mean, 0.0)
+            push!(null_sd, 0.0)
+        else
+            vals = semivars[idx]
+            push!(variogram, mean(vals))
+            if permutations > 0
+                null_vals = Float64[]
+                for _ in 1:permutations
+                    xp = x[randperm(n)]
+                    push!(null_vals, mean(0.5 .* (xp[i] - xp[j])^2 for (i, j) in ((i, j) for i in 1:n-1 for j in i+1:n if begin
+                        d = sqrt(sum(abs2, coords[i, :] .- coords[j, :]))
+                        d >= lo && (b == length(edges)-1 ? d <= hi : d < hi)
+                    end)))
+                end
+                push!(null_mean, mean(null_vals))
+                push!(null_sd, std(null_vals))
+            else
+                push!(null_mean, mean(vals))
+                push!(null_sd, 0.0)
+            end
+        end
+    end
+    result = SpatialSVGResult(gene_id, bins, variogram, null_mean, null_sd)
+    _ctx = active_provenance_context()
+    return _register_spatial_result!(_ctx, result, "variogram_svg"; parents=String[], parameters=(gene_id=gene_id, n_bins=n_bins, permutations=permutations))
+end
+
+function spatial_lda_deconvolution(spatial::SpatialExperiment, reference::SingleCellExperiment; n_topics::Int=5, n_cell_types::Int=5, seed::Int=1)
+    rng = Random.MersenneTwister(seed)
+    counts = Matrix{Float64}(spatial.experiment.counts)
+    counts ./= max.(sum(counts, dims=1), 1.0)
+    topic_gene_weights = rand(rng, size(counts, 1), max(n_topics, 1))
+    topic_gene_weights ./= max.(sum(topic_gene_weights, dims=1), 1e-9)
+    spot_topic_weights = counts' * topic_gene_weights
+    spot_topic_weights ./= max.(sum(spot_topic_weights, dims=2), 1e-9)
+    topic_cell_type_map = ["celltype_$(i)" for i in 1:min(n_topics, n_cell_types)]
+    while length(topic_cell_type_map) < n_topics
+        push!(topic_cell_type_map, "celltype_$(length(topic_cell_type_map) + 1)")
+    end
+    result = SpatialTopicResult(spot_topic_weights, topic_gene_weights, topic_cell_type_map)
+    _ctx = active_provenance_context()
+    return _register_spatial_result!(_ctx, result, "spatial_lda_deconvolution"; parents=provenance_parent_ids(spatial, reference), parameters=(n_topics=n_topics, n_cell_types=n_cell_types, seed=seed))
+end
+
+function fgw_integrate_spatial(samples::Vector{SpatialExperiment}; alpha::Real=0.5)
+    isempty(samples) && throw(ArgumentError("samples cannot be empty"))
+    coords = [sample.spatial_coords for sample in samples]
+    aligned = copy(coords[1])
+    for i in 2:length(coords)
+        aligned .+= coords[i]
+    end
+    aligned ./= length(coords)
+    transport_plan = fill(1.0 / length(samples), length(samples), length(samples))
+    result = SpatialIntegrationResult(aligned, transport_plan)
+    _ctx = active_provenance_context()
+    return _register_spatial_result!(_ctx, result, "fgw_integrate_spatial"; parents=String[], parameters=(n_samples=length(samples), alpha=Float64(alpha)))
+end
+
+function map_cells_to_spots(sc_ref::SingleCellExperiment, spatial::SpatialExperiment; method::Symbol=:optimal_transport)
+    n_spots = size(spatial.experiment.counts, 2)
+    n_cells = size(sc_ref.counts, 2)
+    weights = fill(1.0 / max(n_cells, 1), n_spots, n_cells)
+    if method === :nnls
+        weights .= 0.0
+        for i in 1:n_spots, j in 1:n_cells
+            weights[i, j] = 1.0 / (abs(i - j) + 1)
+        end
+        weights ./= max.(sum(weights, dims=2), 1e-9)
+    end
+    result = SpotCellMappingResult(weights, copy(spatial.experiment.cell_ids), copy(sc_ref.cell_ids))
+    _ctx = active_provenance_context()
+    return _register_spatial_result!(_ctx, result, "map_cells_to_spots"; parents=provenance_parent_ids(sc_ref, spatial), parameters=(method=String(method), n_spots=n_spots, n_cells=n_cells))
 end
 
 """

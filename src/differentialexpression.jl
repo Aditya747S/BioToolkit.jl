@@ -21,7 +21,7 @@ using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams,
 # -----------------------------------------------------------------------------
 # Exports
 # -----------------------------------------------------------------------------
-export CountMatrix, DEResult, GLMSolver, DESeqDataSet, DESeqDataSetFromMatrix,
+export CountMatrix, DEResult, GLMSolver, DESeqDataSet, DESeqDataSetFromMatrix, HurdleDEResult, mast_hurdle_test, pseudobulk_by_donor_celltype, pseudobulk_de,
     # Normalization
     calc_tmm_factors, calc_norm_factors, estimateSizeFactorsForMatrix,
     estimateSizeFactors, sizeFactors, sizeFactors!,
@@ -548,7 +548,7 @@ function _nb_loglik(y::AbstractVector{<:Real}, mu::AbstractVector{<:Real}, dispe
     @inbounds for i in eachindex(y)
         mui = max(Float64(mu[i]), eps(Float64))
         yi = max(Float64(y[i]), 0.0)
-        ll += lgamma(yi + r) - lgamma(r) - lgamma(yi + 1.0) +
+        ll += first(logabsgamma(yi + r)) - first(logabsgamma(r)) - first(logabsgamma(yi + 1.0)) +
               r * (log(r) - log(r + mui)) + yi * (log(mui) - log(r + mui))
     end
     return ll
@@ -3512,8 +3512,8 @@ function _edgeR_exact_twosided_pvalue(total::Int, x_obs::Int, r::Float64)
         # No p2 terms — p drops out under H0
         logp = Vector{Float64}(undef, total + 1)
         @inbounds for k in 0:total
-            logp[k+1] = lgamma(k + r) - lgamma(r) - lgamma(k + 1.0) +
-                        lgamma(total - k + r) - lgamma(r) - lgamma(total - k + 1.0)
+            logp[k+1] = first(logabsgamma(k + r)) - first(logabsgamma(r)) - first(logabsgamma(k + 1.0)) +
+                        first(logabsgamma(total - k + r)) - first(logabsgamma(r)) - first(logabsgamma(total - k + 1.0))
         end
         lp_obs = logp[clamp(x_obs, 0, total)+1]
         sel = [v for v in logp if v <= lp_obs + 1e-12]
@@ -3916,7 +3916,7 @@ function lfc_shrink_apeglm_full(cm::CountMatrix, dds::DESeqDataSet;
             mu = max.(exp.(X * beta_test .+ offset), 1e-8)
             ll = 0.0
             @inbounds for i in 1:ns
-                ll += lgamma(y[i] + r) - lgamma(r) - lgamma(y[i] + 1.0) +
+                ll += first(logabsgamma(y[i] + r)) - first(logabsgamma(r)) - first(logabsgamma(y[i] + 1.0)) +
                       r * (log(r) - log(r + mu[i])) + y[i] * (log(mu[i]) - log(r + mu[i]))
             end
             # Cauchy prior: -log(1 + beta^2/scale^2)
@@ -5041,7 +5041,7 @@ function zinb_test(cm::CountMatrix, design;
                 ll = 0.0
                 for s in 1:ns
                     ll += w_nb[s] * (
-                        lgamma(y[s] + r_try) - lgamma(r_try) - lgamma(y[s] + 1.0) +
+                        first(logabsgamma(y[s] + r_try)) - first(logabsgamma(r_try)) - first(logabsgamma(y[s] + 1.0)) +
                         r_try * (log(r_try) - log(r_try + mu_new)) +
                         y[s] * (log(mu_new) - log(r_try + mu_new))
                     )
@@ -5076,7 +5076,7 @@ function zinb_test(cm::CountMatrix, design;
                     p_zero_nb = (r_new / (r_new + mu_new))^r_new
                     loglik += log(max(pi_new + (1 - pi_new) * p_zero_nb, 1e-300))
                 else
-                    loglik += log(1 - pi_new) + lgamma(y[s] + r_new) - lgamma(r_new) - lgamma(y[s] + 1.0) +
+                    loglik += log(1 - pi_new) + first(logabsgamma(y[s] + r_new)) - first(logabsgamma(r_new)) - first(logabsgamma(y[s] + 1.0)) +
                               r_new * (log(r_new) - log(r_new + mu_new)) + y[s] * (log(mu_new) - log(r_new + mu_new))
                 end
             end
@@ -5825,4 +5825,7 @@ function makeExampleDESeqDataSet(; n::Int=1000, m::Int=12,
     return DESeqDataSet(cm, coldata, condition)
 end
 
+include("hurdle_de.jl")
+
 end # module DifferentialExpression
+

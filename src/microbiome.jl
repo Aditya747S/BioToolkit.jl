@@ -27,6 +27,7 @@ using Plots
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 using ..BioToolkit: BioSequence, DNAAlphabet, DNASeq, PhyloTree, get_terminals
 using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!
+import ..BioToolkit: shannon_entropy
 
 @inline function _register_microbiome_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -870,7 +871,16 @@ function songbird(profile::CommunityProfile, design::AbstractMatrix{<:Real}; fea
 end
 
 function source_tracking_posterior_summary(chain; source::AbstractString="Microbiome/source_tracking_posterior_summary", notes::AbstractVector{<:AbstractString}=String[], parameters::NamedTuple=NamedTuple())
-    samples = Matrix{Float64}(Array(chain))
+    arr = Array(chain)
+    samples = if ndims(arr) == 3
+        if occursin("VNChain", string(typeof(chain)))
+            Matrix{Float64}(reshape(arr, size(arr, 1) * size(arr, 2), size(arr, 3)))
+        else
+            Matrix{Float64}(reshape(permutedims(arr, (1, 3, 2)), size(arr, 1) * size(arr, 3), size(arr, 2)))
+        end
+    else
+        Matrix{Float64}(arr)
+    end
     mean_proportions = vec(mean(samples, dims=1))
     median_proportions = vec(median(samples, dims=1))
     lower_bounds = [quantile(view(samples, :, column), 0.025) for column in axes(samples, 2)]

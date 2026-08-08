@@ -20,6 +20,7 @@ module GenomicRanges
 import ..BioToolkit: normalize_interval, BedRecord, GffRecord, IntervalTree, query_overlaps, _itn_insert
 using PooledArrays
 using DataFrames
+using Statistics
 using ..BioToolkit: PROVENANCE_ID_KEY, PROVENANCE_METADATA_KEY, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!, stamp_provenance!, with_provenance
 
 @inline function _register_genomicranges_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
@@ -34,6 +35,7 @@ export overlap, find_overlaps, nearest, find_nearest, follow, precede
 export shift, flank, resize, promoters, narrow
 export trim, gaps, complement, disjoin, pintersect, punion, psetdiff
 export coverage
+export OverlapProfileResult, profile_interval_overlaps
 
 struct GenomicInterval
     chrom::String
@@ -79,6 +81,26 @@ struct SeqInfo
     chrom::String
     length::Int
     is_circular::Bool
+end
+
+"""
+    OverlapProfileResult
+
+Reproducible timing and allocation measurements comparing the current indexed
+overlap query with a direct coordinate scan. This is intentionally a profiling
+baseline, not an alternative production index: it supplies the evidence needed
+before replacing the interval representation or memory layout.
+"""
+struct OverlapProfileResult
+    query_count::Int
+    subject_count::Int
+    repetitions::Int
+    indexed_seconds::Float64
+    naive_seconds::Float64
+    indexed_allocated_bytes::Int
+    naive_allocated_bytes::Int
+    indexed_hit_count::Int
+    naive_hit_count::Int
 end
 
 GenomicInterval(chrom::String, left::Integer, right::Integer) = GenomicInterval(chrom, left, right, '.', Dict{String,Any}())
@@ -384,6 +406,77 @@ function find_overlaps(query::GenomicInterval, subject::IntervalCollection)
     indices = query_overlaps(tree, query.left, query.right)
 
     return with_provenance(subject.intervals[indices], "GenomicInterval", "GenomicRanges/find_overlaps"; notes=["overlap query against interval collection"], parameters=(chrom=query.chrom, left=query.left, right=query.right, hit_count=length(indices)))
+end
+
+@inline function _naive_overlap_count(query::GenomicInterval, subject::IntervalCollection)
+    hits = 0
+    for interval in subject.intervals
+        interval.chrom == query.chrom || continue
+        interval.left <= query.right && interval.right >= query.left && (hits += 1)
+    end
+    return hits
+end
+
+function _profile_overlap_kernel(kernel::Function, repetitions::Int)
+    # Run once to compile specialized methods outside the measured samples.
+    kernel()
+    times = Vector{Float64}(undef, repetitions)
+    allocations = Vector{Int}(undef, repetitions)
+    hit_counts = Vector{Int}(undef, repetitions)
+    for i in 1:repetitions
+        measurement = @timed kernel()
+        times[i] = measurement.time
+        allocations[i] = measurement.bytes
+        hit_counts[i] = measurement.value
+    end
+    return median(times), round(Int, median(allocations)), hit_counts[end]
+end
+
+"""
+    profile_interval_overlaps(queries, subject; repetitions=5)
+
+Measure the public indexed overlap path against an exact direct scan. Both
+paths must produce the same total hit count; a mismatch raises an error rather
+than reporting a misleading performance comparison. Timings exclude JIT
+compilation and report median wall time and allocation volume across repeats.
+"""
+function profile_interval_overlaps(
+    queries,
+    subject::IntervalCollection;
+    repetitions::Integer=5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    repetitions > 0 || throw(ArgumentError("repetitions must be positive"))
+    query_vector = GenomicInterval[query for query in queries]
+
+    indexed_kernel = () -> sum(length(find_overlaps(query, subject)) for query in query_vector)
+    naive_kernel = () -> sum(_naive_overlap_count(query, subject) for query in query_vector)
+    indexed_seconds, indexed_bytes, indexed_hits = _profile_overlap_kernel(indexed_kernel, Int(repetitions))
+    naive_seconds, naive_bytes, naive_hits = _profile_overlap_kernel(naive_kernel, Int(repetitions))
+    indexed_hits == naive_hits || throw(ErrorException("indexed and naive overlap hit counts disagree: $(indexed_hits) != $(naive_hits)"))
+
+    result = OverlapProfileResult(
+        length(query_vector),
+        length(subject),
+        Int(repetitions),
+        indexed_seconds,
+        naive_seconds,
+        indexed_bytes,
+        naive_bytes,
+        indexed_hits,
+        naive_hits)
+    return _register_genomicranges_result!(
+        _ctx,
+        result,
+        "profile_interval_overlaps";
+        parents=provenance_parent_ids(query_vector, subject),
+        parameters=(
+            query_count=result.query_count,
+            subject_count=result.subject_count,
+            repetitions=result.repetitions,
+            indexed_hit_count=result.indexed_hit_count,
+            naive_hit_count=result.naive_hit_count))
 end
 
 overlap(query::GenomicInterval, subject::IntervalCollection) = find_overlaps(query, subject)

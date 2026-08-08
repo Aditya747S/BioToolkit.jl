@@ -4,6 +4,8 @@
 
 `deeplearning.jl` provides model-inspired embedding, denoising, label-transfer, perturbation, protein-sequence, and graph-network utilities using lightweight Julia implementations or payload-compatible approximations.
 
+Flux-backed helpers such as `flux_autoencoder_embedding` and `flux_mlp_classifier` require the optional Flux extension to be loaded.
+
 ### Purpose
 
 This page documents the user-facing types and workflows implemented in `deeplearning.jl`. The emphasis is on public APIs exported through BioToolkit and the biological analysis step each one supports.

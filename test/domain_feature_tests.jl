@@ -222,7 +222,7 @@ using BioToolkit
         gl = BioToolkit.graphsca_label_transfer(rand(15, 10), A, ["T", "T", "unknown", "B", "B", "unknown", "T", "B", "unknown", "T"])
         @test length(gl.predicted_label) == 10
 
-        if Base.find_package("Flux") !== nothing
+        if BioToolkit.flux_available()
             import Flux
             ae = BioToolkit.flux_autoencoder_embedding(rand(40, 12); latent_dim=4, hidden_dim=8, epochs=1, backend=:cpu)
             @test size(ae.latent, 2) == 4

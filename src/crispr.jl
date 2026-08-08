@@ -25,20 +25,25 @@
 module CRISPR
 
 using DataFrames
+using DataAPI
 using Statistics
 using LinearAlgebra
 using Random
+using Distributions
 
 # Import biotypes for type-safe sequence handling
 using ..BioToolkit: AASeq, AminoAcidAlphabet, BioSequence, DNAAlphabet, DNASeq, SummarizedExperiment, assay, colData
+using ..BioToolkit: AbstractAnalysisResult, ResultProvenance, provenance_record
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
 
 export GuideRNA, CRISPRSystem, OffTarget, EditingWindow
 export design_guides, score_on_target, find_pam_sites, enumerate_off_targets
+export FMIndex, OffTargetIndex, OffTargetSearchDiagnostics, build_offtarget_index
 export cfd_score, mit_score, guide_gc_content
 export design_base_editor_guides, analyze_editing_window
 export design_pegrna, prime_editing_guide_score
-export crispr_screen_analysis, mageck_like_test
+export crispr_screen_analysis, mageck_like_test, crispr_screen_nb
+export MageckRRAResult, CRISPRScreenResult
 export design_library, library_coverage_stats
 export design_hdr_template
 export predict_indels, indel_distribution
@@ -126,6 +131,51 @@ struct EditingWindow
     editable_base::Char
     edited_base::Char
     bystander_positions::Vector{Int}
+end
+
+"""
+    FMIndex
+
+Checkpointed FM-index with sampled suffix-array locations. The index supports
+exact and bounded Hamming-distance backward search over a DNA reference.
+`bwt` and suffix-array samples are immutable after construction, making the
+query path deterministic and safe to share across threads.
+"""
+struct FMIndex
+    bwt::Vector{UInt8}
+    c_table::Vector{Int}
+    symbol_to_slot::Vector{Int16}
+    checkpoint_counts::Matrix{Int}
+    checkpoint_interval::Int
+    sample_rows::Vector{Int}
+    sample_values::Vector{Int}
+    text_length::Int
+end
+
+"""
+    OffTargetIndex
+
+A contig-aware FM-index for repeated CRISPR off-target searches. Reference
+sequences are retained for PAM verification and strand-correct extraction after
+candidate discovery; the FM-index itself performs the genome-scale lookup.
+"""
+struct OffTargetIndex <: AbstractAnalysisResult
+    fm_index::FMIndex
+    contig_names::Vector{String}
+    contig_sequences::Vector{String}
+    contig_starts::Vector{Int}
+    contig_stops::Vector{Int}
+    suffix_array_sample_rate::Int
+    provenance::ResultProvenance
+end
+
+struct OffTargetSearchDiagnostics <: AbstractAnalysisResult
+    candidate_intervals::Int
+    fm_candidates::Int
+    verified_sites::Int
+    max_mismatches::Int
+    method_level::Symbol
+    provenance::ResultProvenance
 end
 
 # Base editor definitions
@@ -396,62 +446,317 @@ function mit_score(guide::BioSequence{DNAAlphabet}, off_targets::AbstractVector{
 end
 
 # ---------------------------------------------------------------------------
-# Off-target enumeration (in-silico, from a target sequence)
+# Off-target indexing and FM-index enumeration
 # ---------------------------------------------------------------------------
 
-"""
-    enumerate_off_targets(guide, genome_seq; max_mismatches=3, chromosome="chr1") → DataFrame
+const _FM_SENTINEL = UInt8(0x00)
+const _FM_CONTIG_SEPARATOR = UInt8(0x01)
+const _OFFTARGET_SEARCH_ALPHABET = UInt8[UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T')]
 
-Enumerate off-target sites. Accepts `AbstractString` or `BioSequence{DNAAlphabet}`.
-"""
-function enumerate_off_targets(
-    guide::BioSequence{DNAAlphabet},
-    genome_seq::BioSequence{DNAAlphabet};
-    max_mismatches::Int=3,
-    chromosome::String="chr1",
-    system::CRISPRSystem=SpCas9)
-    g    = uppercase(String(guide))
-    glen = length(g)
-    seq  = uppercase(String(genome_seq))
-    n    = length(seq)
-    plen = length(system.pam)
-    ots  = NamedTuple[]
+function _suffix_array_prefix_doubling(text::Vector{UInt8})
+    n = length(text)
+    n > 0 || throw(ArgumentError("cannot build an FM-index over an empty reference"))
+    suffixes = collect(1:n)
+    ranks = Int.(text)
+    next_ranks = similar(ranks)
+    width = 1
+    while true
+        sort!(suffixes; by=index -> (ranks[index], index + width <= n ? ranks[index + width] : -1))
+        classes = 1
+        next_ranks[suffixes[1]] = classes
+        for order_index in 2:n
+            current = suffixes[order_index]
+            previous = suffixes[order_index - 1]
+            current_key = (ranks[current], current + width <= n ? ranks[current + width] : -1)
+            previous_key = (ranks[previous], previous + width <= n ? ranks[previous + width] : -1)
+            current_key != previous_key && (classes += 1)
+            next_ranks[current] = classes
+        end
+        ranks, next_ranks = next_ranks, ranks
+        classes == n && return suffixes
+        width >= n && return suffixes
+        width *= 2
+    end
+end
 
-    for strand_sign in (1, -1)
-        working = strand_sign == 1 ? seq : _reverse_complement_str(seq)
-        nw = length(working)
-        for i in 1:(nw - glen - plen + 1)
-            site = working[i : i+glen-1]
-            mismatches = count(k -> g[k] != site[k], 1:glen)
-            mismatches > max_mismatches && continue
-            # Check PAM
-            pam_seg = working[i+glen : min(i+glen+plen-1, nw)]
-            pam_ok = length(pam_seg) == plen && pam_matches(system.pam, pam_seg)
-            pam_ok || continue
+function _build_fm_index(text::Vector{UInt8}; checkpoint_interval::Integer=128, suffix_array_sample_rate::Integer=32)
+    checkpoint_interval > 0 || throw(ArgumentError("checkpoint_interval must be positive"))
+    suffix_array_sample_rate > 0 || throw(ArgumentError("suffix_array_sample_rate must be positive"))
+    suffix_array = _suffix_array_prefix_doubling(text)
+    n = length(text)
+    bwt = Vector{UInt8}(undef, n)
+    for row in eachindex(suffix_array)
+        suffix_start = suffix_array[row]
+        bwt[row] = text[suffix_start == 1 ? n : suffix_start - 1]
+    end
 
-            push!(ots, (
-                guide         = g,
-                chromosome    = chromosome,
-                position      = strand_sign == 1 ? i : n - (i + glen - 1) + 1,
-                strand        = Int8(strand_sign),
-                sequence      = site,
-                mismatches    = mismatches,
-                bulges        = 0,
-                cfd           = cfd_score(g, site),
-                mit           = mit_score(g, [site]),
-                pam           = pam_seg))
+    counts = zeros(Int, 256)
+    for symbol in text
+        counts[Int(symbol) + 1] += 1
+    end
+    c_table = zeros(Int, 256)
+    cumulative = 0
+    for index in eachindex(c_table)
+        c_table[index] = cumulative
+        cumulative += counts[index]
+    end
+    alphabet = UInt8[index - 1 for index in eachindex(counts) if counts[index] > 0]
+    symbol_to_slot = zeros(Int16, 256)
+    for (slot, symbol) in enumerate(alphabet)
+        symbol_to_slot[Int(symbol) + 1] = Int16(slot)
+    end
+
+    block_count = cld(n, Int(checkpoint_interval))
+    checkpoints = zeros(Int, length(alphabet), block_count + 1)
+    running = zeros(Int, length(alphabet))
+    for position in eachindex(bwt)
+        slot = Int(symbol_to_slot[Int(bwt[position]) + 1])
+        running[slot] += 1
+        if position % checkpoint_interval == 0
+            checkpoints[:, position ÷ checkpoint_interval + 1] .= running
         end
     end
 
-    sort!(ots, by = r -> r.mismatches)
-    result = DataFrame(ots)
-    _ctx = active_provenance_context()
-
-
-    return _register_crispr_result!(_ctx, result, "enumerate_off_targets"; parents=provenance_parent_ids(guide, genome_seq), parameters=(max_mismatches=max_mismatches, chromosome=chromosome, system=system.name, row_count=nrow(result)))
+    sample_rows = Int[]
+    sample_values = Int[]
+    for (row, suffix_start) in enumerate(suffix_array)
+        if (suffix_start - 1) % suffix_array_sample_rate == 0
+            push!(sample_rows, row)
+            push!(sample_values, suffix_start)
+        end
+    end
+    return FMIndex(bwt, c_table, symbol_to_slot, checkpoints, Int(checkpoint_interval), sample_rows, sample_values, n)
 end
 
-# Removed enumerate_off_targets BioSequence wrapper functions - main implementation now uses BioSequence
+@inline function _fm_occurrence(index::FMIndex, symbol::UInt8, position::Int)
+    position <= 0 && return 0
+    position <= index.text_length || throw(BoundsError(index.bwt, position))
+    slot = Int(index.symbol_to_slot[Int(symbol) + 1])
+    slot == 0 && return 0
+    complete_block = position ÷ index.checkpoint_interval
+    count = index.checkpoint_counts[slot, complete_block + 1]
+    block_start = complete_block * index.checkpoint_interval
+    for offset in block_start + 1:position
+        index.bwt[offset] == symbol && (count += 1)
+    end
+    return count
+end
+
+@inline function _fm_extend(index::FMIndex, left::Int, right::Int, symbol::UInt8)
+    slot = Int(index.symbol_to_slot[Int(symbol) + 1])
+    slot == 0 && return 1, 0
+    next_left = index.c_table[Int(symbol) + 1] + _fm_occurrence(index, symbol, left - 1) + 1
+    next_right = index.c_table[Int(symbol) + 1] + _fm_occurrence(index, symbol, right)
+    return next_left, next_right
+end
+
+@inline function _fm_lf(index::FMIndex, row::Int)
+    symbol = index.bwt[row]
+    return index.c_table[Int(symbol) + 1] + _fm_occurrence(index, symbol, row)
+end
+
+function _fm_locate(index::FMIndex, row::Int)
+    steps = 0
+    current_row = row
+    while true
+        sample_index = searchsortedfirst(index.sample_rows, current_row)
+        if sample_index <= length(index.sample_rows) && index.sample_rows[sample_index] == current_row
+            return mod(index.sample_values[sample_index] + steps - 1, index.text_length) + 1
+        end
+        current_row = _fm_lf(index, current_row)
+        steps += 1
+        steps <= index.text_length || throw(ErrorException("FM-index locate failed to reach a suffix-array sample"))
+    end
+end
+
+function _fm_hamming_intervals(index::FMIndex, pattern::Vector{UInt8}, max_mismatches::Int)
+    stack = Tuple{Int,Int,Int,Int}[(length(pattern), 1, index.text_length, 0)]
+    intervals = Tuple{Int,Int,Int}[]
+    expanded = 0
+    while !isempty(stack)
+        pattern_position, left, right, mismatches = pop!(stack)
+        pattern_position == 0 && (push!(intervals, (left, right, mismatches)); continue)
+        requested = pattern[pattern_position]
+        for observed in _OFFTARGET_SEARCH_ALPHABET
+            next_mismatches = mismatches + (observed == requested ? 0 : 1)
+            next_mismatches <= max_mismatches || continue
+            next_left, next_right = _fm_extend(index, left, right, observed)
+            next_left <= next_right || continue
+            expanded += 1
+            push!(stack, (pattern_position - 1, next_left, next_right, next_mismatches))
+        end
+    end
+    return intervals, expanded
+end
+
+function _offtarget_index_from_contigs(
+    contig_names::Vector{String},
+    contig_sequences::Vector{String};
+    checkpoint_interval::Integer=128,
+    suffix_array_sample_rate::Integer=32,
+    max_build_bases::Union{Nothing,Integer}=nothing,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    length(contig_names) == length(contig_sequences) || throw(DimensionMismatch("contig names and sequences must have identical lengths"))
+    isempty(contig_sequences) && throw(ArgumentError("at least one contig is required"))
+    all(!isempty, contig_sequences) || throw(ArgumentError("empty contigs are not supported by the FM-index builder"))
+    total_bases = sum(length, contig_sequences)
+    max_build_bases === nothing || total_bases <= max_build_bases || throw(ArgumentError("reference has $(total_bases) bases, exceeding max_build_bases=$(max_build_bases); use a larger build environment or explicitly raise the limit"))
+
+    text = UInt8[]
+    starts = Int[]
+    stops = Int[]
+    for (contig_name, sequence) in zip(contig_names, contig_sequences)
+        isempty(contig_name) && throw(ArgumentError("contig names must not be empty"))
+        occursin(' ', sequence) && throw(ArgumentError("reference sequence contains the FM-index sentinel byte"))
+        occursin('', sequence) && throw(ArgumentError("reference sequence contains the FM-index contig separator byte"))
+        push!(starts, length(text) + 1)
+        append!(text, codeunits(sequence))
+        push!(stops, length(text))
+        push!(text, _FM_CONTIG_SEPARATOR)
+    end
+    text[end] = _FM_SENTINEL
+    fm_index = _build_fm_index(text; checkpoint_interval=checkpoint_interval, suffix_array_sample_rate=suffix_array_sample_rate)
+    provenance = provenance_record("OffTargetIndex", "CRISPR/build_offtarget_index"; parameters=(contig_count=length(contig_names), total_bases=total_bases, checkpoint_interval=Int(checkpoint_interval), suffix_array_sample_rate=Int(suffix_array_sample_rate)))
+    result = OffTargetIndex(fm_index, contig_names, contig_sequences, starts, stops, Int(suffix_array_sample_rate), provenance)
+    return _register_crispr_result!(_ctx, result, "build_offtarget_index"; parents=String[], parameters=(contig_count=length(contig_names), total_bases=total_bases, checkpoint_interval=Int(checkpoint_interval), suffix_array_sample_rate=Int(suffix_array_sample_rate)))
+end
+
+"""
+    build_offtarget_index(genome; chromosome="chr1", ...)
+
+Build a reusable FM-index for a DNA reference. Construction uses a native
+prefix-doubling suffix-array builder and is memory-intensive; build once and
+query many guides with `enumerate_off_targets(guide, index)`. The query engine
+is bounded-Hamming only and therefore reports `bulges=0` explicitly.
+"""
+function build_offtarget_index(genome::BioSequence{DNAAlphabet}; chromosome::AbstractString="chr1", kwargs...)
+    return _offtarget_index_from_contigs([String(chromosome)], [uppercase(String(genome))]; kwargs...)
+end
+
+build_offtarget_index(genome::AbstractString; kwargs...) = build_offtarget_index(DNASeq(genome; validate=false); kwargs...)
+
+function build_offtarget_index(genomes::AbstractDict; kwargs...)
+    keys_sorted = sort!(collect(keys(genomes)); by=string)
+    names = String.(keys_sorted)
+    sequences = [uppercase(String(genomes[key])) for key in keys_sorted]
+    return _offtarget_index_from_contigs(names, sequences; kwargs...)
+end
+
+@inline function _index_contig_position(index::OffTargetIndex, text_position::Int)
+    contig_index = searchsortedlast(index.contig_starts, text_position)
+    return contig_index >= 1 && text_position <= index.contig_stops[contig_index] ? contig_index : nothing
+end
+
+function _fm_candidate_positions(index::OffTargetIndex, pattern::String, max_mismatches::Int; max_candidates::Int)
+    intervals, expanded = _fm_hamming_intervals(index.fm_index, collect(codeunits(pattern)), max_mismatches)
+    positions = Int[]
+    for (left, right, _) in intervals
+        length(positions) + (right - left + 1) <= max_candidates || throw(ArgumentError("FM-index search exceeded max_candidates=$(max_candidates); narrow max_mismatches or raise the explicit limit"))
+        for row in left:right
+            push!(positions, _fm_locate(index.fm_index, row))
+        end
+    end
+    return positions, length(intervals), expanded
+end
+
+function _append_verified_offtargets!(
+    rows::Vector{NamedTuple},
+    index::OffTargetIndex,
+    guide::String,
+    candidate_positions::Vector{Int},
+    strand_sign::Int8,
+    system::CRISPRSystem)
+
+    guide_length = length(guide)
+    pam_length = length(system.pam)
+    for text_position in candidate_positions
+        contig_index = _index_contig_position(index, text_position)
+        contig_index === nothing && continue
+        sequence = index.contig_sequences[contig_index]
+        local_start = text_position - index.contig_starts[contig_index] + 1
+        if strand_sign == 1
+            local_start + guide_length + pam_length - 1 <= length(sequence) || continue
+            site = sequence[local_start:local_start + guide_length - 1]
+            pam = sequence[local_start + guide_length:local_start + guide_length + pam_length - 1]
+            pam_matches(system.pam, pam) || continue
+            position = local_start
+        else
+            local_start - pam_length >= 1 || continue
+            forward_site = sequence[local_start:local_start + guide_length - 1]
+            site = _reverse_complement_str(forward_site)
+            pam = _reverse_complement_str(sequence[local_start - pam_length:local_start - 1])
+            pam_matches(system.pam, pam) || continue
+            position = local_start
+        end
+        mismatches = count(index -> guide[index] != site[index], eachindex(guide))
+        push!(rows, (
+            guide=guide,
+            chromosome=index.contig_names[contig_index],
+            position=position,
+            strand=strand_sign,
+            sequence=site,
+            mismatches=mismatches,
+            bulges=0,
+            cfd=cfd_score(DNASeq(guide; validate=false), DNASeq(site; validate=false)),
+            mit=mit_score(DNASeq(guide; validate=false), [DNASeq(site; validate=false)]),
+            pam=pam))
+    end
+    return rows
+end
+
+"""
+    enumerate_off_targets(guide, index; max_mismatches=3, max_candidates=100_000, system=SpCas9)
+
+Enumerate PAM-valid off-targets through FM-index backward search with bounded
+Hamming distance. Candidate discovery is sublinear in reference length for
+selective guide suffixes; candidate verification preserves exact strand and PAM
+semantics. Bulges are not searched and are reported as zero.
+"""
+function enumerate_off_targets(
+    guide::BioSequence{DNAAlphabet},
+    index::OffTargetIndex;
+    max_mismatches::Integer=3,
+    max_candidates::Integer=100_000,
+    system::CRISPRSystem=SpCas9,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    0 <= max_mismatches <= length(guide) || throw(ArgumentError("max_mismatches must lie between 0 and the guide length"))
+    max_candidates > 0 || throw(ArgumentError("max_candidates must be positive"))
+    guide_string = uppercase(String(guide))
+    all(symbol -> symbol in _OFFTARGET_SEARCH_ALPHABET, codeunits(guide_string)) || throw(ArgumentError("FM-index off-target search accepts unambiguous A/C/G/T guides only"))
+
+    forward_positions, forward_intervals, _ = _fm_candidate_positions(index, guide_string, Int(max_mismatches); max_candidates=Int(max_candidates))
+    reverse_guide = _reverse_complement_str(guide_string)
+    remaining = Int(max_candidates) - length(forward_positions)
+    remaining > 0 || throw(ArgumentError("FM-index search reached max_candidates before reverse-strand evaluation"))
+    reverse_positions, reverse_intervals, _ = _fm_candidate_positions(index, reverse_guide, Int(max_mismatches); max_candidates=remaining)
+    rows = NamedTuple[]
+    _append_verified_offtargets!(rows, index, guide_string, forward_positions, Int8(1), system)
+    _append_verified_offtargets!(rows, index, guide_string, reverse_positions, Int8(-1), system)
+    sort!(rows; by=row -> (row.mismatches, row.chromosome, row.position, row.strand))
+    result = DataFrame(rows)
+    diagnostics = OffTargetSearchDiagnostics(forward_intervals + reverse_intervals, length(forward_positions) + length(reverse_positions), length(rows), Int(max_mismatches), :validated, provenance_record("OffTargetSearchDiagnostics", "CRISPR/enumerate_off_targets"; parameters=(candidate_intervals=forward_intervals + reverse_intervals, fm_candidates=length(forward_positions) + length(reverse_positions), verified_sites=length(rows), max_mismatches=Int(max_mismatches))))
+    DataAPI.metadata!(result, "off_target_search_diagnostics", diagnostics; style=:note)
+    return _register_crispr_result!(_ctx, result, "enumerate_off_targets"; parents=provenance_parent_ids(guide, index), parameters=(engine="fm_index_hamming", max_mismatches=Int(max_mismatches), max_candidates=Int(max_candidates), system=system.name, row_count=nrow(result), candidate_count=diagnostics.fm_candidates, bulges_searched=false))
+end
+
+enumerate_off_targets(guide::AbstractString, index::OffTargetIndex; kwargs...) = enumerate_off_targets(DNASeq(guide; validate=false), index; kwargs...)
+
+"""
+    enumerate_off_targets(guide, genome_seq; kwargs...)
+
+Compatibility path for a single in-memory reference. For repeated guide queries,
+build one `OffTargetIndex` and call the indexed overload directly.
+"""
+function enumerate_off_targets(guide::BioSequence{DNAAlphabet}, genome_seq::BioSequence{DNAAlphabet}; chromosome::String="chr1", kwargs...)
+    index = build_offtarget_index(genome_seq; chromosome=chromosome)
+    return enumerate_off_targets(guide, index; kwargs...)
+end
+
+enumerate_off_targets(guide::AbstractString, genome_seq::AbstractString; kwargs...) = enumerate_off_targets(DNASeq(guide; validate=false), DNASeq(genome_seq; validate=false); kwargs...)
 
 # ---------------------------------------------------------------------------
 # Guide design pipeline
@@ -973,97 +1278,222 @@ function library_coverage_stats(library::DataFrame, n_genes::Int)
 end
 
 # ---------------------------------------------------------------------------
-# CRISPR screen analysis (MAGeCK-like)
+# CRISPR screen analysis: negative-binomial guide model and RRA ranking
 # ---------------------------------------------------------------------------
 
 """
-    crispr_screen_analysis(counts_treatment, counts_control, guide_gene_map; method=:rra) → DataFrame
+    MageckRRAResult
 
-Analyze a CRISPR screen for essentiality or enrichment using a simplified
-Robust Rank Aggregation (RRA) approach, analogous to MAGeCK.
-
-`counts_treatment`, `counts_control`: matrices (n_guides × n_replicates).
-`guide_gene_map`: DataFrame with `guide` and `gene` columns.
-
-Returns a gene-level result DataFrame sorted by score.
-
-Reference: Li et al. (2014) Genome Biology 15:554.
+Gene-level robust-rank-aggregation output. The RRA p-value is a two-sided,
+Bonferroni-corrected minimum beta-order-statistic probability; it is reported
+separately from the negative-binomial guide-level evidence.
 """
-function crispr_screen_analysis(
+struct MageckRRAResult <: AbstractAnalysisResult
+    gene_results::DataFrame
+    direction::Symbol
+    provenance::ResultProvenance
+end
+
+"""
+    CRISPRScreenResult
+
+Result of a library-size-normalized negative-binomial CRISPR screen analysis.
+Guide-level Wald statistics and dispersion estimates are retained so gene calls
+can be audited rather than treated as an opaque rank list.
+"""
+struct CRISPRScreenResult <: AbstractAnalysisResult
+    guide_results::DataFrame
+    gene_results::DataFrame
+    qc::DataFrame
+    global_dispersion::Float64
+    rra::MageckRRAResult
+    provenance::ResultProvenance
+end
+
+function _median_ratio_size_factors(counts::AbstractMatrix{<:Real})
+    any(value -> value < 0 || !isfinite(value), counts) && throw(ArgumentError("screen counts must be finite and nonnegative"))
+    counts_float = Float64.(counts)
+    log_geomean = vec(mean(log.(counts_float .+ 1.0), dims=2))
+    geomean = exp.(log_geomean)
+    factors = Float64[]
+    for column in axes(counts_float, 2)
+        ratios = counts_float[:, column] ./ geomean
+        valid = filter(isfinite, ratios)
+        push!(factors, isempty(valid) ? 1.0 : median(valid))
+    end
+    any(value -> value <= 0 || !isfinite(value), factors) && throw(ArgumentError("could not estimate positive library size factors"))
+    factors ./= exp(mean(log.(factors)))
+    return factors
+end
+
+function _bh_adjust(pvalues::AbstractVector{<:Real})
+    n = length(pvalues)
+    n == 0 && return Float64[]
+    order = sortperm(pvalues)
+    adjusted = ones(Float64, n)
+    running = 1.0
+    for rank in n:-1:1
+        index = order[rank]
+        running = min(running, Float64(pvalues[index]) * n / rank)
+        adjusted[index] = clamp(running, 0.0, 1.0)
+    end
+    return adjusted
+end
+
+function _rra_tail_probability(ranks::AbstractVector{<:Integer}, total_guides::Int)
+    isempty(ranks) && return 1.0
+    total_guides > 0 || throw(ArgumentError("total_guides must be positive"))
+    sorted_ranks = sort(Int.(ranks))
+    n = length(sorted_ranks)
+    probabilities = Float64[]
+    for (position, rank) in enumerate(sorted_ranks)
+        u = clamp(rank / total_guides, 0.0, 1.0)
+        push!(probabilities, cdf(Beta(position, n - position + 1), u))
+    end
+    return clamp(n * minimum(probabilities), 0.0, 1.0)
+end
+
+function _rra_gene_results(guide_results::DataFrame)
+    n_guides = nrow(guide_results)
+    depleted_order = sortperm(guide_results.log2_fold_change)
+    enriched_order = reverse(depleted_order)
+    depleted_ranks = zeros(Int, n_guides)
+    enriched_ranks = zeros(Int, n_guides)
+    for (rank, index) in enumerate(depleted_order)
+        depleted_ranks[index] = rank
+    end
+    for (rank, index) in enumerate(enriched_order)
+        enriched_ranks[index] = rank
+    end
+
+    rows = NamedTuple[]
+    for gene in unique(guide_results.gene)
+        indices = findall(==(gene), guide_results.gene)
+        depleted_p = _rra_tail_probability(depleted_ranks[indices], n_guides)
+        enriched_p = _rra_tail_probability(enriched_ranks[indices], n_guides)
+        direction = depleted_p <= enriched_p ? :depleted : :enriched
+        rra_p = min(1.0, 2.0 * min(depleted_p, enriched_p))
+        push!(rows, (
+            gene=String(gene),
+            n_guides=length(indices),
+            mean_log2_fold_change=mean(guide_results.log2_fold_change[indices]),
+            median_log2_fold_change=median(guide_results.log2_fold_change[indices]),
+            rra_pvalue=rra_p,
+            depleted_rra_pvalue=depleted_p,
+            enriched_rra_pvalue=enriched_p,
+            direction=String(direction)))
+    end
+    results = DataFrame(rows)
+    results[!, :padj] = _bh_adjust(results.rra_pvalue)
+    sort!(results, [:padj, :rra_pvalue, :gene])
+    return results
+end
+
+"""
+    crispr_screen_nb(counts_treatment, counts_control, guide_gene_map;
+                     min_mean_count=10, dispersion_prior_weight=10.0)
+
+Fit a guide-level two-group negative-binomial Wald model after DESeq-style
+median-ratio library normalization. Dispersion is estimated from all samples
+and shrunk toward a robust global estimate. Gene hits are ranked with
+bidirectional robust rank aggregation of guide log-fold changes.
+
+This is an explicit NB-Wald/RRA implementation, not a claim of bit-for-bit
+MAGeCK MLE parity. It requires at least two samples per condition; screen-level
+QC, guide dispersion, and all intermediate statistics are returned.
+"""
+function crispr_screen_nb(
     counts_treatment::AbstractMatrix{<:Real},
     counts_control::AbstractMatrix{<:Real},
     guide_gene_map::DataFrame;
-    method::Symbol=:rra,
-    min_reads::Int=10,
-    pseudocount::Real=1.0)
-    size(counts_treatment) == size(counts_control) ||
-        throw(DimensionMismatch("treatment and control must have same dimensions"))
-    n_guides, n_reps = size(counts_treatment)
-    nrow(guide_gene_map) == n_guides ||
-        throw(DimensionMismatch("guide_gene_map must have one row per guide"))
+    min_mean_count::Real=10.0,
+    dispersion_prior_weight::Real=10.0,
+    pseudocount::Real=0.5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
 
-    pc = Float64(pseudocount)
-    # Normalise each sample to total reads × 1e6 (RPM)
-    treat_rpm = (Float64.(counts_treatment) .+ pc) ./
-                max.(vec(sum(counts_treatment, dims=1))', 1) .* 1e6
-    ctrl_rpm  = (Float64.(counts_control)   .+ pc) ./
-                max.(vec(sum(counts_control,  dims=1))', 1) .* 1e6
+    size(counts_treatment, 1) == size(counts_control, 1) || throw(DimensionMismatch("treatment and control must have the same guide count"))
+    size(counts_treatment, 2) >= 2 || throw(ArgumentError("negative-binomial screen analysis requires at least two treatment replicates"))
+    size(counts_control, 2) >= 2 || throw(ArgumentError("negative-binomial screen analysis requires at least two control replicates"))
+    n_guides = size(counts_treatment, 1)
+    nrow(guide_gene_map) == n_guides || throw(DimensionMismatch("guide_gene_map must have one row per guide"))
+    :gene in propertynames(guide_gene_map) || throw(ArgumentError("guide_gene_map requires a :gene column"))
+    min_mean_count >= 0 || throw(ArgumentError("min_mean_count must be nonnegative"))
+    dispersion_prior_weight >= 0 || throw(ArgumentError("dispersion_prior_weight must be nonnegative"))
+    pseudocount > 0 || throw(ArgumentError("pseudocount must be positive"))
 
-    # Log2 fold change per guide (mean across replicates)
-    lfc = vec(mean(log2.(treat_rpm ./ ctrl_rpm), dims=2))
+    combined = hcat(Float64.(counts_control), Float64.(counts_treatment))
+    size_factors = _median_ratio_size_factors(combined)
+    normalised = combined ./ permutedims(size_factors)
+    n_control = size(counts_control, 2)
+    control_columns = 1:n_control
+    treatment_columns = n_control + 1:size(combined, 2)
+    inverse_factor_mean = mean(1.0 ./ size_factors)
 
-    # Per-guide p-value: simple t-test across replicates
-    guide_pvals = zeros(Float64, n_guides)
-    for i in 1:n_guides
-        t = Float64.(counts_treatment[i,:]) .+ pc
-        c = Float64.(counts_control[i,:])   .+ pc
-        n_t, n_c = length(t), length(c)
-        if n_t >= 2 && n_c >= 2
-            d = log2.(t) .- log2.(c)
-            guide_pvals[i] = _one_sample_ttest_pvalue(d)
-        else
-            guide_pvals[i] = 1.0
-        end
+    guide_mean = vec(mean(normalised, dims=2))
+    guide_variance = [length(row) > 1 ? var(row; corrected=true) : 0.0 for row in eachrow(normalised)]
+    raw_dispersion = max.((guide_variance .- guide_mean .* inverse_factor_mean) ./ max.(guide_mean .^ 2, eps()), 0.0)
+    expressed = findall(guide_mean .>= Float64(min_mean_count))
+    global_dispersion = isempty(expressed) ? 1e-8 : max(median(raw_dispersion[expressed]), 1e-8)
+    total_replicates = size(combined, 2)
+    shrunk_dispersion = (raw_dispersion .* max(total_replicates - 1, 1) .+ global_dispersion * Float64(dispersion_prior_weight)) ./ (max(total_replicates - 1, 1) + Float64(dispersion_prior_weight))
+
+    guide_names = :guide in propertynames(guide_gene_map) ? String.(guide_gene_map.guide) : ["guide_$(index)" for index in 1:n_guides]
+    rows = NamedTuple[]
+    for guide_index in 1:n_guides
+        control_mean = mean(@view normalised[guide_index, control_columns])
+        treatment_mean = mean(@view normalised[guide_index, treatment_columns])
+        dispersion = shrunk_dispersion[guide_index]
+        control_variance = (control_mean * mean(1.0 ./ size_factors[control_columns]) + dispersion * control_mean^2) / length(control_columns)
+        treatment_variance = (treatment_mean * mean(1.0 ./ size_factors[treatment_columns]) + dispersion * treatment_mean^2) / length(treatment_columns)
+        log_fold = log2((treatment_mean + Float64(pseudocount)) / (control_mean + Float64(pseudocount)))
+        log_se = sqrt(control_variance / (control_mean + Float64(pseudocount))^2 + treatment_variance / (treatment_mean + Float64(pseudocount))^2)
+        z_score = log_se > 0 && isfinite(log_se) ? log_fold * log(2) / log_se : 0.0
+        pvalue = clamp(2.0 * ccdf(Normal(), abs(z_score)), 0.0, 1.0)
+        pass_filter = guide_mean[guide_index] >= Float64(min_mean_count)
+        push!(rows, (
+            guide=guide_names[guide_index],
+            gene=String(guide_gene_map.gene[guide_index]),
+            control_mean=control_mean,
+            treatment_mean=treatment_mean,
+            log2_fold_change=log_fold,
+            wald_se=log_se / log(2),
+            wald_z=z_score,
+            pvalue=pvalue,
+            dispersion=dispersion,
+            mean_normalized_count=guide_mean[guide_index],
+            passes_mean_filter=pass_filter))
     end
+    guide_results = DataFrame(rows)
+    guide_results[!, :padj] = _bh_adjust(guide_results.pvalue)
+    rra_gene_results = _rra_gene_results(guide_results)
+    rra = MageckRRAResult(rra_gene_results, :two_sided, provenance_record("MageckRRAResult", "CRISPR/crispr_screen_nb"; parameters=(gene_count=nrow(rra_gene_results), guide_count=n_guides, direction="two_sided")))
+    qc = DataFrame(
+        sample=vcat(["control_$(index)" for index in 1:length(control_columns)], ["treatment_$(index)" for index in 1:length(treatment_columns)]),
+        condition=vcat(fill("control", length(control_columns)), fill("treatment", length(treatment_columns))),
+        library_size=vec(sum(combined, dims=1)),
+        size_factor=size_factors)
+    provenance = provenance_record("CRISPRScreenResult", "CRISPR/crispr_screen_nb"; parameters=(guide_count=n_guides, control_replicates=length(control_columns), treatment_replicates=length(treatment_columns), global_dispersion=global_dispersion, min_mean_count=Float64(min_mean_count), dispersion_prior_weight=Float64(dispersion_prior_weight)))
+    result = CRISPRScreenResult(guide_results, rra_gene_results, qc, global_dispersion, rra, provenance)
+    return _register_crispr_result!(_ctx, result, "crispr_screen_nb"; parents=provenance_parent_ids(counts_treatment, counts_control, guide_gene_map), parameters=(guide_count=n_guides, gene_count=nrow(rra_gene_results), global_dispersion=global_dispersion, min_mean_count=Float64(min_mean_count)))
+end
 
-    # Gene-level aggregation (RRA-like: rank-based)
-    genes = unique(guide_gene_map.gene)
-    gene_results = NamedTuple[]
+"""
+    crispr_screen_analysis(counts_treatment, counts_control, guide_gene_map; kwargs...) → DataFrame
 
-    for gene in genes
-        idx = findall(g -> g == gene, guide_gene_map.gene)
-        g_lfc    = lfc[idx]
-        g_pvals  = guide_pvals[idx]
-        # Pool p-values: geometric mean (simpler than RRA; same direction)
-        pooled_p = prod(g_pvals) ^ (1 / max(length(g_pvals), 1))
-        push!(gene_results, (
-            gene         = gene,
-            n_guides     = length(idx),
-            mean_lfc     = mean(g_lfc),
-            median_lfc   = median(g_lfc),
-            gene_pvalue  = pooled_p,
-            direction    = mean(g_lfc) > 0 ? "enriched" : "depleted"))
-    end
-
-    sort!(gene_results, by = r -> r.gene_pvalue)
-
-    # BH FDR
-    n = length(gene_results)
-    padj = [min(gene_results[i].gene_pvalue * n / i, 1.0) for i in 1:n]
-    for i in (n-1):-1:1; padj[i] = min(padj[i], padj[i+1]); end
-
-    df = DataFrame(gene_results)
-    df[!, :padj] = padj
-    _ctx = active_provenance_context()
-
-
-    return _register_crispr_result!(_ctx, df, "crispr_screen_analysis"; parents=provenance_parent_ids(counts_treatment, counts_control, guide_gene_map), parameters=(method=String(method), min_reads=min_reads, pseudocount=Float64(pseudocount), row_count=nrow(df)))
+Compatibility wrapper returning the gene-level NB-Wald/RRA table from
+`crispr_screen_nb`. The former simplified t-test/geometric-mean implementation
+is retired; callers needing guide evidence should call `crispr_screen_nb`.
+"""
+function crispr_screen_analysis(counts_treatment, counts_control, guide_gene_map; method::Symbol=:rra, min_reads::Int=10, pseudocount::Real=0.5, kwargs...)
+    method == :rra || throw(ArgumentError("only method=:rra is supported by the NB-Wald/RRA implementation"))
+    return crispr_screen_nb(counts_treatment, counts_control, guide_gene_map; min_mean_count=min_reads, pseudocount=pseudocount, kwargs...).gene_results
 end
 
 """
     mageck_like_test(treatment_counts, control_counts, guide_df) → DataFrame
 
-Convenience alias for `crispr_screen_analysis` with MAGeCK-style column names.
+Compatibility wrapper for the explicit NB-Wald/RRA screen model.
 """
 mageck_like_test(t, c, g; kwargs...) = crispr_screen_analysis(t, c, g; kwargs...)
 

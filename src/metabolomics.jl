@@ -66,7 +66,16 @@ MetabolomicsSourceTrackingResult(chain, mean_proportions::Vector{Float64}, media
     MetabolomicsSourceTrackingResult(chain, mean_proportions, median_proportions, lower_bounds, upper_bounds, provenance_record("MetabolomicsSourceTrackingResult", "Metabolomics/metabolomics_source_tracking"))
 
 function metabolomics_source_tracking_posterior_summary(chain)
-    samples = Matrix{Float64}(Array(chain))
+    arr = Array(chain)
+    samples = if ndims(arr) == 3
+        if occursin("VNChain", string(typeof(chain)))
+            Matrix{Float64}(reshape(arr, size(arr, 1) * size(arr, 2), size(arr, 3)))
+        else
+            Matrix{Float64}(reshape(permutedims(arr, (1, 3, 2)), size(arr, 1) * size(arr, 3), size(arr, 2)))
+        end
+    else
+        Matrix{Float64}(arr)
+    end
     mean_proportions   = vec(mean(samples, dims=1))
     median_proportions = vec(median(samples, dims=1))
     lower_bounds = [quantile(view(samples, :, column), 0.025) for column in axes(samples, 2)]

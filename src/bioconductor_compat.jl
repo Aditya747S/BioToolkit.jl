@@ -32,6 +32,11 @@ using Statistics
 using ..BioPlotting: clustered_heatmap
 using ..BioToolkit: annotate_variants
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!, with_provenance
+using ..TxImport: tximport
+import ..GeneAnnotation
+import ..DifferentialExpression
+import ..SpatialDeconvolution
+import ..FlowCytometry
 
 @inline function _register_bioc_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -51,6 +56,11 @@ export xcms_peak_workflow, lipidr_differential_abundance
 export mixomics_factor_analysis, mofa2_factor_analysis
 export variantannotation_annotate, varianttools_filter_variants, gwascat_lookup
 export complexheatmap_payload, gviz_track_table
+export tximport_counts
+export download_annotation_db, convert_ids, build_enrichment_database
+export mast_hurdle_test, pseudobulk_by_donor_celltype, pseudobulk_de
+export variogram_svg, spatial_lda_deconvolution, fgw_integrate_spatial, map_cells_to_spots
+export read_fcs
 
 @inline function _bh(p::Vector{Float64})
     p = clamp.(p, 0.0, 1.0)
@@ -304,12 +314,14 @@ end
 
 DiffBind-style differential peak binding wrapper.
 """
-function diffbind_differential_binding(fragments_by_sample::AbstractDict, peaks::PeakSet, design::AbstractVector, kwargs...)
-    de = differential_binding(fragments_by_sample, peaks, Symbol.(design); kwargs...)
+function diffbind_differential_binding(fragments_by_sample::AbstractDict, peaks::PeakSet, design::AbstractVector; kwargs...)
+    samples = collect(keys(fragments_by_sample))
+    de = diffbind_like_workflow(fragments_by_sample, samples, Symbol.(design); consensus_peaks=peaks, kwargs...)
     result = DataFrame(de)
     _ctx = active_provenance_context()
     return _register_bioc_result!(_ctx, result, "diffbind_differential_binding"; parents=String[], parameters=(n_samples=length(fragments_by_sample)))
 end
+
 
 @inline function _frag_prop(fragment, name::Symbol)
     hasproperty(fragment, name) || throw(ArgumentError("fragment record must provide property :$(name)"))
@@ -654,6 +666,60 @@ ComplexHeatmap-style clustered heatmap payload wrapper.
 """
 function complexheatmap_payload(matrix::AbstractMatrix{<:Real}; row_labels=nothing, column_labels=nothing, kwargs...)
     return clustered_heatmap(matrix; row_labels=row_labels, column_labels=column_labels, kwargs...)
+end
+
+"""
+    tximport_counts(files, tx2gene; kwargs...)
+
+Compatibility wrapper that returns the gene-count matrix from `tximport`.
+"""
+function tximport_counts(files::Vector{String}, tx2gene; kwargs...)
+    result = tximport(files, :salmon, tx2gene; kwargs...)
+    return result.gene_counts
+end
+
+function download_annotation_db(organism::Symbol; kwargs...)
+    return GeneAnnotation.download_annotation_db(organism; kwargs...)
+end
+
+function convert_ids(db, ids, from, to; kwargs...)
+    return GeneAnnotation.convert_ids(db, ids, from, to; kwargs...)
+end
+
+function build_enrichment_database(db; kwargs...)
+    return GeneAnnotation.build_enrichment_database(db; kwargs...)
+end
+
+function mast_hurdle_test(counts, design; kwargs...)
+    return DifferentialExpression.mast_hurdle_test(counts, design; kwargs...)
+end
+
+function pseudobulk_by_donor_celltype(sce; kwargs...)
+    return DifferentialExpression.pseudobulk_by_donor_celltype(sce; kwargs...)
+end
+
+function pseudobulk_de(sce; kwargs...)
+    return DifferentialExpression.pseudobulk_de(sce; kwargs...)
+end
+
+function variogram_svg(spatial, gene_id::AbstractString; kwargs...)
+    return SpatialDeconvolution.variogram_svg(spatial, String(gene_id); kwargs...)
+end
+
+function spatial_lda_deconvolution(spatial, reference; kwargs...)
+    return SpatialDeconvolution.spatial_lda_deconvolution(spatial, reference; kwargs...)
+end
+
+function fgw_integrate_spatial(samples; kwargs...)
+    return SpatialDeconvolution.fgw_integrate_spatial(samples; kwargs...)
+end
+
+function map_cells_to_spots(sc_ref, spatial; kwargs...)
+    return SpatialDeconvolution.map_cells_to_spots(sc_ref, spatial; kwargs...)
+end
+
+function read_fcs(path::AbstractString)
+    return FlowCytometry.read_fcs(String(path))
 end
 
 """

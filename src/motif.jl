@@ -12,7 +12,11 @@
 
 using DataFrames
 using SHA
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, register_provenance!
+using Distributions
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, register_provenance!, read_fasta, SeqRecord, BioSequence
+
+
+
 
 """
     MotifCounts{A <: BioAlphabet}
@@ -1113,3 +1117,73 @@ end
 # ---- Typed BioSequence{DNAAlphabet} dispatch ---------------------------------
 # These overloads ensure that typed DNA sequences can be used directly with
 # motif scanning functions without explicit String conversion.
+
+struct MotifEnrichmentResult <: AbstractAnalysisResult
+    motif_name::String
+    pvalue::Float64
+    fold_enrichment::Float64
+    peak_hits::Int
+    peak_total::Int
+    bg_hits::Int
+    bg_total::Int
+    provenance::ResultProvenance
+end
+
+function motif_enrichment_peaks(peak_sequences::AbstractVector{<:BioSequence}, background_sequences::AbstractVector{<:BioSequence}, pwm::MotifPWM; threshold::Real=5.0)
+    _ctx = active_provenance_context()
+    
+    peak_hits = count(seq -> !isempty(motif_scan_both_strands(seq, pwm; threshold=threshold)), peak_sequences)
+    bg_hits = count(seq -> !isempty(motif_scan_both_strands(seq, pwm; threshold=threshold)), background_sequences)
+    
+    n_peaks = length(peak_sequences)
+    n_bg = length(background_sequences)
+    
+    N = n_peaks + n_bg
+    K = peak_hits + bg_hits
+    n = n_peaks
+    k = peak_hits
+    
+    if K > 0 && N > 0 && n > 0
+        d = Distributions.Hypergeometric(K, N - K, n)
+        pvalue = Distributions.ccdf(d, k - 1)
+    else
+        pvalue = 1.0
+    end
+    
+    fold_enrichment = (peak_hits / max(1, n_peaks)) / (max(1, bg_hits) / max(1, n_bg))
+    
+    result = MotifEnrichmentResult("motif", pvalue, fold_enrichment, peak_hits, n_peaks, bg_hits, n_bg, provenance_record("MotifEnrichmentResult", "motif"))
+    return provenance_result!(_ctx, result, "motif_enrichment_peaks"; parents=String[])
+end
+
+function scan_peaks_for_motifs(peaks, genome_fasta::AbstractString, profile::MotifProfile; threshold::Real=0.0)
+    _ctx = active_provenance_context()
+    records = read_fasta(genome_fasta)
+    genome = Dict(r.identifier => r.sequence for r in records)
+    
+    rows = NamedTuple[]
+    for peak in peaks.peaks
+        if haskey(genome, peak.chrom)
+            chrom_seq = genome[peak.chrom]
+            left = max(1, peak.left)
+            right = min(length(chrom_seq), peak.right)
+            if left < right
+                peak_seq = chrom_seq[left:right]
+                hits = motif_scan_both_strands(peak_seq, profile.pwm; threshold=threshold)
+                for h in hits
+                    genomic_start = left + h.start - 1
+                    push!(rows, (
+                        peak_id = peak.id,
+                        chrom = peak.chrom,
+                        start = genomic_start,
+                        strand = h.strand == 1 ? '+' : '-',
+                        score = h.score
+                    ))
+                end
+            end
+        end
+    end
+    
+    df = isempty(rows) ? DataFrame(peak_id=String[], chrom=String[], start=Int[], strand=Char[], score=Float64[]) : DataFrame(rows)
+    return provenance_result!(_ctx, df, "scan_peaks_for_motifs"; parents=String[])
+end

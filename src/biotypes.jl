@@ -372,33 +372,39 @@ Ensures that subsetting samples or features automatically maintains metadata ali
 - `colData::Dict{Symbol, Vector}`: Metadata for each column (sample).
 - `metadata::Dict{Symbol, Any}`: General experiment-level metadata.
 """
-struct SummarizedExperiment
-    assays::Dict{String,Matrix{Float64}}
+struct SummarizedExperiment{T<:Real}
+    assays::Dict{String,Matrix{T}}
     rowData::Dict{Symbol,Vector}
     colData::Dict{Symbol,Vector}
     metadata::Dict{Symbol,Any}
 
     function SummarizedExperiment(
-        assays::Dict{String,Matrix{Float64}},
-        rowData::Dict{Symbol,Vector},
-        colData::Dict{Symbol,Vector},
-        metadata::Dict{Symbol,Any}=Dict{Symbol,Any}()
-    )
-        isempty(assays) && throw(ArgumentError("at least one assay must be provided"))
+        assays::AbstractDict{String, <:AbstractMatrix{T}},
+        rowData::AbstractDict{Symbol, <:AbstractVector},
+        colData::AbstractDict{Symbol, <:AbstractVector},
+        metadata::AbstractDict=Dict{Symbol,Any}()
+    ) where {T<:Real}
+        assays_conv = Dict{String, Matrix{T}}(k => Matrix{T}(v) for (k, v) in assays)
+        rowData_conv = Dict{Symbol, Vector}(k => Vector(v) for (k, v) in rowData)
+        colData_conv = Dict{Symbol, Vector}(k => Vector(v) for (k, v) in colData)
+        metadata_conv = Dict{Symbol, Any}(Symbol(k) => v for (k, v) in metadata)
+
+        isempty(assays_conv) && throw(ArgumentError("at least one assay must be provided"))
         # Validate dimensions
-        n_features, n_samples = size(first(values(assays)))
-        for (name, matrix) in assays
+        n_features, n_samples = size(first(values(assays_conv)))
+        for (name, matrix) in assays_conv
             size(matrix) == (n_features, n_samples) || throw(DimensionMismatch("assay '$name' has dimensions $(size(matrix)), expected ($n_features, $n_samples)"))
         end
-        for (key, vec) in rowData
+        for (key, vec) in rowData_conv
             length(vec) == n_features || throw(DimensionMismatch("rowData column '$key' has length $(length(vec)), expected $n_features"))
         end
-        for (key, vec) in colData
+        for (key, vec) in colData_conv
             length(vec) == n_samples || throw(DimensionMismatch("colData column '$key' has length $(length(vec)), expected $n_samples"))
         end
-        return new(assays, rowData, colData, metadata)
+        return new{T}(assays_conv, rowData_conv, colData_conv, metadata_conv)
     end
 end
+
 
 """
     SummarizedExperiment(counts::Matrix; rowData=..., colData=..., metadata=...)
@@ -406,14 +412,14 @@ end
 Main constructor for `SummarizedExperiment`.
 """
 function SummarizedExperiment(
-    counts::Matrix{<:Real};
+    counts::Matrix{T};
     assay_name::String="counts",
     rowData::Dict{Symbol,Vector}=Dict{Symbol,Vector}(),
     colData::Dict{Symbol,Vector}=Dict{Symbol,Vector}(),
     metadata::Dict{Symbol,Any}=Dict{Symbol,Any}()
-)
+) where {T<:Real}
     return SummarizedExperiment(
-        Dict(assay_name => Matrix{Float64}(counts)),
+        Dict(assay_name => counts),
         rowData,
         colData,
         metadata
@@ -628,3 +634,83 @@ function _itn_count(node::IntervalTreeNode)
 end
 
 Base.isempty(tree::IntervalTree) = tree.root[] === nothing
+
+# ---- Bioconductor Parity Types ----------------------------------------------
+
+abstract type GeneIdType end
+struct EnsemblID <: GeneIdType end
+struct EntrezID <: GeneIdType end
+struct SymbolID <: GeneIdType end
+struct RefSeqID <: GeneIdType end
+struct UniProtID <: GeneIdType end
+
+const ensembl = EnsemblID()
+const entrez = EntrezID()
+const symbol = SymbolID()
+const refseq = RefSeqID()
+const uniprot = UniProtID()
+
+function GeneIdType(s::Symbol)
+    if s === :ensembl return EnsemblID()
+    elseif s === :entrez return EntrezID()
+    elseif s === :symbol return SymbolID()
+    elseif s === :refseq return RefSeqID()
+    elseif s === :uniprot return UniProtID()
+    else throw(ArgumentError("Unknown GeneIdType symbol: $s"))
+    end
+end
+
+Base.Symbol(::EnsemblID) = :ensembl
+Base.Symbol(::EntrezID) = :entrez
+Base.Symbol(::SymbolID) = :symbol
+Base.Symbol(::RefSeqID) = :refseq
+Base.Symbol(::UniProtID) = :uniprot
+
+struct OrganismDb{Organism}
+    metadata::Dict{Symbol,Any}
+    mapper::Any
+    term_indices::Dict{Symbol,Any}
+end
+
+function OrganismDb(organism::Symbol, metadata::Dict{Symbol,Any}=Dict{Symbol,Any}(), mapper=nothing, term_indices::Dict{Symbol,Any}=Dict{Symbol,Any}())
+    return OrganismDb{organism}(metadata, mapper, term_indices)
+end
+
+struct TxQuantRecord
+    tx_ids::Vector{String}
+    counts::Vector{Float64}
+    tpm::Vector{Float64}
+    efflength::Vector{Float64}
+    tool::String
+    sample_id::String
+end
+
+struct Tx2GeneMap <: AbstractAnalysisResult
+    map::Dict{String,String}
+    gene_id_type::GeneIdType
+    bias_flags::Dict{Symbol,Any}
+    provenance::ResultProvenance
+end
+
+Tx2GeneMap(map, gene_id_type, bias_flags) = Tx2GeneMap(map, gene_id_type, bias_flags, provenance_record("Tx2GeneMap", "biotypes/Tx2GeneMap"))
+
+struct AnnotatedHeatmapSpec
+    row_annotations::Dict{Symbol,Vector}
+    col_annotations::Dict{Symbol,Vector}
+    row_splits::Vector
+    col_splits::Vector
+end
+
+# Accept DataFrame by converting each column to a Dict entry
+_df_to_dict(d::Dict) = d
+function _df_to_dict(df)
+    out = Dict{Symbol,Vector}()
+    for n in propertynames(df)
+        out[n] = Vector(df[!, n])
+    end
+    out
+end
+
+function AnnotatedHeatmapSpec(; row_annotations=Dict{Symbol,Vector}(), col_annotations=Dict{Symbol,Vector}(), row_splits=String[], col_splits=String[])
+    return AnnotatedHeatmapSpec(_df_to_dict(row_annotations), _df_to_dict(col_annotations), row_splits, col_splits)
+end

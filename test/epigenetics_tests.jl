@@ -109,4 +109,85 @@ using DataFrames
     tads = BioToolkit.detect_tads(contact; window=1, threshold=0.1)
     @test all(tad -> tad isa BioToolkit.TadResult, tads)
     @test !isempty(tads)
+
+    @testset "ATAC-seq" begin
+        atac_fragments = [
+            BioToolkit.GenomicInterval("chr1", 1, 100),
+            BioToolkit.GenomicInterval("chr1", 150, 250),
+            BioToolkit.GenomicInterval("chr1", 300, 400),
+            BioToolkit.GenomicInterval("chr1", 450, 550),
+            BioToolkit.GenomicInterval("chr1", 10000, 10100),
+            BioToolkit.GenomicInterval("chr1", 10050, 10150),
+            BioToolkit.GenomicInterval("chr1", 200, 300),
+            BioToolkit.GenomicInterval("chr1", 350, 450),
+        ]
+        barcodes = ["cell1", "cell2", "cell1", "cell3", "cell4", "cell4", "cell1", "cell2"]
+        sample_ids = ["sample1", "sample1", "sample1", "sample1", "sample1", "sample1", "sample1", "sample1"]
+
+        exp = BioToolkit.atac_experiment(atac_fragments; barcodes=barcodes, sample_ids=sample_ids)
+        @test length(exp) == 8
+        @test !isempty(exp)
+        @test exp.sample_ids == ["sample1"]
+
+        frags = BioToolkit.ATACFragment[]
+        for i in 1:20
+            push!(frags, BioToolkit.ATACFragment("chr1", i * 100, i * 100 + 100, 100, '+', "cell_$i", "sample1"))
+        end
+        for i in 1:10
+            push!(frags, BioToolkit.ATACFragment("chr1", 147 + i * 200, 147 + i * 200 + 147, 147, '+', "cell_nuc_$i", "sample1"))
+        end
+        atac_exp = BioToolkit.ATACExperiment(frags, Dict("chr1" => collect(1:length(frags))), ["sample1"], Dict{String,Any}())
+
+        frag_dist = BioToolkit.fragment_size_distribution(atac_exp)
+        @test frag_dist isa BioToolkit.FragmentSizeDistribution
+        @test frag_dist.nucleosome_free > 0.0
+        @test frag_dist.mono_nucleosome > 0.0
+        @test frag_dist.mean_size > 0.0
+        @test frag_dist.median_size > 0.0
+        @test sum(frag_dist.counts) == length(frags)
+
+        nuc_metrics = BioToolkit.nucleosome_metrics(atac_exp)
+        @test nuc_metrics isa BioToolkit.NucleosomeMetricsResult
+        @test nuc_metrics.nucleosome_signal >= 0.0
+        @test nuc_metrics.mononucleosome_fraction >= 0.0
+        @test nuc_metrics.fraction_small >= 0.0
+
+        tss_sites = [
+            BioToolkit.GenomicInterval("chr1", 1000, 1001, '+'),
+            BioToolkit.GenomicInterval("chr1", 5000, 5001, '+'),
+            BioToolkit.GenomicInterval("chr1", 10000, 10001, '+'),
+        ]
+
+        tss_result = BioToolkit.tss_enrichment(atac_exp, tss_sites; flank=500, bin_width=50)
+        @test haskey(tss_result, :positions)
+        @test haskey(tss_result, :profile)
+        @test haskey(tss_result, :enrichment)
+        @test length(tss_result.positions) == length(tss_result.profile)
+        @test tss_result.enrichment >= 0.0
+
+        peaks_for_frip = BioToolkit.PeakSet([
+            BioToolkit.Peak("peak1", "chr1", 100, 200, 150, 10.0, 0.01, 0.05),
+            BioToolkit.Peak("peak2", "chr1", 10000, 10100, 10050, 8.0, 0.02, 0.08),
+        ])
+
+        frip = BioToolkit.frip_score(atac_exp, peaks_for_frip)
+        @test frip >= 0.0
+        @test frip <= 1.0
+
+        bias_result = BioToolkit.insertion_bias_correction(atac_exp)
+        @test haskey(bias_result, :correction_factors)
+        @test bias_result.total_insertions > 0
+
+        atac_peaks = BioToolkit.atac_peak_calling(atac_exp; pvalue_threshold=1.0, min_depth=1)
+        @test atac_peaks isa BioToolkit.PeakSet
+
+        qc_result = BioToolkit.atac_qc_report(atac_exp, peaks_for_frip, tss_sites)
+        @test qc_result isa BioToolkit.ATACQCResult
+        @test qc_result.total_fragments > 0
+        @test qc_result.frip >= 0.0
+        @test qc_result.tss_enrichment >= 0.0
+        @test qc_result.nucleosome_signal >= 0.0
+        @test 0.0 <= qc_result.fraction_nucleosome_free <= 1.0
+        @test 0.0 <= qc_result.fraction_mono_nucleosome <= 1.0
+    end
 end

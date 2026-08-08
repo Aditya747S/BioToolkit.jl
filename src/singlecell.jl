@@ -1,5 +1,6 @@
 module SingleCell
 
+using DataFrames
 using CUDA
 using JSON
 using Mmap
@@ -11,14 +12,14 @@ using LinearAlgebra
 using Random
 using Graphs
 using SimpleWeightedGraphs: SimpleWeightedGraph, SimpleWeightedEdge
-using SpecialFunctions: erfc
+using SpecialFunctions: erfc, loggamma
 using Plots: plot, scatter, scatter!, plot!, heatmap, quiver!, bar
 
 using Serialization
 
-using ..DifferentialExpression: CountMatrix, DEResult, benjamini_hochberg, calc_norm_factors, differential_expression, estimate_dispersions, filter_low_counts, vst
+using ..DifferentialExpression: CountMatrix, DEResult, benjamini_hochberg, calc_norm_factors, differential_expression, estimate_dispersions, filter_low_counts, vst, _mast_markers
 using ..BioToolkit: threaded_foreach, threaded_map_collect
-using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, provenance_summary, provenance_result!, register_provenance!, stamp_provenance!, update_provenance!, with_provenance
+using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, provenance_summary, provenance_result!, register_provenance!, stamp_provenance!, update_provenance!, with_provenance, BackendConfig, ConvergenceReport, ModelFitDiagnostics
 
 # ---------------------------------------------------------------------------
 # Provenance helper
@@ -45,7 +46,7 @@ export RNAVelocityResult, DynamicalRNAVelocityResult, attach_velocity_layers!, c
 export LigandReceptorPair, CellCommunicationResult, CellCommunicationNetwork, CommunicationPathwaySummary, LigandReceptorReport, SpatialMoranResult, default_ligand_receptor_pairs, find_cell_communication, communication_network, communication_pathway_summary, rank_ligand_receptor_report, attach_spatial_coords!, moran_i_test, find_spatially_variable_genes
 export WNNResult, weighted_nearest_neighbors, PerturbationPredictionResult, predict_perturbation
 export read_h5ad, write_h5ad, CellTypeAnnotationResult, annotate_cell_types, AmbientRNARemovalResult, remove_ambient_rna, SingleCellViewer, interactive_singlecell_viewer, lasso_select_cells, recluster_singlecell_viewer!, cell_hover_text, top_expressed_genes
-export bayesspace_like_domains, spagc_like_domains, sparkx_spatial_de, spatialde_gp_de, spatial_trajectory_graph, niche_weighted_communication, cell2location_like_segmentation, mixscape_like_contrast
+export bayesspace_like_domains, spagc_like_domains, sparkx_spatial_de, spatialde_gp_de, spatial_trajectory_graph, niche_weighted_communication, Cell2LocationNBResult, cell2location_nb_segmentation, cell2location_like_segmentation, mixscape_like_contrast
 export spatial_markov_refine_domains, spatial_lr_permutation_test
 export mixscape_multibatch_contrast, perturbseq_pseudobulk, milo_like_neighborhood_da, perturbation_synergy_scores
 
@@ -1173,7 +1174,11 @@ end
 
 function find_markers(experiment::SingleCellExperiment, labels::AbstractVector{<:Integer}; ident_1::Integer, ident_2::Union{Nothing,Integer}=nothing, test::Symbol=:wilcox, pseudobulk::Bool=false, sample_labels::Union{Nothing,AbstractVector{<:String}}=nothing, min_total::Integer=10, shrink::Bool=true, normalization_method::Symbol=:tmm, dispersion_workflow::Symbol=:prior, modelMatrixType::Symbol=:standard)
     length(labels) == length(experiment.cell_ids) || throw(ArgumentError("labels must match the number of cells"))
-    test in (:wilcox, :deseq2) || throw(ArgumentError("test must be :wilcox or :deseq2"))
+    test in (:wilcox, :deseq2, :mast) || throw(ArgumentError("test must be :wilcox, :deseq2, or :mast"))
+
+    if test == :mast
+        return _mast_markers(experiment, labels, ident_1, ident_2)
+    end
 
     if test == :wilcox && !pseudobulk
         return _wilcoxon_markers(experiment, labels, ident_1, ident_2; min_total=min_total)
@@ -1191,6 +1196,7 @@ function find_markers(experiment::SingleCellExperiment, labels::AbstractVector{<
         pseudobulk=pseudobulk || test == :deseq2,
         sample_labels=sample_labels)
 end
+
 
 function _cell_embedding(experiment::SingleCellExperiment; n_components::Int=20)
     embedding = haskey(experiment.reductions, "pca") ? experiment.reductions["pca"] : run_pca(experiment; n_components=n_components)
@@ -2759,38 +2765,117 @@ function niche_weighted_communication(experiment::SingleCellExperiment, labels::
     return table
 end
 
-"""
-    cell2location_like_segmentation(spot_expression, reference_signatures)
+struct Cell2LocationNBResult <: AbstractAnalysisResult
+    abundance::Matrix{Float64}
+    uncertainty::Matrix{Float64}
+    cell_type_names::Vector{String}
+    dominant_celltype::Vector{String}
+    loglikelihood::Float64
+    overdispersion::Float64
+    diagnostics::ModelFitDiagnostics
+    table::DataFrame
+    provenance::ResultProvenance
+end
 
-Cell2location-inspired nonnegative deconvolution of spot profiles.
+function _cell2location_nb_loglik(S::Matrix{Float64}, μ::Matrix{Float64}, θ::Float64)
+    total = 0.0
+    theta = max(θ, eps(Float64))
+    for i in eachindex(S)
+        y = max(S[i], 0.0)
+        m = max(μ[i], eps(Float64))
+        total += loggamma(y + theta) - loggamma(theta) - loggamma(y + 1.0) + theta * log(theta / (theta + m)) + y * log(m / (theta + m))
+    end
+    return total
+end
+
 """
-function cell2location_like_segmentation(spot_expression::AbstractMatrix{<:Real}, reference_signatures::AbstractMatrix{<:Real}; cell_type_names=nothing)
-    S = Matrix{Float64}(spot_expression)
-    R = Matrix{Float64}(reference_signatures)
+    cell2location_nb_segmentation(spot_expression, reference_signatures; ...)
+
+Estimate spot-level cell-type abundances with a negative-binomial count model.
+Rows of `spot_expression` are spots and columns are genes. Rows of
+`reference_signatures` are cell types and columns are the same genes. The
+returned `Cell2LocationNBResult` includes abundance fractions, approximate
+posterior uncertainty, NB overdispersion, convergence diagnostics, and a compact
+table for downstream compatibility.
+"""
+function cell2location_nb_segmentation(spot_expression::AbstractMatrix{<:Real}, reference_signatures::AbstractMatrix{<:Real}; cell_type_names=nothing, n_iter::Int=200, overdispersion::Real=20.0, l2::Real=1e-4, tol::Real=1e-6, seed::Int=1)
+    _ctx = active_provenance_context()
+    S = max.(Matrix{Float64}(spot_expression), 0.0)
+    R = max.(Matrix{Float64}(reference_signatures), 0.0)
     size(S, 2) == size(R, 2) || throw(DimensionMismatch("spot and reference matrices must share genes in columns"))
-
-    A = permutedims(R)
     n_spots = size(S, 1)
     n_types = size(R, 1)
-    abundance = zeros(Float64, n_spots, n_types)
-
-    for i in 1:n_spots
-        y = vec(@view S[i, :])
-        w = A \ y
-        w = max.(w, 0.0)
-        total = sum(w)
-        abundance[i, :] .= total > 0 ? w ./ total : fill(1 / n_types, n_types)
-    end
+    n_types > 0 || throw(ArgumentError("reference_signatures must contain at least one cell type"))
+    n_iter >= 1 || throw(ArgumentError("n_iter must be >= 1"))
 
     names_types = cell_type_names === nothing ? ["celltype_$(i)" for i in 1:n_types] : String.(cell_type_names)
     length(names_types) == n_types || throw(DimensionMismatch("cell_type_names length must match reference rows"))
 
+    rng = MersenneTwister(seed)
+    W = rand(rng, n_spots, n_types) .+ 0.1
+    Rn = copy(R)
+    for k in 1:n_types
+        scale = mean(@view Rn[k, :])
+        scale > 0 && (Rn[k, :] ./= scale)
+    end
+
+    theta = max(Float64(overdispersion), eps(Float64))
+    losses = Float64[]
+    previous = Inf
+    converged = false
+    for iter in 1:n_iter
+        μ = max.(W * Rn, eps(Float64))
+        nb_weight = (S .+ theta) ./ (μ .+ theta)
+        numerator = (S ./ μ .* nb_weight) * Rn'
+        denominator = nb_weight * Rn' .+ Float64(l2)
+        W .*= numerator ./ max.(denominator, eps(Float64))
+        W .= max.(W, eps(Float64))
+        ll = _cell2location_nb_loglik(S, W * Rn, theta) - Float64(l2) * sum(abs2, W)
+        loss = -ll
+        push!(losses, loss)
+        if isfinite(previous) && abs(previous - loss) / max(abs(previous), 1.0) < Float64(tol)
+            converged = true
+            break
+        end
+        previous = loss
+    end
+
+    μ_final = max.(W * Rn, eps(Float64))
+    ll_final = _cell2location_nb_loglik(S, μ_final, theta) - Float64(l2) * sum(abs2, W)
+    row_sums = vec(sum(W, dims=2))
+    abundance = similar(W)
+    for i in 1:n_spots
+        abundance[i, :] .= row_sums[i] > 0 ? W[i, :] ./ row_sums[i] : fill(1 / n_types, n_types)
+    end
+
+    information = max.(W, eps(Float64)) .* (theta ./ (theta .+ row_sums))
+    uncertainty = sqrt.(abundance .* (1 .- abundance) ./ max.(row_sums .+ 1.0, 1.0)) .+ 1.0 ./ sqrt.(information .+ 1.0)
+    dominant = [names_types[argmax(@view abundance[i, :])] for i in 1:n_spots]
+
     table = DataFrame(spot_id=["spot_$(i)" for i in 1:n_spots])
     for j in 1:n_types
         table[!, Symbol(names_types[j])] = abundance[:, j]
+        table[!, Symbol(names_types[j] * "_uncertainty")] = uncertainty[:, j]
     end
-    table[!, :dominant_celltype] = [names_types[argmax(@view abundance[i, :])] for i in 1:n_spots]
-    return table
+    table[!, :dominant_celltype] = dominant
+
+    backend = BackendConfig(:native; device=:cpu, deterministic=true, seed=seed, parameters=Dict{Symbol,Any}(:overdispersion => theta, :l2 => Float64(l2)))
+    conv = ConvergenceReport(converged, length(losses), isempty(losses) ? NaN : losses[end], length(losses) >= 2 ? losses[max(end-1, 1)] - losses[end] : 0.0, converged ? "relative objective tolerance reached" : "maximum iterations reached")
+    diag = ModelFitDiagnostics(:cell2location_nb_segmentation, backend, conv; hyperparameters=Dict{Symbol,Any}(:n_iter => n_iter, :overdispersion => theta, :l2 => Float64(l2), :tol => Float64(tol)), training_loss=losses)
+    result = Cell2LocationNBResult(abundance, uncertainty, names_types, dominant, ll_final, theta, diag, table, provenance_record("Cell2LocationNBResult", "SingleCell/cell2location_nb_segmentation"; parameters=(spot_count=n_spots, gene_count=size(S, 2), cell_type_count=n_types, n_iter=length(losses), converged=converged)))
+    return provenance_result!(_ctx, result, "cell2location_nb_segmentation"; parents=provenance_parent_ids(spot_expression, reference_signatures), parameters=(spot_count=n_spots, gene_count=size(S, 2), cell_type_count=n_types, n_iter=length(losses), converged=converged))
+end
+
+"""
+    cell2location_like_segmentation(spot_expression, reference_signatures)
+
+Compatibility wrapper returning the abundance table from
+`cell2location_nb_segmentation`. Use the primary API when diagnostics,
+uncertainty, and likelihood metadata are needed.
+"""
+function cell2location_like_segmentation(spot_expression::AbstractMatrix{<:Real}, reference_signatures::AbstractMatrix{<:Real}; cell_type_names=nothing)
+    result = cell2location_nb_segmentation(spot_expression, reference_signatures; cell_type_names=cell_type_names, n_iter=50)
+    return result.table
 end
 
 """

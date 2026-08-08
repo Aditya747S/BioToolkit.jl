@@ -20,6 +20,8 @@ The root test file is the file `Pkg.test()` uses from the repository root. Keepi
 
 The CI workflow resolves the package from `Project.toml` compat instead of a committed root `Manifest.toml`, which keeps the test job portable across Julia releases.
 
+The test harness also loads the Flux extension explicitly when Flux is available so the deep-learning utilities exercise the real extension path instead of depending on load-order side effects.
+
 ## Relationship to the nested test file
 
 The real assertions remain in the nested `BioToolkit.jl/test/runtests.jl` file. This root file just acts as the bridge so the repository-level package can run the same tests.
