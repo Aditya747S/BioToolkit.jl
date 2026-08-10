@@ -773,3 +773,90 @@ end
     @test length(rep.conservation_scores) == 12
     @test length(rep.entropy_per_column) == 12
 end
+
+@testset "Annotation — Interactive HTML Visualizations" begin
+    # 1. AnnotatedSeqRecord HTML
+    seq = BioSequence{DNAAlphabet}("ATGCGATCGATCGATCGATCGATCGATC")
+    features = [
+        SeqFeatureLite("gene", FeatureLocationLite(1, 20; strand=1); id="geneA"),
+        SeqFeatureLite("CDS", FeatureLocationLite(1, 18; strand=1); id="cdsA"),
+    ]
+    record = AnnotatedSeqRecord(seq; identifier="NC_000001", name="Gene A locus", description="Test locus", features=features)
+
+    html_map = to_html(record)
+    @test html_map isa String
+    @test occursin("NC_000001", html_map)
+    @test occursin("mapCanvas", html_map)
+    @test occursin("geneA", html_map)
+
+    tmp_path1 = tempname() * ".html"
+    export_html(record, tmp_path1)
+    @test isfile(tmp_path1)
+    @test filesize(tmp_path1) > 1000
+    rm(tmp_path1, force=true)
+
+    # 2. SangerTrace HTML
+    trace = SangerTrace(
+        BioSequence{DNAAlphabet}("ATGC"),
+        UInt8[30, 35, 40, 25],
+        UInt16[10, 100, 10, 10],
+        UInt16[100, 10, 10, 10],
+        UInt16[10, 10, 100, 10],
+        UInt16[10, 10, 10, 100],
+        Dict{String,Any}()
+    )
+    html_trace = to_html(trace)
+    @test html_trace isa String
+    @test occursin("traceCanvas", html_trace)
+    @test occursin("Q32.5", html_trace) || occursin("Base Calls", html_trace)
+
+    tmp_path2 = tempname() * ".html"
+    export_html(trace, tmp_path2)
+    @test isfile(tmp_path2)
+    @test filesize(tmp_path2) > 1000
+    rm(tmp_path2, force=true)
+
+    # 3. Variant Consequence HTML
+    variants = [
+        (chrom="chr1", pos=100, ref="A", alt="G", gene="BRCA1", feature_type="CDS", consequence="Missense", codon_ref="ATG", codon_alt="GTG"),
+        (chrom="chr1", pos=200, ref="C", alt="T", gene="BRCA1", feature_type="CDS", consequence="Synonymous", codon_ref="GAC", codon_alt="GAT"),
+    ]
+    html_vars = visualize_variant_consequences_html(variants)
+    @test html_vars isa String
+    @test occursin("BRCA1", html_vars)
+    @test occursin("Missense", html_vars)
+end
+
+@testset "Align — Interactive HTML Visualizations" begin
+    # 1. Pairwise Alignment HTML
+    s1 = DNASeq("ATGCGTACGTACG")
+    s2 = DNASeq("ATGCGAACGTACG")
+    aln = pairwise_align(s1, s2)
+
+    html_aln = to_html(aln)
+    @test html_aln isa String
+    @test occursin("alnCanvas", html_aln)
+    @test occursin("Alignment Score", html_aln)
+
+    html_vis = visualize_alignment_html(aln)
+    @test html_vis isa String
+    @test occursin("alnCanvas", html_vis)
+
+    tmp_path = tempname() * ".html"
+    export_html(aln, tmp_path)
+    @test isfile(tmp_path)
+    @test filesize(tmp_path) > 1000
+    rm(tmp_path, force=true)
+
+    # 2. Graph Alignment HTML
+    graph = SequenceGraph([DNASeq("ATGC"), DNASeq("CGTA")], [(1,2)])
+    g_aln = align_to_graph(DNASeq("ATGCCGTA"), graph)
+
+    html_g = to_html(g_aln)
+    @test html_g isa String
+    @test occursin("graphCanvas", html_g)
+
+    html_gr = to_html(graph)
+    @test html_gr isa String
+    @test occursin("Sequence Graph Structure", html_gr)
+end

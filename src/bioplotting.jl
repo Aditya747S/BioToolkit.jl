@@ -9,7 +9,7 @@ using DataFrames
 using ..GWAS: GWASResult, MetaAnalysisResult
 using ..Clinical: OncoprintResult
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, AnnotatedHeatmapSpec
-import ..BioToolkit: ProvenanceContext, analysis_result_fields, analysis_result_summary, container_provenance_summary, ensure_provenance_id!, provenance_result!, provenance_parent_ids, register_container_provenance!, register_provenance!
+import ..BioToolkit: ProvenanceContext, analysis_result_fields, analysis_result_summary, container_provenance_summary, ensure_provenance_id!, provenance_result!, provenance_parent_ids, register_container_provenance!, register_provenance!, to_html, export_html
 
 export VolcanoPoint, VolcanoPlotResult, MAPoint, MAPlotResult, ClusteredHeatmapResult
 export ManhattanPoint, ManhattanPlotResult, QQPoint, QQPlotResult, ForestPoint, ForestPlotResult
@@ -292,25 +292,6 @@ function _scale_matrix(matrix::AbstractMatrix{<:Real}; scale::Symbol=:row, threa
     return values
 end
 
-function _distance(a::AbstractVector{<:Real}, b::AbstractVector{<:Real}; metric::Symbol=:correlation)
-    metric == :euclidean && return norm(Float64.(a) .- Float64.(b))
-    metric == :correlation || throw(ArgumentError("metric must be :euclidean or :correlation"))
-    ax = Float64.(a)
-    bx = Float64.(b)
-    da = ax .- mean(ax)
-    db = bx .- mean(bx)
-    sa = norm(da)
-    sb = norm(db)
-    (sa == 0 || sb == 0) && return 1.0
-    return 1.0 - dot(da, db) / (sa * sb)
-end
-
-function _centroid_distance(matrix::AbstractMatrix{Float64}, left::Vector{Int}, right::Vector{Int}; metric::Symbol=:correlation)
-    left_centroid = vec(mean(matrix[left, :], dims=1))
-    right_centroid = vec(mean(matrix[right, :], dims=1))
-    return _distance(left_centroid, right_centroid; metric=metric)
-end
-
 struct _ClusterNode
     members::Vector{Int}
     left::Union{Nothing,_ClusterNode}
@@ -324,31 +305,87 @@ function _leaf_order(node::_ClusterNode)
     return vcat(left, right)
 end
 
+function _pairwise_distance_matrix(matrix::AbstractMatrix{Float64}; metric::Symbol=:correlation)
+    n, p = size(matrix)
+    D = zeros(Float64, n, n)
+    if metric == :correlation
+        norm_matrix = zeros(Float64, n, p)
+        for i in 1:n
+            row = matrix[i, :]
+            m = mean(row)
+            d = row .- m
+            s = norm(d)
+            norm_matrix[i, :] = s > 0 ? d ./ s : d
+        end
+        sim = norm_matrix * norm_matrix'
+        for i in 1:n
+            for j in 1:n
+                D[i, j] = i == j ? 0.0 : max(0.0, 1.0 - sim[i, j])
+            end
+        end
+    elseif metric == :euclidean
+        for i in 1:n-1
+            row_i = matrix[i, :]
+            for j in i+1:n
+                d = norm(row_i .- matrix[j, :])
+                D[i, j] = d
+                D[j, i] = d
+            end
+        end
+    else
+        throw(ArgumentError("metric must be :euclidean or :correlation"))
+    end
+    return D
+end
+
 function _hierarchical_order(matrix::AbstractMatrix{Float64}; metric::Symbol=:correlation)
     n = size(matrix, 1)
     n == 0 && return Int[]
     n == 1 && return [1]
-    clusters = [_ClusterNode([index], nothing, nothing) for index in 1:n]
-    while length(clusters) > 1
-        best_left = 1
-        best_right = 2
-        best_distance = Inf
-        for left in 1:length(clusters)-1
-            for right in left+1:length(clusters)
-                distance = _centroid_distance(matrix, clusters[left].members, clusters[right].members; metric=metric)
-                if distance < best_distance
-                    best_distance = distance
-                    best_left = left
-                    best_right = right
+
+    D = _pairwise_distance_matrix(matrix; metric=metric)
+    clusters = [_ClusterNode([i], nothing, nothing) for i in 1:n]
+    sizes = ones(Int, n)
+    active = fill(true, n)
+
+    for step in 1:n-1
+        best_i, best_j = 0, 0
+        min_dist = Inf
+        for i in 1:n-1
+            active[i] || continue
+            for j in i+1:n
+                active[j] || continue
+                if D[i, j] < min_dist
+                    min_dist = D[i, j]
+                    best_i, best_j = i, j
                 end
             end
         end
-        merged = _ClusterNode(vcat(clusters[best_left].members, clusters[best_right].members), clusters[best_left], clusters[best_right])
-        deleteat!(clusters, best_right)
-        deleteat!(clusters, best_left)
-        push!(clusters, merged)
+
+        (best_i == 0 || best_j == 0) && break
+
+        merged = _ClusterNode(vcat(clusters[best_i].members, clusters[best_j].members), clusters[best_i], clusters[best_j])
+        clusters[best_i] = merged
+
+        w_i = sizes[best_i]
+        w_j = sizes[best_j]
+        total_w = w_i + w_j
+
+        for m in 1:n
+            if active[m] && m != best_i && m != best_j
+                new_d = (w_i * D[best_i, m] + w_j * D[best_j, m]) / total_w
+                D[best_i, m] = new_d
+                D[m, best_i] = new_d
+            end
+        end
+
+        sizes[best_i] = total_w
+        active[best_j] = false
     end
-    return _leaf_order(first(clusters))
+
+    root_idx = findfirst(active)
+    root_idx === nothing && return collect(1:n)
+    return _leaf_order(clusters[root_idx])
 end
 
 function _reorder_labels(labels, order::Vector{Int})
@@ -435,11 +472,15 @@ function clustered_heatmap(matrix::AbstractMatrix{<:Real}; row_labels=nothing, c
     return _plot_result_finalize(result, _ctx, provenance_parent_ids(matrix), "clustered_heatmap", provenance_parameters)
 end
 
-function export_plot(result, save_path::String)
-    result isa VolcanoPlotResult && result.figure !== nothing && savefig(result.figure, save_path)
-    result isa MAPlotResult && result.figure !== nothing && savefig(result.figure, save_path)
-    result isa ClusteredHeatmapResult && result.figure !== nothing && savefig(result.figure, save_path)
-
+function export_plot(result::AbstractAnalysisResult, save_path::String)
+    if endswith(lowercase(save_path), ".html") || endswith(lowercase(save_path), ".htm")
+        return export_html(result, save_path)
+    end
+    if hasproperty(result, :figure) && getproperty(result, :figure) !== nothing
+        savefig(getproperty(result, :figure), save_path)
+    else
+        @warn "Cannot export plot: result does not contain a valid figure."
+    end
     return save_path
 end
 
@@ -452,13 +493,17 @@ end
 function _chromosome_offsets(result::GWASResult)
     order = unique(result.chromosomes)
     sort!(order; by = _chromosome_key)
+    max_pos = Dict{String,Float64}()
+    for (chrom, pos) in zip(result.chromosomes, result.positions)
+        p = Float64(pos)
+        max_pos[chrom] = max(get(max_pos, chrom, -Inf), p)
+    end
     offsets = Dict{String,Float64}()
     cumulative = 0.0
     for chromosome in order
-        positions = [Float64(position) for (chrom, position) in zip(result.chromosomes, result.positions) if chrom == chromosome]
-        max_position = isempty(positions) ? 0.0 : maximum(positions)
+        mx = get(max_pos, chromosome, 0.0)
         offsets[chromosome] = cumulative
-        cumulative += max(max_position, 1.0)
+        cumulative += max(mx, 1.0)
     end
     return offsets
 end
@@ -466,12 +511,21 @@ end
 function _chromosome_layout(result::GWASResult)
     order = unique(result.chromosomes)
     sort!(order; by = _chromosome_key)
+    min_pos = Dict{String,Float64}()
+    max_pos = Dict{String,Float64}()
+    for (chrom, pos) in zip(result.chromosomes, result.positions)
+        p = Float64(pos)
+        min_pos[chrom] = min(get(min_pos, chrom, Inf), p)
+        max_pos[chrom] = max(get(max_pos, chrom, -Inf), p)
+    end
+
     offsets = Dict{String,Float64}()
     centers = Dict{String,Float64}()
     cumulative = 0.0
     for chromosome in order
-        positions = [Float64(position) for (chrom, position) in zip(result.chromosomes, result.positions) if chrom == chromosome]
-        span = isempty(positions) ? 1.0 : max(maximum(positions) - minimum(positions), 1.0)
+        mn = get(min_pos, chromosome, 0.0)
+        mx = get(max_pos, chromosome, 1.0)
+        span = max(mx - mn, 1.0)
         offsets[chromosome] = cumulative
         centers[chromosome] = cumulative + span / 2
         cumulative += span
@@ -567,9 +621,11 @@ function qq_plot(result::GWASResult)
     ys = [point.observed for point in points]
     if !isempty(points)
         n = length(points)
-        confidence_x = copy(xs)
-        confidence_low = [max(-log10(quantile(Beta(index, n - index + 1), 0.025)), 0.0) for index in 1:n]
-        confidence_high = [max(-log10(quantile(Beta(index, n - index + 1), 0.975)), 0.0) for index in 1:n]
+        step_sz = max(1, n ÷ 500)
+        grid_indices = unique(vcat(1:step_sz:n, n))
+        confidence_x = xs[grid_indices]
+        confidence_low = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.025)), 0.0) for idx in grid_indices]
+        confidence_high = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.975)), 0.0) for idx in grid_indices]
         plot!(figure, confidence_x, confidence_high; fillrange=confidence_low, fillalpha=0.18, linecolor=:transparent, fillcolor="#9db4c0")
     end
     scatter!(figure, xs, ys; color="#173f5f", markersize=4.2, markerstrokewidth=0, xlabel="expected -log10(p)", ylabel="observed -log10(p)", title="QQ plot")
@@ -799,6 +855,105 @@ function circos_plot(matrix::AbstractMatrix{<:Real})
     n = min(size(matrix, 1), size(matrix, 2))
     chroms = ["chr$i" for i in 1:n]
     return circos_plot(chroms, Tuple{String,Int,String,Int}[])
+end
+
+"""
+    to_html(result) -> String
+
+Generate an interactive HTML/JS report for BioPlotting analysis results (Volcano, MA, Manhattan, Heatmap, OncoPrint, etc.).
+"""
+function to_html(result::AbstractAnalysisResult)
+    title = string(typeof(result))
+    data_json = "{}"
+    if result isa VolcanoPlotResult
+        pts = ["{\"gene\":\"$(_json_escape(p.gene_id))\",\"x\":$(p.log2_fold_change),\"y\":$(p.negative_log10_pvalue),\"cat\":\"$(_json_escape(string(p.category)))\"}" for p in result.points]
+        data_json = "{\"type\":\"volcano\",\"points\":[$(join(pts, ","))]}"
+    elseif result isa MAPlotResult
+        pts = ["{\"gene\":\"$(_json_escape(p.gene_id))\",\"x\":$(p.abundance),\"y\":$(p.log2_fold_change),\"cat\":\"$(_json_escape(string(p.category)))\"}" for p in result.points]
+        data_json = "{\"type\":\"ma\",\"points\":[$(join(pts, ","))]}"
+    elseif result isa ManhattanPlotResult
+        pts = ["{\"snp\":\"$(_json_escape(p.snp_id))\",\"chr\":\"$(_json_escape(p.chromosome))\",\"x\":$(p.cumulative_position),\"y\":$(p.negative_log10_pvalue),\"cat\":\"$(_json_escape(string(p.category)))\"}" for p in result.points]
+        data_json = "{\"type\":\"manhattan\",\"points\":[$(join(pts, ","))]}"
+    elseif result isa QQPlotResult
+        pts = ["{\"x\":$(p.expected),\"y\":$(p.observed)}" for p in result.points]
+        data_json = "{\"type\":\"qq\",\"points\":[$(join(pts, ","))]}"
+    elseif result isa ClusteredHeatmapResult
+        data_json = "{\"type\":\"heatmap\",\"rows\":$(JSON.json(result.row_labels)),\"cols\":$(JSON.json(result.column_labels))}"
+    else
+        data_json = "{\"type\":\"generic\"}"
+    end
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title)) - BioToolkit Report</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #38bdf8; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+        .card { background: var(--panel); border: 1px solid #334155; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+        h1 { color: var(--accent); font-size: 1.5rem; margin-top: 0; }
+        canvas { width: 100%; height: 500px; display: block; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>📊 $(_escape_html(title))</h1>
+        <canvas id="plotCanvas"></canvas>
+    </div>
+    <script>
+        const plotData = $(data_json);
+        const canvas = document.getElementById('plotCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function resize() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 500 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            draw();
+        }
+        window.addEventListener('resize', resize);
+
+        function draw() {
+            const w = canvas.parentElement.clientWidth;
+            const h = 500;
+            ctx.clearRect(0, 0, w, h);
+            ctx.fillStyle = '#38bdf8';
+            ctx.font = '14px system-ui';
+            ctx.fillText('BioToolkit Interactive Report: ' + plotData.type, 20, 30);
+            if (plotData.points) {
+                const xs = plotData.points.map(p => p.x);
+                const ys = plotData.points.map(p => p.y);
+                const minX = Math.min(...xs), maxX = Math.max(...xs);
+                const minY = Math.min(...ys), maxY = Math.max(...ys);
+                plotData.points.forEach(p => {
+                    const px = 50 + ((p.x - minX) / (maxX - minX || 1)) * (w - 100);
+                    const py = h - 50 - ((p.y - minY) / (maxY - minY || 1)) * (h - 100);
+                    ctx.fillStyle = p.cat === 'up' || p.cat === 'significant' ? '#ef4444' : p.cat === 'down' ? '#3b82f6' : '#64748b';
+                    ctx.beginPath();
+                    ctx.arc(px, py, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+            }
+        }
+        setTimeout(resize, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+"""
+    export_html(result, path)
+
+Export interactive HTML report for any BioPlotting result.
+"""
+function export_html(result::AbstractAnalysisResult, path::String)
+    html_str = to_html(result)
+    write(path, html_str)
+    return path
 end
 
 end

@@ -34,8 +34,9 @@ export build_collection, read_intervals
 export overlap, find_overlaps, nearest, find_nearest, follow, precede
 export shift, flank, resize, promoters, narrow
 export trim, gaps, complement, disjoin, pintersect, punion, psetdiff
-export coverage
+export coverage, count_overlaps
 export OverlapProfileResult, profile_interval_overlaps
+export width, mid
 
 struct GenomicInterval
     chrom::String
@@ -150,9 +151,10 @@ function Base.hash(interval::GenomicInterval, state::UInt)
     state = hash(interval.left, state)
     state = hash(interval.right, state)
     state = hash(interval.strand, state)
-    for (key, value) in sort(collect(pairs(_comparable_interval_metadata(interval.metadata))); by=first)
+    cm = _comparable_interval_metadata(interval.metadata)
+    for key in sort!(collect(keys(cm)))
         state = hash(key, state)
-        state = hash(value, state)
+        state = hash(cm[key], state)
     end
     return state
 end
@@ -177,6 +179,18 @@ Base.length(collection::IntervalCollection) = length(collection.intervals)
 Base.isempty(collection::IntervalCollection) = isempty(collection.intervals)
 Base.iterate(collection::IntervalCollection, state...) = iterate(collection.intervals, state...)
 Base.getindex(collection::IntervalCollection, index::Integer) = collection.intervals[index]
+
+"""
+    width(interval) / mid(interval)
+
+Return the width or midpoint of a genomic interval. Bioconductor parity.
+"""
+width(interval::GenomicInterval) = interval.right - interval.left + 1
+mid(interval::GenomicInterval) = (interval.left + interval.right) ÷ 2
+width(intervals::AbstractVector{<:GenomicInterval}) = [width(i) for i in intervals]
+mid(intervals::AbstractVector{<:GenomicInterval}) = [mid(i) for i in intervals]
+width(collection::IntervalCollection) = width(collection.intervals)
+mid(collection::IntervalCollection) = mid(collection.intervals)
 
 function _copy_metadata(interval::GenomicInterval)
     return Dict{String,Any}(interval.metadata)
@@ -399,13 +413,32 @@ function _find_last_end_lt(ends::Vector{Int}, ordered_indices::Vector{Int}, boun
     return answer
 end
 
-function find_overlaps(query::GenomicInterval, subject::IntervalCollection)
+function find_overlaps(query::GenomicInterval, subject::IntervalCollection; ignore_strand::Bool=true)
     tree = get(subject.trees, query.chrom, nothing)
     tree === nothing && return GenomicInterval[]
 
     indices = query_overlaps(tree, query.left, query.right)
+    if !ignore_strand && query.strand != '.'
+        filter!(i -> subject.intervals[i].strand == query.strand || subject.intervals[i].strand == '.', indices)
+    end
 
     return with_provenance(subject.intervals[indices], "GenomicInterval", "GenomicRanges/find_overlaps"; notes=["overlap query against interval collection"], parameters=(chrom=query.chrom, left=query.left, right=query.right, hit_count=length(indices)))
+end
+
+"""
+    count_overlaps(query, subject; ignore_strand=true)
+
+Return the number of overlapping intervals without allocating the full result.
+Equivalent to Bioconductor's `countOverlaps`.
+"""
+function count_overlaps(query::GenomicInterval, subject::IntervalCollection; ignore_strand::Bool=true)
+    tree = get(subject.trees, query.chrom, nothing)
+    tree === nothing && return 0
+    indices = query_overlaps(tree, query.left, query.right)
+    if !ignore_strand && query.strand != '.'
+        return count(i -> subject.intervals[i].strand == query.strand || subject.intervals[i].strand == '.', indices)
+    end
+    return length(indices)
 end
 
 @inline function _naive_overlap_count(query::GenomicInterval, subject::IntervalCollection)
@@ -512,26 +545,52 @@ function nearest(query::GenomicInterval, subject::IntervalCollection; select::Sy
     range = get(subject.chrom_indices, query.chrom, nothing)
     range === nothing && return nothing
 
-    best_interval = nothing
-    best_key = nothing
-
-    for interval in subject.intervals[range]
-        key = if interval.left <= query.right && interval.right >= query.left
-            (0, interval.left, interval.right, Int(interval.strand))
-        elseif interval.right < query.left
-            (1, _distance(query, interval), -interval.right, interval.left, interval.right)
-        else
-            (2, _distance(query, interval), interval.left, interval.right)
-        end
-
-        if best_key === nothing || key < best_key
-            best_interval = interval
-            best_key = key
+    # Fast path: check for overlapping intervals via interval tree (distance=0)
+    tree = get(subject.trees, query.chrom, nothing)
+    if tree !== nothing
+        containing = query_overlaps(tree, query.left, query.right)
+        if !isempty(containing)
+            best = subject.intervals[containing[1]]
+            return with_provenance(best, "GenomicInterval", "GenomicRanges/nearest"; parameters=(chrom=query.chrom, left=query.left, right=query.right, select=select))
         end
     end
 
-    best_interval === nothing && return nothing
+    # Binary search on sorted starts for right-side nearest
+    right_idx = searchsortedfirst(subject.starts, query.right + 1, first(range), last(range), Base.Order.Forward)
+    # Binary search on sorted starts for left-side candidates
+    left_idx = right_idx - 1
 
+    best_interval = nothing
+    best_dist = typemax(Int)
+
+    # Check candidate to the right (start > query.right)
+    if right_idx <= last(range)
+        d = subject.starts[right_idx] - query.right - 1
+        if d < best_dist
+            best_dist = d
+            best_interval = subject.intervals[right_idx]
+        end
+    end
+
+    # Check candidates to the left (need to find the one with largest end)
+    # Scan a small window leftward from the insertion point
+    scan_left = left_idx
+    while scan_left >= first(range)
+        interval = subject.intervals[scan_left]
+        d = _distance(query, interval)
+        d < 0 && (scan_left -= 1; continue)
+        if d < best_dist
+            best_dist = d
+            best_interval = interval
+        end
+        # If the start is far enough left that no remaining interval can be closer
+        if query.left - interval.left > best_dist
+            break
+        end
+        scan_left -= 1
+    end
+
+    best_interval === nothing && return nothing
     return with_provenance(best_interval, "GenomicInterval", "GenomicRanges/nearest"; parameters=(chrom=query.chrom, left=query.left, right=query.right, select=select))
 end
 
@@ -549,56 +608,60 @@ function precede(query::GenomicInterval, subject::IntervalCollection)
     range = get(subject.chrom_indices, query.chrom, nothing)
     range === nothing && return nothing
 
-    candidates = GenomicInterval[]
-    for interval in subject.intervals[range]
-        interval.right < query.left && push!(candidates, interval)
+    # Strand-aware: for '-' strand, "preceded by" means y is to the LEFT (ending before query.left)
+    if query.strand == '-'
+        end_indices = get(subject.chrom_end_indices, query.chrom, nothing)
+        end_indices === nothing && return nothing
+        idx = _find_last_end_lt(subject.ends, end_indices, query.left)
+        return idx === nothing ? nothing : subject.intervals[idx]
     end
 
-    isempty(candidates) && return nothing
-
-    best = candidates[1]
-    best_key = (best.right, best.left, Int(best.strand))
-    for interval in candidates[2:end]
-        key = (interval.right, interval.left, Int(interval.strand))
-        if key > best_key
-            best = interval
-            best_key = key
-        end
-    end
-
-    return best
+    # For '+' or '.': find the nearest interval starting after query.right
+    idx = searchsortedfirst(subject.starts, query.right + 1, first(range), last(range), Base.Order.Forward)
+    return idx <= last(range) ? subject.intervals[idx] : nothing
 end
 
 """
     follow(query::GenomicInterval, subject::IntervalCollection)
 
-In Bioconductor, `follow(x, y)` is the index of the element in `y` that is followed
-by `x`. This is strand-aware:
-- For `+` strand (or `.`): `y` is to the left of `x`.
-- For `-` strand: `y` is to the right of `x`.
+Strand-aware: find the interval in `subject` that `query` follows.
+- For `+` strand (or `.`): `y` is to the left of `x` (ending before query.left).
+- For `-` strand: `y` is to the right of `x` (starting after query.right).
 """
 function follow(query::GenomicInterval, subject::IntervalCollection)
     range = get(subject.chrom_indices, query.chrom, nothing)
     range === nothing && return nothing
 
-    candidates = GenomicInterval[]
-    for interval in subject.intervals[range]
-        interval.left > query.right && push!(candidates, interval)
+    if query.strand == '-'
+        # For '-' strand: find nearest interval starting after query.right
+        idx = searchsortedfirst(subject.starts, query.right + 1, first(range), last(range), Base.Order.Forward)
+        return idx <= last(range) ? subject.intervals[idx] : nothing
     end
 
-    isempty(candidates) && return nothing
+    # For '+' or '.': find the nearest interval ending before query.left
+    end_indices = get(subject.chrom_end_indices, query.chrom, nothing)
+    end_indices === nothing && return nothing
+    idx = _find_last_end_lt(subject.ends, end_indices, query.left)
+    return idx === nothing ? nothing : subject.intervals[idx]
+end
 
-    best = candidates[1]
-    best_key = (best.left, best.right, Int(best.strand))
-    for interval in candidates[2:end]
-        key = (interval.left, interval.right, Int(interval.strand))
-        if key < best_key
-            best = interval
-            best_key = key
-        end
+"""
+    _subtract_piece(target, blocker)
+
+Subtract a single blocker interval from a target, returning 0-2 remaining pieces.
+"""
+function _subtract_piece(target::GenomicInterval, blocker::GenomicInterval)
+    target.chrom == blocker.chrom || return [target]
+    blocker.right < target.left && return [target]
+    blocker.left > target.right && return [target]
+    result = GenomicInterval[]
+    if blocker.left > target.left
+        push!(result, GenomicInterval(target.chrom, target.left, blocker.left - 1, target.strand, target.metadata))
     end
-
-    return best
+    if blocker.right < target.right
+        push!(result, GenomicInterval(target.chrom, blocker.right + 1, target.right, target.strand, target.metadata))
+    end
+    return result
 end
 
 function _subtract_many(piece::GenomicInterval, blockers::Vector{GenomicInterval})
@@ -755,24 +818,32 @@ function Base.union(left::IntervalCollection, right::IntervalCollection)
 end
 
 function _coverage_segments_for_chrom(chrom::String, intervals::Vector{GenomicInterval}, range::UnitRange{Int})
-    events = Dict{Int,Int}()
+    # Use sorted event vector instead of Dict for better cache performance
+    events = Tuple{Int,Int}[]  # (position, delta)
+    sizehint!(events, 2 * length(range))
 
     @inbounds for index in range
         interval = intervals[index]
-        events[interval.left] = get(events, interval.left, 0) + 1
-        events[interval.right + 1] = get(events, interval.right + 1, 0) - 1
+        push!(events, (interval.left, 1))
+        push!(events, (interval.right + 1, -1))
     end
 
-    positions = sort!(collect(keys(events)))
+    sort!(events; by=first)
+
     segments = CoverageSegment[]
     depth = 0
     previous_position = nothing
-
-    for position in positions
+    i = 1
+    while i <= length(events)
+        position = events[i][1]
         if previous_position !== nothing && depth > 0 && position > previous_position
             push!(segments, CoverageSegment(chrom, previous_position, position - 1, depth))
         end
-        depth += events[position]
+        # Sum all deltas at the same position
+        while i <= length(events) && events[i][1] == position
+            depth += events[i][2]
+            i += 1
+        end
         previous_position = position
     end
 
@@ -873,12 +944,16 @@ function disjoin(collection::IntervalCollection)
     for chrom in sort(collect(keys(breakpoints)))
         points = sort(collect(breakpoints[chrom]))
         length(points) < 2 && continue
+        # Use interval tree for O(log n + k) containment checks instead of O(n)
+        tree = get(collection.trees, chrom, nothing)
         for index in 1:length(points)-1
             left = points[index]
             right = points[index + 1] - 1
             left > right && continue
-            candidate = GenomicInterval(chrom, left, right, '.', Dict{String,Any}())
-            any(interval -> interval.left <= candidate.left && interval.right >= candidate.right, collection.intervals) && push!(pieces, candidate)
+            # Check if any interval contains this piece via interval tree
+            if tree !== nothing && !isempty(query_overlaps(tree, left, right))
+                push!(pieces, GenomicInterval(chrom, left, right, '.', Dict{String,Any}()))
+            end
         end
     end
 
@@ -924,22 +999,24 @@ end
 
 function DataFrames.DataFrame(intervals::AbstractVector{<:GenomicInterval})
     rows = collect(intervals)
+    n = length(rows)
     metadata_keys = Set{String}()
     for interval in rows
         union!(metadata_keys, keys(_comparable_interval_metadata(interval.metadata)))
     end
 
-    columns = Dict{Symbol,Vector{Any}}(
-        :chrom => Any[interval.chrom for interval in rows],
-        :start => Any[interval.left for interval in rows],
-        :stop => Any[interval.right for interval in rows],
-        :strand => Any[interval.strand for interval in rows])
+    # Use typed vectors instead of Any[] for performance
+    columns = Dict{Symbol,AbstractVector}(
+        :chrom => String[interval.chrom for interval in rows],
+        :start => Int[interval.left for interval in rows],
+        :stop => Int[interval.right for interval in rows],
+        :strand => Char[interval.strand for interval in rows])
 
     for key in sort(collect(metadata_keys))
         columns[Symbol(key)] = Any[get(interval.metadata, key, missing) for interval in rows]
     end
 
-    return with_provenance(DataFrames.DataFrame(columns), "GenomicIntervalTable", "GenomicRanges/DataFrame"; parameters=(row_count=length(rows),))
+    return with_provenance(DataFrames.DataFrame(columns), "GenomicIntervalTable", "GenomicRanges/DataFrame"; parameters=(row_count=n,))
 end
 
 function read_intervals(df::DataFrames.AbstractDataFrame)
@@ -987,13 +1064,13 @@ end
 
 coverage(intervals::AbstractVector{<:GenomicInterval}) = coverage(build_collection(intervals))
 
-function _parse_interval_row(headers::Vector{String}, fields::Vector{String})
-    column_map = Dict(lowercase(strip(header)) => index for (index, header) in pairs(headers))
+function _parse_interval_row(headers::Vector{String}, fields::Vector{String}; column_map::Union{Nothing,Dict{String,Int}}=nothing)
+    cmap = column_map === nothing ? Dict(lowercase(strip(header)) => index for (index, header) in pairs(headers)) : column_map
 
-    chrom_index = get(column_map, "chr", get(column_map, "chrom", get(column_map, "chromosome", nothing)))
-    start_index = get(column_map, "start", get(column_map, "left", get(column_map, "begin", nothing)))
-    stop_index = get(column_map, "end", get(column_map, "stop", get(column_map, "right", nothing)))
-    strand_index = get(column_map, "strand", nothing)
+    chrom_index = get(cmap, "chr", get(cmap, "chrom", get(cmap, "chromosome", nothing)))
+    start_index = get(cmap, "start", get(cmap, "left", get(cmap, "begin", nothing)))
+    stop_index = get(cmap, "end", get(cmap, "stop", get(cmap, "right", nothing)))
+    strand_index = get(cmap, "strand", nothing)
 
     chrom_index === nothing && throw(ArgumentError("interval header must include a chrom column"))
     start_index === nothing && throw(ArgumentError("interval header must include a start column"))
@@ -1016,6 +1093,7 @@ end
 
 function read_intervals(io::IO)
     headers = nothing
+    column_map = nothing
     intervals = GenomicInterval[]
 
     for raw_line in eachline(io)
@@ -1025,12 +1103,14 @@ function read_intervals(io::IO)
 
         if headers === nothing
             headers = String[strip(field) for field in Base.split(line, ',')]
+            # Pre-compute column map once instead of per-row
+            column_map = Dict(lowercase(strip(header)) => index for (index, header) in pairs(headers))
             continue
         end
 
         fields = String[strip(field) for field in Base.split(line, ',')]
         length(fields) >= length(headers) || throw(ArgumentError("interval row has fewer fields than header"))
-        push!(intervals, _parse_interval_row(headers, fields))
+        push!(intervals, _parse_interval_row(headers, fields; column_map=column_map))
     end
 
     headers === nothing && return GenomicInterval[]

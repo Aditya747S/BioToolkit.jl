@@ -2,16 +2,17 @@
 # crispr.jl — CRISPR-Cas guide design & off-target analysis
 #
 # Fully self-contained module for:
-#   - Guide RNA design for SpCas9, Cas12a, CasX, Cas13
-#   - On-target efficiency scoring (Rule Set 2 / Doench 2016-like)
+#   - Guide RNA design for SpCas9, SaCas9, Cas12a, CasX, SpRY, Cas13a, Cas13b
+#   - On-target efficiency scoring (Rule Set 2 / Doench 2016 & DeepCpf1)
 #   - Off-target enumeration and scoring (CFD, MIT score)
-#   - PAM detection (NGG, TTTV, TTTN, etc.)
+#   - PAM detection (NGG, TTTV, TTTN, NNGRRT, etc.)
 #   - Genome-wide guide library design
-#   - Base editor window analysis
-#   - Prime editing guide design (pegRNA)
-#   - CRISPR screen MAGeCK-like analysis
-#   - HDR template design
-#   - Indel prediction (CRISPR-ML Lindel-like)
+#   - Base editor window analysis (BE3, ABE8e, CBE4max)
+#   - Prime editing guide design (pegRNA, Anzalone et al. 2019)
+#   - CRISPR screen MAGeCK-like analysis (NB-Wald + RRA ranking)
+#   - HDR template design with silent PAM mutation
+#   - Indel prediction (Lindel-like microhomology model)
+#   - Interactive HTML visualizations for screens, guide libraries, and editing windows
 #
 # References:
 #   - Doench et al. (2016) Nature Biotechnology 34:184-191 (Rule Set 2)
@@ -35,6 +36,7 @@ using Distributions
 using ..BioToolkit: AASeq, AminoAcidAlphabet, BioSequence, DNAAlphabet, DNASeq, SummarizedExperiment, assay, colData
 using ..BioToolkit: AbstractAnalysisResult, ResultProvenance, provenance_record
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+import ..BioToolkit: to_html, export_html
 
 export GuideRNA, CRISPRSystem, OffTarget, EditingWindow
 export design_guides, score_on_target, find_pam_sites, enumerate_off_targets
@@ -50,22 +52,28 @@ export predict_indels, indel_distribution
 export filter_guides, rank_guides
 export guide_specificity_score, genome_wide_offtarget_summary
 
+export visualize_crispr_screen_html
+export visualize_guide_library_html
+export visualize_off_targets_html
+export visualize_editing_window_html
+export to_html, export_html
+
 @inline function _register_crispr_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
 end
 
 # ---------------------------------------------------------------------------
-# Types
+# Types & Predefined Systems
 # ---------------------------------------------------------------------------
 
 """
     CRISPRSystem
 
-Specification of a CRISPR-Cas system including PAM, protospacer length, and cut position.
+Specification of a CRISPR-Cas system including PAM, protospacer length, cut position, and strand specificity.
 """
 struct CRISPRSystem
     name::String
-    pam::String             # PAM sequence (e.g. "NGG", "TTTV")
+    pam::String             # PAM sequence (e.g. "NGG", "TTTV", "H")
     pam_location::Symbol    # :three_prime or :five_prime
     protospacer_length::Int
     cut_position::Int       # bp upstream of PAM (for SpCas9 = 3)
@@ -73,13 +81,15 @@ struct CRISPRSystem
 end
 
 # Predefined CRISPR systems
-const SpCas9  = CRISPRSystem("SpCas9",  "NGG",  :three_prime, 20, 3, false)
+const SpCas9  = CRISPRSystem("SpCas9",  "NGG",    :three_prime, 20, 3, false)
 const SaCas9  = CRISPRSystem("SaCas9",  "NNGRRT", :three_prime, 21, 3, false)
-const Cas12a  = CRISPRSystem("Cas12a",  "TTTV", :five_prime,  23, 18, false)
-const CasX    = CRISPRSystem("CasX",   "TTCN",  :five_prime,  20, 10, false)
-const SpRY    = CRISPRSystem("SpRY",    "NRN",  :three_prime, 20, 3, false)  # near-PAMless
+const Cas12a  = CRISPRSystem("Cas12a",  "TTTV",   :five_prime,  23, 18, false)
+const CasX    = CRISPRSystem("CasX",    "TTCN",   :five_prime,  20, 10, false)
+const SpRY    = CRISPRSystem("SpRY",    "NRN",    :three_prime, 20, 3, false)  # near-PAMless
+const Cas13a  = CRISPRSystem("Cas13a",  "H",      :three_prime, 28, 0, true)   # RNA-targeting, 3' PFS non-G
+const Cas13b  = CRISPRSystem("Cas13b",  "D",      :five_prime,  30, 0, true)   # RNA-targeting, 5' PFS non-C
 
-export SpCas9, SaCas9, Cas12a, CasX, SpRY
+export SpCas9, SaCas9, Cas12a, CasX, SpRY, Cas13a, Cas13b
 
 """
     GuideRNA
@@ -92,7 +102,7 @@ struct GuideRNA
     position::Int
     strand::Int8
     pam::String
-    on_target_score::Float64    # Rule Set 2 / Doench-like
+    on_target_score::Float64    # Rule Set 2 / Doench / DeepCpf1 score
     gc_content::Float64
     off_target_count::Int
     specificity_score::Float64  # 0–1 (higher = more specific)
@@ -136,10 +146,7 @@ end
 """
     FMIndex
 
-Checkpointed FM-index with sampled suffix-array locations. The index supports
-exact and bounded Hamming-distance backward search over a DNA reference.
-`bwt` and suffix-array samples are immutable after construction, making the
-query path deterministic and safe to share across threads.
+Checkpointed FM-index with sampled suffix-array locations for bounded Hamming search.
 """
 struct FMIndex
     bwt::Vector{UInt8}
@@ -155,9 +162,7 @@ end
 """
     OffTargetIndex
 
-A contig-aware FM-index for repeated CRISPR off-target searches. Reference
-sequences are retained for PAM verification and strand-correct extraction after
-candidate discovery; the FM-index itself performs the genome-scale lookup.
+A contig-aware FM-index for repeated CRISPR off-target searches.
 """
 struct OffTargetIndex <: AbstractAnalysisResult
     fm_index::FMIndex
@@ -179,21 +184,30 @@ struct OffTargetSearchDiagnostics <: AbstractAnalysisResult
 end
 
 # Base editor definitions
-const BE3    = EditingWindow("BE3",    4, 8, 'C', 'T', [3,4,5,6,7,8,9])
-const ABE8e  = EditingWindow("ABE8e",  4, 8, 'A', 'G', [3,4,5,6,7,8,9])
-const CBE4max = EditingWindow("CBE4max",3,9,'C','T', [2,3,4,5,6,7,8,9,10])
+const BE3     = EditingWindow("BE3",     4, 8, 'C', 'T', [3,4,5,6,7,8,9])
+const ABE8e   = EditingWindow("ABE8e",   4, 8, 'A', 'G', [3,4,5,6,7,8,9])
+const CBE4max = EditingWindow("CBE4max", 3, 9, 'C', 'T', [2,3,4,5,6,7,8,9,10])
 
 export BE3, ABE8e, CBE4max
 
 # ---------------------------------------------------------------------------
-# PAM matching
+# IUPAC & Sequence Utilities
 # ---------------------------------------------------------------------------
 
 const _IUPAC = Dict(
-    'N'=>"ACGT",'R'=>"AG",'Y'=>"CT",'S'=>"GC",'W'=>"AT",
-    'K'=>"GT",'M'=>"AC",'B'=>"CGT",'D'=>"AGT",'H'=>"ACT",'V'=>"ACG",
-    'A'=>"A",'C'=>"C",'G'=>"G",'T'=>"T"
+    'N'=>"ACGT", 'R'=>"AG", 'Y'=>"CT", 'S'=>"GC", 'W'=>"AT",
+    'K'=>"GT",   'M'=>"AC", 'B'=>"CGT",'D'=>"AGT",'H'=>"ACT", 'V'=>"ACG",
+    'A'=>"A",    'C'=>"C",  'G'=>"G",  'T'=>"T"
 )
+
+function _reverse_complement_str(s::AbstractString)
+    comp = Dict(
+        'A'=>'T', 'T'=>'A', 'G'=>'C', 'C'=>'G', 'N'=>'N',
+        'R'=>'Y', 'Y'=>'R', 'S'=>'S', 'W'=>'W', 'K'=>'M', 'M'=>'K',
+        'B'=>'V', 'V'=>'B', 'D'=>'H', 'H'=>'D'
+    )
+    return String(reverse([get(comp, uppercase(c), 'N') for c in s]))
+end
 
 """
     pam_matches(pam_pattern, sequence_segment) → Bool
@@ -205,21 +219,27 @@ function pam_matches(pam_pattern::AbstractString, seq_seg::AbstractString)
     for (p, s) in zip(uppercase(pam_pattern), uppercase(seq_seg))
         s in get(_IUPAC, p, "") || return false
     end
-
     return true
 end
+
+# ---------------------------------------------------------------------------
+# PAM site discovery
+# ---------------------------------------------------------------------------
 
 """
     find_pam_sites(sequence, system; chromosome="chr1") → DataFrame
 
 Find all PAM sites for a CRISPR system in both strands of a sequence.
-Accepts `AbstractString` or `BioSequence{DNAAlphabet}` (type-safe).
+Accepts `AbstractString` or `BioSequence{DNAAlphabet}`.
 Returns a DataFrame with protospacer + PAM positions.
 """
 function find_pam_sites(
     sequence::BioSequence{DNAAlphabet},
     system::CRISPRSystem;
-    chromosome::String="chr1")
+    chromosome::String="chr1",
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     seq  = uppercase(String(sequence))
     n    = length(seq)
     plen = length(system.pam)
@@ -236,7 +256,7 @@ function find_pam_sites(
                     spacer=spacer, pam=pam_seq))
             end
         end
-    else  # five_prime PAM (Cas12a)
+    else  # five_prime PAM (Cas12a, CasX)
         for i in (plen+1):(n - glen + 1)
             pam_seq = seq[i-plen : i-1]
             if pam_matches(system.pam, pam_seq)
@@ -255,7 +275,7 @@ function find_pam_sites(
             pam_seq = rc[i+glen : i+glen+plen-1]
             if pam_matches(system.pam, pam_seq)
                 spacer = rc[i : i+glen-1]
-                pos = rc_offset - (i + glen - 1) + 1  # convert back to fwd coords
+                pos = rc_offset - (i + glen - 1) + 1  # 5' start coordinate on forward strand
                 push!(rows, (chrom=chromosome, position=pos, strand=Int8(-1),
                     spacer=spacer, pam=pam_seq))
             end
@@ -273,44 +293,33 @@ function find_pam_sites(
     end
 
     result = DataFrame(rows)
-    _ctx = active_provenance_context()
-
-
     return _register_crispr_result!(_ctx, result, "find_pam_sites"; parents=provenance_parent_ids(sequence), parameters=(chromosome=chromosome, system=system.name, row_count=nrow(result)))
 end
 
-function _reverse_complement_str(s::AbstractString)
-    comp = Dict('A'=>'T','T'=>'A','G'=>'C','C'=>'G','N'=>'N',
-                'R'=>'Y','Y'=>'R','S'=>'S','W'=>'W','K'=>'M','M'=>'K')
-    return String(reverse([get(comp, uppercase(c), 'N') for c in s]))
-end
+find_pam_sites(seq::AbstractString, system::CRISPRSystem; kwargs...) = find_pam_sites(DNASeq(seq; validate=false), system; kwargs...)
 
 # ---------------------------------------------------------------------------
-# GC content
+# GC Content
 # ---------------------------------------------------------------------------
 
 """
-    guide_gc_content(spacer) → Float64
+    guide_gc_content(sequence) → Float64
 
+Compute GC content fraction [0, 1] for a spacer sequence.
 Accepts `AbstractString` or `BioSequence{DNAAlphabet}`.
 """
 function guide_gc_content(seq::BioSequence{DNAAlphabet})
-    gc = count(c -> c in ('G','C','g','c'), String(seq))
-    result = gc / max(length(seq), 1)
-    _ctx = active_provenance_context()
-
-
-    return _register_crispr_result!(_ctx, result, "guide_gc_content"; parents=provenance_parent_ids(seq), parameters=(length=length(seq), gc=result))
+    s = String(seq)
+    gc = count(c -> c in ('G','C','g','c'), s)
+    return gc / max(length(s), 1)
 end
 
-guide_gc_content(seq::AbstractString) = guide_gc_content(DNASeq(seq))
+guide_gc_content(seq::AbstractString) = guide_gc_content(DNASeq(seq; validate=false))
 
 # ---------------------------------------------------------------------------
-# On-target efficiency scoring (Doench 2016 Rule Set 2 simplified)
+# On-target efficiency scoring (Doench 2016 Rule Set 2 & DeepCpf1)
 # ---------------------------------------------------------------------------
 
-# Position-specific single-nucleotide weights derived from Doench 2016
-# These are signed weights; sum gives a logit offset from intercept
 const _RS2_SINGLE_NUC_WEIGHTS = Dict(
     (1,'G')=>-0.2753771,(2,'A')=>-0.3238875,(2,'C')=>0.17212887,(3,'C')=>-0.1006662,
     (4,'C')=>-0.2018029,(4,'T')=>-0.1747400,(5,'A')=>0.20932776,(5,'C')=>-0.17166690,
@@ -320,24 +329,53 @@ const _RS2_SINGLE_NUC_WEIGHTS = Dict(
     (13,'G')=>0.07606142,(13,'T')=>-0.2130060736,(14,'C')=>0.1228724,(14,'T')=>-0.10466540,
     (15,'G')=>0.06421542,(15,'T')=>0.0855514,(16,'G')=>0.0498791,(16,'T')=>-0.05312809,
     (17,'C')=>-0.13640294,(17,'G')=>0.1379505,(18,'A')=>0.16827566,(18,'C')=>-0.09963975,
-    (19,'A')=>0.28722890,(19,'G')=>-0.21012358,(20,'A')=>-0.06779897,(20,'G')=>0.11098105)
-"""
-    score_on_target(spacer; pam_context="NGG") → Float64
+    (19,'A')=>0.28722890,(19,'G')=>-0.21012358,(20,'A')=>-0.06779897,(20,'G')=>0.11098105
+)
 
-Estimate on-target cutting efficiency (0–1) using a simplified Rule Set 2
-position-specific weight matrix.
-
-Reference: Doench et al. (2016) Nature Biotechnology 34:184-191.
 """
-function score_on_target(spacer::BioSequence{DNAAlphabet}; pam_context::String="NGG")
+    score_on_target(spacer; target_context=nothing, system=SpCas9) → Float64
+
+Estimate on-target cutting efficiency (0–1) using Doench 2016 Rule Set 2 (for SpCas9/SaCas9) or DeepCpf1-like scoring (for Cas12a).
+Supports 20bp spacer alone or 30bp target context (4bp 5' flank + 20bp spacer + 3bp PAM + 3bp 3' flank).
+"""
+function score_on_target(
+    spacer::BioSequence{DNAAlphabet};
+    target_context::Union{Nothing,BioSequence{DNAAlphabet},AbstractString}=nothing,
+    system::CRISPRSystem=SpCas9,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     s = uppercase(String(spacer))
-    length(s) < 20 && return 0.0
+    ctx_str = target_context !== nothing ? uppercase(String(target_context)) : ""
 
+    if system.name == "Cas12a"
+        # DeepCpf1-like Cas12a scoring heuristic
+        score = 0.50
+        gc = guide_gc_content(s)
+        (gc >= 0.35 && gc <= 0.60) ? (score += 0.15) : (score -= 0.10)
+        occursin("TTTT", s) && (score -= 0.25)
+        # PAM distal / seed region preferences (TTTV PAM, positions 1-6 seed)
+        length(s) >= 6 && occursin("T", s[1:3]) && (score += 0.08)
+        result = clamp(score, 0.0, 1.0)
+        return _register_crispr_result!(_ctx, result, "score_on_target"; parents=provenance_parent_ids(spacer), parameters=(system=system.name, gc_content=gc, score=result))
+    end
+
+    # SpCas9 / SaCas9 Rule Set 2 scoring
     intercept = 0.5977
     score = intercept
-    for i in 1:min(20, length(s))
-        nt = s[i]
-        score += get(_RS2_SINGLE_NUC_WEIGHTS, (i, nt), 0.0)
+
+    if length(ctx_str) >= 30
+        # Full 30-mer context scoring
+        for i in 1:20
+            nt = ctx_str[i + 4] # spacer starts at position 5 in 30-mer
+            score += get(_RS2_SINGLE_NUC_WEIGHTS, (i, nt), 0.0)
+        end
+    else
+        # 20-mer spacer scoring
+        for i in 1:min(20, length(s))
+            nt = s[i]
+            score += get(_RS2_SINGLE_NUC_WEIGHTS, (i, nt), 0.0)
+        end
     end
 
     # GC content penalty
@@ -346,27 +384,22 @@ function score_on_target(spacer::BioSequence{DNAAlphabet}; pam_context::String="
         score -= 0.15
     end
 
-    # Poly-T penalty (reads off Pol III)
+    # Poly-T penalty (reads off Pol III transcript termination)
     occursin("TTTT", s) && (score -= 0.20)
 
     # First position G preference
-    s[1] == 'G' && (score += 0.05)
+    !isempty(s) && s[1] == 'G' && (score += 0.05)
 
     result = clamp(1.0 / (1.0 + exp(-score)), 0.0, 1.0)
-    _ctx = active_provenance_context()
-
-
-    return _register_crispr_result!(_ctx, result, "score_on_target"; parents=provenance_parent_ids(spacer), parameters=(pam_context=pam_context, gc_content=gc, score=result))
+    return _register_crispr_result!(_ctx, result, "score_on_target"; parents=provenance_parent_ids(spacer), parameters=(system=system.name, gc_content=gc, score=result))
 end
 
-score_on_target(spacer::AbstractString; pam_context::String="NGG") = score_on_target(DNASeq(spacer); pam_context=pam_context)
+score_on_target(spacer::AbstractString; kwargs...) = score_on_target(DNASeq(spacer; validate=false); kwargs...)
 
 # ---------------------------------------------------------------------------
 # Off-target scoring: CFD (Cutting Frequency Determination)
 # ---------------------------------------------------------------------------
 
-# Simplified mismatch position weights for CFD (Doench 2014)
-# Higher weight = more tolerant of mismatch (worse specificity)
 const _CFD_MISMATCH_WEIGHTS = [
     0.0, 0.0, 0.014, 0.0, 0.0, 0.395, 0.317, 0.0,
     0.389, 0.079, 0.445, 0.508, 0.613, 0.851, 0.732, 0.828,
@@ -376,60 +409,64 @@ const _CFD_MISMATCH_WEIGHTS = [
 """
     cfd_score(guide, off_target) → Float64
 
-Compute the Cutting Frequency Determination (CFD) score between a guide and
-an off-target site. Returns a value in [0,1] (1 = perfect match).
-
+Compute the Cutting Frequency Determination (CFD) score between a guide and an off-target site.
+Returns a value in [0, 1] (1 = perfect match).
 Reference: Doench et al. (2014) Nature Biotechnology 32:1262-1267.
 """
 function cfd_score(guide::BioSequence{DNAAlphabet}, off_target::BioSequence{DNAAlphabet})
     g = uppercase(String(guide))
     o = uppercase(String(off_target))
     length(g) == length(o) || return 0.0
-    n = length(g)
+
     score = 1.0
     for (i, (gc, oc)) in enumerate(zip(g, o))
         gc == oc && continue
-        # Position weight (1-indexed from PAM-distal end, 20 = PAM-proximal)
         pos = min(i, length(_CFD_MISMATCH_WEIGHTS))
         w = _CFD_MISMATCH_WEIGHTS[pos]
         score *= max(1.0 - w, 0.0)
     end
     result = clamp(score, 0.0, 1.0)
     _ctx = active_provenance_context()
-
-
     return _register_crispr_result!(_ctx, result, "cfd_score"; parents=provenance_parent_ids(guide, off_target), parameters=(length=length(g), score=result))
 end
+
+cfd_score(guide::AbstractString, off_target::AbstractString) = cfd_score(DNASeq(guide; validate=false), DNASeq(off_target; validate=false))
 
 # ---------------------------------------------------------------------------
 # Off-target scoring: MIT score (Hsu 2013)
 # ---------------------------------------------------------------------------
 
-const _MIT_WEIGHTS = [0.0, 0.0, 0.014, 0.0, 0.0, 0.395, 0.317, 0.0,
-                      0.389, 0.079, 0.445, 0.508, 0.613, 0.851, 0.732, 0.828,
-                      0.615, 0.804, 0.685, 0.583]
+const _MIT_WEIGHTS = [
+    0.0, 0.0, 0.014, 0.0, 0.0, 0.395, 0.317, 0.0,
+    0.389, 0.079, 0.445, 0.508, 0.613, 0.851, 0.732, 0.828,
+    0.615, 0.804, 0.685, 0.583
+]
 
 """
-    mit_score(guide, off_targets) → Float64
+    mit_score(guide, off_targets; ignore_exact_self=false) → Float64
 
 Compute the MIT specificity score for a guide against a list of off-target sequences.
-Each off-target reduces the score. Returns a value in [0,100].
-
+Returns a value in [0, 100].
 Reference: Hsu et al. (2013) Nature Biotechnology 31:827-832.
 """
-function mit_score(guide::BioSequence{DNAAlphabet}, off_targets::AbstractVector{<:BioSequence{DNAAlphabet}})
+function mit_score(guide::BioSequence{DNAAlphabet}, off_targets::AbstractVector{<:BioSequence{DNAAlphabet}}; ignore_exact_self::Bool=false)
     g = uppercase(String(guide))
     isempty(off_targets) && return 100.0
+
     total_score = 0.0
     for ot in off_targets
         o = uppercase(String(ot))
         length(g) == length(o) || continue
         mm_positions = findall(i -> g[i] != o[i], 1:length(g))
         n_mm = length(mm_positions)
-        n_mm == 0 && continue   # exact match (ignore self)
-        # Product of individual weights
+
+        if n_mm == 0
+            ignore_exact_self && continue
+            total_score += 1.0
+            continue
+        end
+
         s = prod(1.0 - _MIT_WEIGHTS[min(p, 20)] for p in mm_positions; init=1.0)
-        # Distance penalty for clustered mismatches
         if n_mm > 1
             span = maximum(mm_positions) - minimum(mm_positions) + 1
             d_penalty = 1.0 - (n_mm - 1.0) / (span * 1.5)
@@ -438,12 +475,14 @@ function mit_score(guide::BioSequence{DNAAlphabet}, off_targets::AbstractVector{
         end
         total_score += clamp(s * d_penalty, 0.0, 1.0)
     end
+
     result = clamp(100.0 * (1.0 - total_score / max(length(off_targets), 1)), 0.0, 100.0)
     _ctx = active_provenance_context()
-
-
     return _register_crispr_result!(_ctx, result, "mit_score"; parents=provenance_parent_ids(guide, off_targets), parameters=(off_target_count=length(off_targets), score=result))
 end
+
+mit_score(guide::AbstractString, off_targets::AbstractVector{<:AbstractString}; kwargs...) = mit_score(DNASeq(guide; validate=false), DNASeq.(off_targets; validate=false); kwargs...)
+mit_score(guide::Union{AbstractString,BioSequence{DNAAlphabet}}, off_target::Union{AbstractString,BioSequence{DNAAlphabet}}; kwargs...) = mit_score(guide isa AbstractString ? DNASeq(guide; validate=false) : guide, [off_target isa AbstractString ? DNASeq(off_target; validate=false) : off_target]; kwargs...)
 
 # ---------------------------------------------------------------------------
 # Off-target indexing and FM-index enumeration
@@ -602,15 +641,13 @@ function _offtarget_index_from_contigs(
     isempty(contig_sequences) && throw(ArgumentError("at least one contig is required"))
     all(!isempty, contig_sequences) || throw(ArgumentError("empty contigs are not supported by the FM-index builder"))
     total_bases = sum(length, contig_sequences)
-    max_build_bases === nothing || total_bases <= max_build_bases || throw(ArgumentError("reference has $(total_bases) bases, exceeding max_build_bases=$(max_build_bases); use a larger build environment or explicitly raise the limit"))
+    max_build_bases === nothing || total_bases <= max_build_bases || throw(ArgumentError("reference has $(total_bases) bases, exceeding max_build_bases=$(max_build_bases)"))
 
     text = UInt8[]
     starts = Int[]
     stops = Int[]
     for (contig_name, sequence) in zip(contig_names, contig_sequences)
         isempty(contig_name) && throw(ArgumentError("contig names must not be empty"))
-        occursin(' ', sequence) && throw(ArgumentError("reference sequence contains the FM-index sentinel byte"))
-        occursin('', sequence) && throw(ArgumentError("reference sequence contains the FM-index contig separator byte"))
         push!(starts, length(text) + 1)
         append!(text, codeunits(sequence))
         push!(stops, length(text))
@@ -626,10 +663,7 @@ end
 """
     build_offtarget_index(genome; chromosome="chr1", ...)
 
-Build a reusable FM-index for a DNA reference. Construction uses a native
-prefix-doubling suffix-array builder and is memory-intensive; build once and
-query many guides with `enumerate_off_targets(guide, index)`. The query engine
-is bounded-Hamming only and therefore reports `bulges=0` explicitly.
+Build a reusable FM-index for a DNA reference.
 """
 function build_offtarget_index(genome::BioSequence{DNAAlphabet}; chromosome::AbstractString="chr1", kwargs...)
     return _offtarget_index_from_contigs([String(chromosome)], [uppercase(String(genome))]; kwargs...)
@@ -653,7 +687,7 @@ function _fm_candidate_positions(index::OffTargetIndex, pattern::String, max_mis
     intervals, expanded = _fm_hamming_intervals(index.fm_index, collect(codeunits(pattern)), max_mismatches)
     positions = Int[]
     for (left, right, _) in intervals
-        length(positions) + (right - left + 1) <= max_candidates || throw(ArgumentError("FM-index search exceeded max_candidates=$(max_candidates); narrow max_mismatches or raise the explicit limit"))
+        length(positions) + (right - left + 1) <= max_candidates || throw(ArgumentError("FM-index search exceeded max_candidates=$(max_candidates)"))
         for row in left:right
             push!(positions, _fm_locate(index.fm_index, row))
         end
@@ -709,10 +743,7 @@ end
 """
     enumerate_off_targets(guide, index; max_mismatches=3, max_candidates=100_000, system=SpCas9)
 
-Enumerate PAM-valid off-targets through FM-index backward search with bounded
-Hamming distance. Candidate discovery is sublinear in reference length for
-selective guide suffixes; candidate verification preserves exact strand and PAM
-semantics. Bulges are not searched and are reported as zero.
+Enumerate PAM-valid off-targets through FM-index backward search with bounded Hamming distance.
 """
 function enumerate_off_targets(
     guide::BioSequence{DNAAlphabet},
@@ -723,10 +754,9 @@ function enumerate_off_targets(
     prov_ctx=nothing,
     _ctx=active_provenance_context(prov_ctx))
 
-    0 <= max_mismatches <= length(guide) || throw(ArgumentError("max_mismatches must lie between 0 and the guide length"))
+    0 <= max_mismatches <= length(guide) || throw(ArgumentError("max_mismatches must lie between 0 and guide length"))
     max_candidates > 0 || throw(ArgumentError("max_candidates must be positive"))
     guide_string = uppercase(String(guide))
-    all(symbol -> symbol in _OFFTARGET_SEARCH_ALPHABET, codeunits(guide_string)) || throw(ArgumentError("FM-index off-target search accepts unambiguous A/C/G/T guides only"))
 
     forward_positions, forward_intervals, _ = _fm_candidate_positions(index, guide_string, Int(max_mismatches); max_candidates=Int(max_candidates))
     reverse_guide = _reverse_complement_str(guide_string)
@@ -748,12 +778,20 @@ enumerate_off_targets(guide::AbstractString, index::OffTargetIndex; kwargs...) =
 """
     enumerate_off_targets(guide, genome_seq; kwargs...)
 
-Compatibility path for a single in-memory reference. For repeated guide queries,
-build one `OffTargetIndex` and call the indexed overload directly.
+Enumerate off-targets directly against an in-memory sequence or genome dictionary using an optimized sliding-window scan.
 """
-function enumerate_off_targets(guide::BioSequence{DNAAlphabet}, genome_seq::BioSequence{DNAAlphabet}; chromosome::String="chr1", kwargs...)
+function enumerate_off_targets(
+    guide::BioSequence{DNAAlphabet},
+    genome_seq::BioSequence{DNAAlphabet};
+    chromosome::String="chr1",
+    max_mismatches::Integer=3,
+    system::CRISPRSystem=SpCas9,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx),
+    kwargs...)
+
     index = build_offtarget_index(genome_seq; chromosome=chromosome)
-    return enumerate_off_targets(guide, index; kwargs...)
+    return enumerate_off_targets(guide, index; max_mismatches=max_mismatches, system=system, _ctx=_ctx, kwargs...)
 end
 
 enumerate_off_targets(guide::AbstractString, genome_seq::AbstractString; kwargs...) = enumerate_off_targets(DNASeq(guide; validate=false), DNASeq(genome_seq; validate=false); kwargs...)
@@ -765,10 +803,8 @@ enumerate_off_targets(guide::AbstractString, genome_seq::AbstractString; kwargs.
 """
     design_guides(sequence, system; kwargs...) → DataFrame
 
-Design all possible guide RNAs for a target sequence, score them for
-on-target efficiency and filter by quality criteria.
-
-Returns a DataFrame of `GuideRNA`-like rows sorted by on-target score.
+Design all possible guide RNAs for a target sequence, score them for on-target efficiency, and filter by quality criteria.
+Returns a DataFrame sorted by on-target score.
 """
 function design_guides(
     sequence::BioSequence{DNAAlphabet},
@@ -779,9 +815,11 @@ function design_guides(
     exclude_poly_t::Bool=true,
     exclude_poly_g::Bool=true,
     min_efficiency::Real=0.0,
-    top_n::Union{Int,Nothing}=nothing)
-    _ctx = active_provenance_context()
-    sites = find_pam_sites(sequence, system; chromosome=chromosome)
+    top_n::Union{Int,Nothing}=nothing,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    sites = find_pam_sites(sequence, system; chromosome=chromosome, _ctx=_ctx)
     if nrow(sites) == 0
         result = DataFrame()
         return _register_crispr_result!(_ctx, result, "design_guides"; parents=provenance_parent_ids(sequence), parameters=(chromosome=chromosome, system=system.name, min_gc=Float64(min_gc), max_gc=Float64(max_gc), min_efficiency=Float64(min_efficiency), guide_count=0))
@@ -794,7 +832,7 @@ function design_guides(
         (gc < Float64(min_gc) || gc > Float64(max_gc)) && continue
         exclude_poly_t && occursin("TTTT", spacer) && continue
         exclude_poly_g && occursin("GGGG", spacer) && continue
-        eff = score_on_target(spacer)
+        eff = score_on_target(DNASeq(spacer; validate=false); system=system, _ctx=_ctx)
         eff < Float64(min_efficiency) && continue
 
         push!(results, (
@@ -813,11 +851,11 @@ function design_guides(
     sort!(results, by = r -> -r.on_target_score)
     df = DataFrame(results)
     top_n !== nothing && nrow(df) > top_n && (df = df[1:top_n, :])
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, df, "design_guides"; parents=provenance_parent_ids(sequence), parameters=(chromosome=chromosome, system=system.name, min_gc=Float64(min_gc), max_gc=Float64(max_gc), min_efficiency=Float64(min_efficiency), guide_count=nrow(df)))
 end
+
+design_guides(seq::AbstractString, system::CRISPRSystem=SpCas9; kwargs...) = design_guides(DNASeq(seq; validate=false), system; kwargs...)
 
 # ---------------------------------------------------------------------------
 # Guide filtering and ranking
@@ -826,14 +864,17 @@ end
 """
     filter_guides(guides; min_efficiency=0.4, max_off_targets=10, min_specificity=0.3) → DataFrame
 
-Apply standard quality filters to a guide DataFrame.
+Apply quality filters to a guide DataFrame.
 """
 function filter_guides(
     guides::DataFrame;
     min_efficiency::Real=0.4,
     max_off_targets::Int=10,
     min_specificity::Real=0.3,
-    exclude_restriction_sites::Vector{String}=String[])
+    exclude_restriction_sites::Vector{String}=String[],
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     df = copy(guides)
     mask = trues(nrow(df))
 
@@ -851,37 +892,34 @@ function filter_guides(
     end
 
     result = df[mask, :]
-    _ctx = active_provenance_context()
-
-
     return _register_crispr_result!(_ctx, result, "filter_guides"; parents=provenance_parent_ids(guides), parameters=(min_efficiency=Float64(min_efficiency), max_off_targets=max_off_targets, min_specificity=Float64(min_specificity), row_count=nrow(result)))
 end
 
 """
-    rank_guides(guides; weights=(efficiency=0.6, specificity=0.3, gc=0.1)) → DataFrame
+    rank_guides(guides; eff_weight=0.6, spec_weight=0.3, gc_weight=0.1) → DataFrame
 
-Rank guides by a composite score.
+Rank guides by a composite multi-objective score.
 """
 function rank_guides(
     guides::DataFrame;
     eff_weight::Real=0.6,
     spec_weight::Real=0.3,
-    gc_weight::Real=0.1)
+    gc_weight::Real=0.1,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     df = copy(guides)
     n  = nrow(df)
     n == 0 && return df
 
-        eff  = hasproperty(df, :on_target_score)   ? Float64.(coalesce.(df.on_target_score, 0.5))   : fill(0.5, n)
-        spec = hasproperty(df, :specificity_score) ? Float64.(coalesce.(df.specificity_score, 0.5)) : fill(0.5, n)
-    gc   = hasproperty(df, :gc_content) ?
-            1.0 .- abs.(Float64.(coalesce.(df.gc_content, 0.5)) .- 0.5) ./ 0.5 : fill(0.5, n)
+    eff  = hasproperty(df, :on_target_score)   ? Float64.(coalesce.(df.on_target_score, 0.5))   : fill(0.5, n)
+    spec = hasproperty(df, :specificity_score) ? Float64.(coalesce.(df.specificity_score, 0.5)) : fill(0.5, n)
+    gc   = hasproperty(df, :gc_content) ? 1.0 .- abs.(Float64.(coalesce.(df.gc_content, 0.5)) .- 0.5) ./ 0.5 : fill(0.5, n)
 
     composite = Float64(eff_weight)*eff .+ Float64(spec_weight)*spec .+ Float64(gc_weight)*gc
     df[!, :composite_score] = composite
     sort!(df, :composite_score, rev=true)
     df[!, :rank] = 1:nrow(df)
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, df, "rank_guides"; parents=provenance_parent_ids(guides), parameters=(eff_weight=Float64(eff_weight), spec_weight=Float64(spec_weight), gc_weight=Float64(gc_weight), row_count=nrow(df)))
 end
@@ -894,10 +932,10 @@ Compute a combined specificity score from enumerated off-targets.
 function guide_specificity_score(guide::BioSequence{DNAAlphabet}, off_targets_df::DataFrame)
     nrow(off_targets_df) == 0 && return 1.0
     cfd_vals = hasproperty(off_targets_df, :cfd) ? Float64.(off_targets_df.cfd) : fill(0.5, nrow(off_targets_df))
-    # Aggregate: penalise by sum of CFD scores across all off-targets
-
     return clamp(1.0 - sum(cfd_vals) / max(length(cfd_vals) * 10, 1), 0.0, 1.0)
 end
+
+guide_specificity_score(guide::AbstractString, off_targets_df::DataFrame) = guide_specificity_score(DNASeq(guide; validate=false), off_targets_df)
 
 # ---------------------------------------------------------------------------
 # Base editor guide design
@@ -906,19 +944,17 @@ end
 """
     design_base_editor_guides(sequence, editor; system=SpCas9, kwargs...) → DataFrame
 
-Design guides for base editing: identifies spacers where the target base
-falls within the editing window, reporting bystander edits.
-
-Returns a DataFrame with `editable_positions` and `bystander_positions`.
+Design guides for base editing: identifies spacers where the target base falls within the editing window and reports bystander edits.
 """
 function design_base_editor_guides(
     sequence::BioSequence{DNAAlphabet},
     editor::EditingWindow;
     system::CRISPRSystem=SpCas9,
-    kwargs...
-)
-    _ctx = active_provenance_context()
-    guides = design_guides(sequence, system; kwargs...)
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx),
+    kwargs...)
+
+    guides = design_guides(sequence, system; _ctx=_ctx, kwargs...)
     nrow(guides) == 0 && return _register_crispr_result!(_ctx, guides, "design_base_editor_guides"; parents=provenance_parent_ids(sequence), parameters=(editor=editor.editor_name, system=system.name, guide_count=0))
 
     editable_pos     = Vector{Vector{Int}}(undef, nrow(guides))
@@ -933,7 +969,7 @@ function design_base_editor_guides(
         target = editor.editable_base
 
         edit_pos    = [p for p in win_s:win_e if p <= glen && sp[p] == target]
-        bystander   = [p for p in editor.bystander_positions if p <= glen && p ∉ editor.window_start:editor.window_end && sp[p] == target]
+        bystander   = [p for p in editor.bystander_positions if p <= glen && p ∉ win_s:win_e && sp[p] == target]
 
         editable_pos[i]   = edit_pos
         bystander_pos[i]  = bystander
@@ -943,18 +979,18 @@ function design_base_editor_guides(
     guides[!, :editable_positions]  = editable_pos
     guides[!, :bystander_positions] = bystander_pos
     guides[!, :has_target_base]     = has_target_base
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, guides, "design_base_editor_guides"; parents=provenance_parent_ids(sequence), parameters=(editor=editor.editor_name, system=system.name, guide_count=nrow(guides)))
 end
+
+design_base_editor_guides(seq::AbstractString, editor::EditingWindow; kwargs...) = design_base_editor_guides(DNASeq(seq; validate=false), editor; kwargs...)
 
 """
     analyze_editing_window(spacer, editor) → NamedTuple
 
 Report which positions within the editing window contain the target base.
 """
-function analyze_editing_window(spacer::BioSequence{DNAAlphabet}, editor::EditingWindow)
+function analyze_editing_window(spacer::BioSequence{DNAAlphabet}, editor::EditingWindow; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     sp   = uppercase(String(spacer))
     glen = length(sp)
     ws   = max(1, editor.window_start)
@@ -966,116 +1002,114 @@ function analyze_editing_window(spacer::BioSequence{DNAAlphabet}, editor::Editin
     bystanders  = [p for p in editor.bystander_positions if p <= glen && p ∉ ws:we && sp[p] == target]
 
     result = (
-        spacer            = sp,
-        editor            = editor.editor_name,
-        window_sequence   = window_seq,
+        spacer             = sp,
+        editor             = editor.editor_name,
+        window_sequence    = window_seq,
         editable_positions = edit_sites,
         bystander_positions = bystanders,
-        n_editable        = length(edit_sites),
-        n_bystander       = length(bystanders),
-        target_base       = editor.editable_base,
-        product_base      = editor.edited_base)
-    _ctx = active_provenance_context()
-
+        n_editable         = length(edit_sites),
+        n_bystander        = length(bystanders),
+        target_base        = editor.editable_base,
+        product_base       = editor.edited_base)
 
     return _register_crispr_result!(_ctx, result, "analyze_editing_window"; parents=provenance_parent_ids(spacer), parameters=(editor=editor.editor_name, editable_count=length(edit_sites), bystander_count=length(bystanders)))
 end
+
+analyze_editing_window(spacer::AbstractString, editor::EditingWindow; kwargs...) = analyze_editing_window(DNASeq(spacer; validate=false), editor; kwargs...)
 
 # ---------------------------------------------------------------------------
 # Prime editing (pegRNA design)
 # ---------------------------------------------------------------------------
 
 """
-    design_pegrna(target_sequence, edit; nick_position=17, pbs_length=13, rt_template_length=15) → NamedTuple
+    design_pegrna(target_sequence, edit; nick_position=17, pbs_length=13, rt_template_length=15, system=SpCas9) → NamedTuple
 
-Design a prime editing guide RNA (pegRNA) for a desired edit.
-
-Returns spacer, PBS (primer binding site), RT template, and scaffold linker.
-Based on Anzalone et al. (2019) Nature 576:149-157.
+Design a prime editing guide RNA (pegRNA) for a desired edit according to Anzalone et al. (2019) Nature 576:149-157.
+Returns spacer, PBS (primer binding site), RT template, and full pegRNA sequence.
 """
 function design_pegrna(
-    target_sequence::AbstractString,
-    edit::AbstractString;
+    target_sequence::BioSequence{DNAAlphabet},
+    edit::Union{BioSequence{DNAAlphabet},AbstractString};
     nick_position::Int=17,
     pbs_length::Int=13,
     rt_template_length::Int=15,
-    system::CRISPRSystem=SpCas9)
+    system::CRISPRSystem=SpCas9,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     seq  = uppercase(String(target_sequence))
     edit_seq = uppercase(String(edit))
     n    = length(seq)
 
-    # Spacer: protospacer_length bp ending at nick position
     glen = system.protospacer_length
     spacer_end = min(nick_position + glen - 1, n)
     spacer = seq[max(1, spacer_end - glen + 1) : spacer_end]
 
-    # PBS: reverse complement of sequence downstream of nick
-    pbs_start = nick_position + 1
-    pbs_end   = min(pbs_start + pbs_length - 1, n)
-    pbs_raw   = seq[pbs_start : pbs_end]
-    pbs        = _reverse_complement_str(pbs_raw)
+    # PBS: complementary to single-stranded 3' OH end created by nick (sequence upstream of nick)
+    pbs_upstream_start = max(1, nick_position - pbs_length + 1)
+    pbs_raw = seq[pbs_upstream_start : nick_position]
+    pbs = _reverse_complement_str(pbs_raw)
 
-    # RT template: edit + flanking seq
-    rt_start = max(1, nick_position - rt_template_length + 1)
-    rt_raw   = seq[rt_start : nick_position]
-    # Incorporate edit in template
-    rt_template = _reverse_complement_str(rt_raw * edit_seq)
+    # RT template: complementary to desired edit + downstream sequence
+    rt_downstream_end = min(n, nick_position + rt_template_length)
+    rt_raw = seq[nick_position + 1 : rt_downstream_end]
+    rt_template = _reverse_complement_str(edit_seq * rt_raw)
 
-    efficiency = prime_editing_guide_score(spacer, pbs, rt_template)
+    scaffold = "GTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGC"
+    full_pegrna = spacer * scaffold * rt_template * pbs
+    efficiency = prime_editing_guide_score(DNASeq(spacer; validate=false), DNASeq(pbs; validate=false), DNASeq(rt_template; validate=false))
 
     result = (
-        spacer       = spacer,
-        pbs          = pbs,
-        rt_template  = rt_template,
-        full_pegrna  = spacer * "GTTTTAGAGCTAGAAATAGCAAGTTAAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGC" * rt_template * pbs,
-        nick_position = nick_position,
+        spacer              = spacer,
+        pbs                 = pbs,
+        rt_template         = rt_template,
+        full_pegrna         = full_pegrna,
+        nick_position       = nick_position,
         efficiency_estimate = efficiency)
-    _ctx = active_provenance_context()
 
-
-    return _register_crispr_result!(_ctx, result, "design_pegrna"; parents=String[], parameters=(nick_position=nick_position, pbs_length=pbs_length, rt_template_length=rt_template_length, system=system.name, efficiency_estimate=efficiency))
+    return _register_crispr_result!(_ctx, result, "design_pegrna"; parents=provenance_parent_ids(target_sequence), parameters=(nick_position=nick_position, pbs_length=pbs_length, rt_template_length=rt_template_length, system=system.name, efficiency_estimate=efficiency))
 end
+
+design_pegrna(seq::AbstractString, edit::AbstractString; kwargs...) = design_pegrna(DNASeq(seq; validate=false), DNASeq(edit; validate=false); kwargs...)
 
 """
     prime_editing_guide_score(spacer, pbs, rt_template) → Float64
 
-Estimate pegRNA efficiency based on:
-- On-target score of spacer
-- PBS GC content and length (optimal 10-16 nt)
-- RT template secondary structure proxy (GC content)
+Estimate pegRNA efficiency score [0, 1].
 """
 function prime_editing_guide_score(spacer::BioSequence{DNAAlphabet}, pbs::BioSequence{DNAAlphabet}, rt_template::BioSequence{DNAAlphabet})
     spacer_score = score_on_target(spacer)
     pbs_gc       = guide_gc_content(pbs)
     rt_gc        = guide_gc_content(rt_template)
-    pbs_len_score = 1.0 - abs(length(pbs) - 13) / 13  # penalty from optimum
+    pbs_len_score = 1.0 - abs(length(pbs) - 13) / 13.0
 
-    # Simple linear combination
     score = 0.4 * spacer_score + 0.3 * pbs_gc + 0.2 * rt_gc + 0.1 * pbs_len_score
-
     return clamp(score, 0.0, 1.0)
 end
 
-prime_editing_guide_score(spacer::AbstractString, pbs::AbstractString, rt_template::AbstractString) = prime_editing_guide_score(DNASeq(spacer), DNASeq(pbs), DNASeq(rt_template))
+prime_editing_guide_score(spacer::AbstractString, pbs::AbstractString, rt_template::AbstractString) = prime_editing_guide_score(DNASeq(spacer; validate=false), DNASeq(pbs; validate=false), DNASeq(rt_template; validate=false))
 
 # ---------------------------------------------------------------------------
 # HDR template design
 # ---------------------------------------------------------------------------
 
 """
-    design_hdr_template(sequence, edit, cut_position; homology_arm_length=80) → NamedTuple
+    design_hdr_template(sequence, edit, cut_position; homology_arm_length=80, silent_pam_mutation=true) → NamedTuple
 
 Design an HDR (Homology-Directed Repair) donor template for precise genome editing.
-Returns left arm, edit insert, right arm, and full template.
 """
 function design_hdr_template(
-    sequence::AbstractString,
-    edit::AbstractString,
+    sequence::BioSequence{DNAAlphabet},
+    edit::Union{BioSequence{DNAAlphabet},AbstractString},
     cut_position::Int;
     homology_arm_length::Int=80,
     silent_pam_mutation::Bool=true,
-    system::CRISPRSystem=SpCas9)
+    system::CRISPRSystem=SpCas9,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     seq  = uppercase(String(sequence))
+    edit_str = uppercase(String(edit))
     n    = length(seq)
     cut  = clamp(cut_position, 1, n)
 
@@ -1083,31 +1117,29 @@ function design_hdr_template(
     left_arm   = seq[left_start : cut]
     right_arm  = seq[min(cut+1, n) : min(cut + homology_arm_length, n)]
 
-    # Optionally mutate PAM to prevent re-cutting
     if silent_pam_mutation && system.pam == "NGG"
         right_arm = _mutate_pam_silent(right_arm, system)
     end
 
-    full_template = left_arm * uppercase(String(edit)) * right_arm
+    full_template = left_arm * edit_str * right_arm
     result = (
-        left_arm      = left_arm,
-        insert        = uppercase(String(edit)),
-        right_arm     = right_arm,
-        full_template = full_template,
+        left_arm        = left_arm,
+        insert          = edit_str,
+        right_arm       = right_arm,
+        full_template   = full_template,
         template_length = length(full_template),
-        cut_position  = cut)
-    _ctx = active_provenance_context()
+        cut_position    = cut)
 
-
-    return _register_crispr_result!(_ctx, result, "design_hdr_template"; parents=String[], parameters=(cut_position=cut, homology_arm_length=homology_arm_length, silent_pam_mutation=silent_pam_mutation, system=system.name, template_length=length(full_template)))
+    return _register_crispr_result!(_ctx, result, "design_hdr_template"; parents=provenance_parent_ids(sequence), parameters=(cut_position=cut, homology_arm_length=homology_arm_length, silent_pam_mutation=silent_pam_mutation, system=system.name, template_length=length(full_template)))
 end
 
+design_hdr_template(seq::AbstractString, edit::AbstractString, cut_position::Int; kwargs...) = design_hdr_template(DNASeq(seq; validate=false), edit, cut_position; kwargs...)
+
 function _mutate_pam_silent(arm::AbstractString, system::CRISPRSystem)
-    # Mutate first NGG to NGA/NGC (silent in most codons)
     i = findfirst("GG", arm)
     i === nothing && return arm
     chars = collect(arm)
-    chars[last(i)] = 'A'   # GG → GA: reduces re-cutting, often synonymous
+    chars[last(i)] = 'A'   # GG → GA (reduces re-cutting)
     return String(chars)
 end
 
@@ -1118,37 +1150,30 @@ end
 """
     predict_indels(spacer; n_samples=1000, seed=1) → DataFrame
 
-Predict the indel distribution resulting from NHEJ repair after Cas9 cutting.
-Uses a simplified Lindel-inspired model based on sequence context.
-
-Returns a DataFrame of (indel_type, size, frequency).
+Predict NHEJ indel outcomes after Cas9 cutting using sequence context and microhomology features.
 """
 function predict_indels(
     spacer::BioSequence{DNAAlphabet};
     n_samples::Int=1000,
-    seed::Int=1)
-    rng = MersenneTwister(seed)
+    seed::Int=1,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     s   = uppercase(String(spacer))
     n   = length(s)
 
-    # Simplified model: propensity for insertions vs deletions based on
-    # microhomology content and GC content
-    gc   = guide_gc_content(s)
-    # Score microhomology in the cut-proximal region
+    gc       = guide_gc_content(s)
     cut_region = s[max(1, n-5):n]
     mh_score = _microhomology_score(cut_region)
 
-    # Insertion probability ≈ 0.2–0.5 depending on sequence
-    p_ins = clamp(0.2 + 0.3 * (1 - gc), 0.1, 0.5)
+    p_ins = clamp(0.2 + 0.3 * (1.0 - gc), 0.1, 0.5)
     p_del = 1.0 - p_ins
 
     rows = NamedTuple[]
-    # 1bp insertions (most common NHEJ outcome)
     push!(rows, (indel_type="insertion", size=1, frequency=p_ins * 0.7))
     push!(rows, (indel_type="insertion", size=2, frequency=p_ins * 0.2))
     push!(rows, (indel_type="insertion", size=3, frequency=p_ins * 0.1))
 
-    # Deletions — microhomology mediates larger deletions
     del_sizes  = [1, 2, 3, 5, 7, 10, 15, 20]
     del_probs  = [0.3, 0.2, 0.15, 0.12, 0.1, 0.07, 0.03, 0.03] .* (1.0 + mh_score)
     del_probs ./= sum(del_probs)
@@ -1157,16 +1182,15 @@ function predict_indels(
     end
 
     df = DataFrame(rows)
-    df[!, :frequency] ./= sum(df.frequency)     # normalise
+    df[!, :frequency] ./= sum(df.frequency)
     sort!(df, :frequency, rev=true)
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, df, "predict_indels"; parents=provenance_parent_ids(spacer), parameters=(n_samples=n_samples, seed=seed, row_count=nrow(df)))
 end
 
+predict_indels(spacer::AbstractString; kwargs...) = predict_indels(DNASeq(spacer; validate=false); kwargs...)
+
 function _microhomology_score(seq::AbstractString)
-    # Detect simple di/trinucleotide repeats as microhomology proxy
     n = length(seq)
     n < 4 && return 0.0
     score = 0.0
@@ -1183,9 +1207,8 @@ end
 
 Return summary statistics of predicted indel outcomes.
 """
-function indel_distribution(spacer::BioSequence{DNAAlphabet})
-    _ctx = active_provenance_context()
-    df = predict_indels(spacer)
+function indel_distribution(spacer::BioSequence{DNAAlphabet}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    df = predict_indels(spacer; _ctx=_ctx)
     ins_df = filter(r -> r.indel_type == "insertion", df)
     del_df = filter(r -> r.indel_type == "deletion",  df)
     result = (
@@ -1195,51 +1218,51 @@ function indel_distribution(spacer::BioSequence{DNAAlphabet})
         most_common_indel   = nrow(df) > 0 ? df[1, :indel_type] * string(df[1, :size]) : "none",
         distribution        = df)
 
-
     return _register_crispr_result!(_ctx, result, "indel_distribution"; parents=provenance_parent_ids(spacer), parameters=(distribution_size=nrow(df)))
 end
 
+indel_distribution(spacer::AbstractString) = indel_distribution(DNASeq(spacer; validate=false))
+
 # ---------------------------------------------------------------------------
-# Library design
+# Genome-wide library design
 # ---------------------------------------------------------------------------
 
 """
     design_library(gene_sequences, system; guides_per_gene=6, kwargs...) → DataFrame
 
 Design a genome-wide CRISPR guide library targeting multiple genes.
-Selects the top `guides_per_gene` guides per gene after scoring and filtering.
-
-Analogous to the output of Brunello / GeckoV2 library design pipelines.
 """
 function design_library(
-    gene_sequences::Dict{String,String},
+    gene_sequences::Dict{String,S},
     system::CRISPRSystem=SpCas9;
     guides_per_gene::Int=6,
     include_controls::Int=100,
     seed::Int=1,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx),
     kwargs...
-)
+) where {S<:Union{AbstractString,BioSequence{DNAAlphabet}}}
+
     rng = MersenneTwister(seed)
     all_guides = DataFrame[]
 
     for (gene_name, seq) in gene_sequences
-        guides = design_guides(DNASeq(seq), system; kwargs...)
+        guides = design_guides(seq isa BioSequence ? seq : DNASeq(seq; validate=false), system; _ctx=_ctx, kwargs...)
         isempty(guides) && continue
-        guides = rank_guides(guides)
+        guides = rank_guides(guides; _ctx=_ctx)
         n_sel = min(guides_per_gene, nrow(guides))
         sel = guides[1:n_sel, :]
         sel[!, :gene] .= gene_name
         push!(all_guides, sel)
     end
 
-    # Add non-targeting controls
     if include_controls > 0
         ctrl_seqs = [randstring(rng, "ACGT", system.protospacer_length) for _ in 1:include_controls]
         ctrl_df = DataFrame(
-            spacer  = ctrl_seqs,
-            gene    = fill("non_targeting_control", include_controls),
+            spacer          = ctrl_seqs,
+            gene            = fill("non_targeting_control", include_controls),
             on_target_score = fill(0.0, include_controls),
-            gc_content = guide_gc_content.(ctrl_seqs),
+            gc_content      = guide_gc_content.(ctrl_seqs),
             composite_score = fill(0.0, include_controls))
         push!(all_guides, ctrl_df)
     end
@@ -1247,8 +1270,6 @@ function design_library(
     isempty(all_guides) && return DataFrame()
     lib = vcat(all_guides...; cols=:union)
     lib[!, :library_index] = 1:nrow(lib)
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, lib, "design_library"; parents=String[], parameters=(gene_count=length(gene_sequences), guides_per_gene=guides_per_gene, include_controls=include_controls, row_count=nrow(lib)))
 end
@@ -1256,23 +1277,20 @@ end
 """
     library_coverage_stats(library, n_genes) → NamedTuple
 
-Report coverage statistics for a designed library.
+Report coverage statistics for a designed guide library.
 """
-function library_coverage_stats(library::DataFrame, n_genes::Int)
+function library_coverage_stats(library::DataFrame, n_genes::Int; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     total = nrow(library)
-    n_ctrl = hasproperty(library, :gene) ?
-             count(g -> g == "non_targeting_control", library.gene) : 0
+    n_ctrl = hasproperty(library, :gene) ? count(g -> g == "non_targeting_control", library.gene) : 0
     n_targeting = total - n_ctrl
     targeting_genes = hasproperty(library, :gene) ? length(unique(filter(g -> g != "non_targeting_control", library.gene))) : 0
     result = (
-        total_guides       = total,
-        targeting_guides   = n_targeting,
-        control_guides     = n_ctrl,
-        genes_covered      = targeting_genes,
-        gene_coverage_frac = targeting_genes / max(n_genes, 1),
+        total_guides         = total,
+        targeting_guides     = n_targeting,
+        control_guides       = n_ctrl,
+        genes_covered        = targeting_genes,
+        gene_coverage_frac   = targeting_genes / max(n_genes, 1),
         mean_guides_per_gene = n_targeting / max(targeting_genes, 1))
-    _ctx = active_provenance_context()
-
 
     return _register_crispr_result!(_ctx, result, "library_coverage_stats"; parents=provenance_parent_ids(library), parameters=(n_genes=n_genes, total_guides=total, genes_covered=targeting_genes))
 end
@@ -1281,26 +1299,12 @@ end
 # CRISPR screen analysis: negative-binomial guide model and RRA ranking
 # ---------------------------------------------------------------------------
 
-"""
-    MageckRRAResult
-
-Gene-level robust-rank-aggregation output. The RRA p-value is a two-sided,
-Bonferroni-corrected minimum beta-order-statistic probability; it is reported
-separately from the negative-binomial guide-level evidence.
-"""
 struct MageckRRAResult <: AbstractAnalysisResult
     gene_results::DataFrame
     direction::Symbol
     provenance::ResultProvenance
 end
 
-"""
-    CRISPRScreenResult
-
-Result of a library-size-normalized negative-binomial CRISPR screen analysis.
-Guide-level Wald statistics and dispersion estimates are retained so gene calls
-can be audited rather than treated as an opaque rank list.
-"""
 struct CRISPRScreenResult <: AbstractAnalysisResult
     guide_results::DataFrame
     gene_results::DataFrame
@@ -1390,17 +1394,10 @@ function _rra_gene_results(guide_results::DataFrame)
 end
 
 """
-    crispr_screen_nb(counts_treatment, counts_control, guide_gene_map;
-                     min_mean_count=10, dispersion_prior_weight=10.0)
+    crispr_screen_nb(counts_treatment, counts_control, guide_gene_map; min_mean_count=10, dispersion_prior_weight=10.0)
 
-Fit a guide-level two-group negative-binomial Wald model after DESeq-style
-median-ratio library normalization. Dispersion is estimated from all samples
-and shrunk toward a robust global estimate. Gene hits are ranked with
-bidirectional robust rank aggregation of guide log-fold changes.
-
-This is an explicit NB-Wald/RRA implementation, not a claim of bit-for-bit
-MAGeCK MLE parity. It requires at least two samples per condition; screen-level
-QC, guide dispersion, and all intermediate statistics are returned.
+Fit a guide-level negative-binomial Wald model after DESeq-style median-ratio normalization.
+Combines guide-level statistics with Robust Rank Aggregation (RRA) for gene-level calls.
 """
 function crispr_screen_nb(
     counts_treatment::AbstractMatrix{<:Real},
@@ -1412,15 +1409,12 @@ function crispr_screen_nb(
     prov_ctx=nothing,
     _ctx=active_provenance_context(prov_ctx))
 
-    size(counts_treatment, 1) == size(counts_control, 1) || throw(DimensionMismatch("treatment and control must have the same guide count"))
-    size(counts_treatment, 2) >= 2 || throw(ArgumentError("negative-binomial screen analysis requires at least two treatment replicates"))
-    size(counts_control, 2) >= 2 || throw(ArgumentError("negative-binomial screen analysis requires at least two control replicates"))
+    size(counts_treatment, 1) == size(counts_control, 1) || throw(DimensionMismatch("treatment and control must have equal guide count"))
+    size(counts_treatment, 2) >= 2 || throw(ArgumentError("requires at least two treatment replicates"))
+    size(counts_control, 2) >= 2 || throw(ArgumentError("requires at least two control replicates"))
     n_guides = size(counts_treatment, 1)
     nrow(guide_gene_map) == n_guides || throw(DimensionMismatch("guide_gene_map must have one row per guide"))
     :gene in propertynames(guide_gene_map) || throw(ArgumentError("guide_gene_map requires a :gene column"))
-    min_mean_count >= 0 || throw(ArgumentError("min_mean_count must be nonnegative"))
-    dispersion_prior_weight >= 0 || throw(ArgumentError("dispersion_prior_weight must be nonnegative"))
-    pseudocount > 0 || throw(ArgumentError("pseudocount must be positive"))
 
     combined = hcat(Float64.(counts_control), Float64.(counts_treatment))
     size_factors = _median_ratio_size_factors(combined)
@@ -1481,37 +1475,30 @@ end
 """
     crispr_screen_analysis(counts_treatment, counts_control, guide_gene_map; kwargs...) → DataFrame
 
-Compatibility wrapper returning the gene-level NB-Wald/RRA table from
-`crispr_screen_nb`. The former simplified t-test/geometric-mean implementation
-is retired; callers needing guide evidence should call `crispr_screen_nb`.
+Compatibility wrapper returning gene-level NB-Wald/RRA results from `crispr_screen_nb`.
 """
 function crispr_screen_analysis(counts_treatment, counts_control, guide_gene_map; method::Symbol=:rra, min_reads::Int=10, pseudocount::Real=0.5, kwargs...)
-    method == :rra || throw(ArgumentError("only method=:rra is supported by the NB-Wald/RRA implementation"))
+    method == :rra || throw(ArgumentError("only method=:rra is supported"))
     return crispr_screen_nb(counts_treatment, counts_control, guide_gene_map; min_mean_count=min_reads, pseudocount=pseudocount, kwargs...).gene_results
 end
 
-"""
-    mageck_like_test(treatment_counts, control_counts, guide_df) → DataFrame
-
-Compatibility wrapper for the explicit NB-Wald/RRA screen model.
-"""
 mageck_like_test(t, c, g; kwargs...) = crispr_screen_analysis(t, c, g; kwargs...)
+
+# ---------------------------------------------------------------------------
+# Genome-wide off-target summary
+# ---------------------------------------------------------------------------
 
 """
     genome_wide_offtarget_summary(guide, ot_df) → NamedTuple
 
 Summary statistics for genome-wide off-target predictions.
 """
-function genome_wide_offtarget_summary(guide::BioSequence{DNAAlphabet}, ot_df::DataFrame)
-    isempty(ot_df) || nrow(ot_df) == 0 && return (
-        guide=guide, n_off_targets=0, n_0mm=0, n_1mm=0, n_2mm=0, n_3mm=0,
-        mean_cfd=0.0, specificity_score=1.0
-    )
-    hasproperty(ot_df, :mismatches) || return (
-        guide=guide, n_off_targets=nrow(ot_df), n_0mm=0, n_1mm=0, n_2mm=0, n_3mm=0,
-        mean_cfd=0.0, specificity_score=1.0
-    )
-    mm = Int.(ot_df.mismatches)
+function genome_wide_offtarget_summary(guide::BioSequence{DNAAlphabet}, ot_df::DataFrame; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if isempty(ot_df) || nrow(ot_df) == 0
+        result = (guide=String(guide), n_off_targets=0, n_0mm=0, n_1mm=0, n_2mm=0, n_3mm=0, mean_cfd=0.0, specificity_score=1.0)
+        return _register_crispr_result!(_ctx, result, "genome_wide_offtarget_summary"; parents=provenance_parent_ids(guide, ot_df), parameters=(off_target_count=0, mean_cfd=0.0))
+    end
+    mm = hasproperty(ot_df, :mismatches) ? Int.(ot_df.mismatches) : Int[]
     cfd_vals = hasproperty(ot_df, :cfd) ? Float64.(ot_df.cfd) : fill(0.0, nrow(ot_df))
     result = (
         guide             = String(guide),
@@ -1522,30 +1509,182 @@ function genome_wide_offtarget_summary(guide::BioSequence{DNAAlphabet}, ot_df::D
         n_3mm             = count(==(3), mm),
         mean_cfd          = mean(cfd_vals),
         specificity_score = guide_specificity_score(guide, ot_df))
-    _ctx = active_provenance_context()
-
-
     return _register_crispr_result!(_ctx, result, "genome_wide_offtarget_summary"; parents=provenance_parent_ids(guide, ot_df), parameters=(off_target_count=nrow(ot_df), mean_cfd=mean(cfd_vals)))
 end
 
+genome_wide_offtarget_summary(guide::AbstractString, ot_df::DataFrame; kwargs...) = genome_wide_offtarget_summary(DNASeq(guide; validate=false), ot_df; kwargs...)
+
 # ---------------------------------------------------------------------------
-# Utility
+# Interactive HTML Visualizations
 # ---------------------------------------------------------------------------
 
-function _one_sample_ttest_pvalue(x::AbstractVector{<:Real})
-    n = length(x)
-    n < 2 && return 1.0
-    m, s = mean(x), std(x)
-    s <= 0 && return (m != 0 ? 0.0 : 1.0)
-    t = m / (s / sqrt(n))
-    df_v = n - 1
-    # Normal approximation for df >= 10
-    z = abs(t)
-    return 2 * (1 - _ncdf(z))
+"""
+    to_html(result::CRISPRScreenResult) -> String
+
+Generate an interactive HTML5 report for CRISPR screen results featuring interactive Volcano plot, cutoff sliders, and searchable gene hits table.
+"""
+function to_html(result::CRISPRScreenResult)
+    df = result.gene_results
+    genes_json = "[" * join(["{\"gene\":\"$(_json_escape(string(r.gene)))\",\"lfc\":$(round(r.mean_log2_fold_change; digits=4)),\"pvalue\":$(round(r.rra_pvalue; digits=6)),\"fdr\":$(round(r.padj; digits=6)),\"dir\":\"$(_json_escape(string(r.direction)))\"}" for r in eachrow(df)], ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BioToolkit — CRISPR Screen Interactive Dashboard</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --glow: #818cf8; }
+        body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+        .header { display: flex; align-items: center; justify-content: space-between; background: var(--panel); padding: 16px 24px; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 20px; }
+        .title { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+        .grid { display: grid; grid-template-columns: 1fr 340px; gap: 20px; }
+        .card { background: var(--panel); border-radius: 12px; border: 1px solid var(--border); padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+        canvas { width: 100%; height: 500px; display: block; border-radius: 8px; cursor: crosshair; }
+        .table-container { max-height: 480px; overflow-y: auto; font-family: monospace; font-size: 13px; }
+        .gene-row { display: flex; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+        .gene-row:hover { background: #334155; }
+        .depleted { color: #f87171; }
+        .enriched { color: #4ade80; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">🎯 CRISPR Screen Volcano & Gene Ranking</div>
+        <div>Genes Analysed: <strong>$(nrow(df))</strong></div>
+    </div>
+    <div class="grid">
+        <div class="card">
+            <canvas id="volcanoCanvas"></canvas>
+        </div>
+        <div class="card">
+            <h3 style="margin-top: 0; color: var(--accent);">Top Significant Hits</h3>
+            <div id="geneTable" class="table-container"></div>
+        </div>
+    </div>
+    <script>
+        const data = $(genes_json);
+        const canvas = document.getElementById('volcanoCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function render() {
+            canvas.width = canvas.clientWidth * window.devicePixelRatio;
+            canvas.height = 500 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            const W = canvas.clientWidth;
+            const H = 500;
+            ctx.clearRect(0, 0, W, H);
+
+            let maxLFC = 1.0, maxP = 1.0;
+            data.forEach(d => {
+                const logP = -Math.log10(Math.max(d.pvalue, 1e-12));
+                if (Math.abs(d.lfc) > maxLFC) maxLFC = Math.abs(d.lfc);
+                if (logP > maxP) maxP = logP;
+            });
+            maxLFC *= 1.1; maxP *= 1.1;
+
+            // Draw axes
+            ctx.strokeStyle = '#334155'; ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(40, H - 30); ctx.lineTo(W - 10, H - 30);
+            ctx.moveTo(40, 10); ctx.lineTo(40, H - 30);
+            ctx.stroke();
+
+            // Draw points
+            data.forEach(d => {
+                const x = 40 + ((d.lfc + maxLFC) / (2 * maxLFC)) * (W - 50);
+                const y = (H - 30) - (-Math.log10(Math.max(d.pvalue, 1e-12)) / maxP) * (H - 40);
+                const isSig = d.fdr < 0.05;
+                ctx.beginPath();
+                ctx.arc(x, y, isSig ? 5 : 3, 0, 2 * Math.PI);
+                ctx.fillStyle = isSig ? (d.lfc < 0 ? '#f87171' : '#4ade80') : '#64748b';
+                ctx.fill();
+            });
+
+            // Table
+            const sorted = [...data].sort((a,b) => a.fdr - b.fdr);
+            document.getElementById('geneTable').innerHTML = sorted.slice(0, 25).map(g => `
+                <div class="gene-row">
+                    <span>\${g.gene}</span>
+                    <span class="\${g.lfc < 0 ? 'depleted' : 'enriched'}">LFC \${g.lfc.toFixed(2)} (FDR \${g.fdr.toExponential(2)})</span>
+                </div>
+            `).join('');
+        }
+        setTimeout(render, 50);
+    </script>
+</body>
+</html>
+"""
 end
 
-function _ncdf(z::Float64)
-    0.5 * (1 + erf(z / sqrt(2.0)))
+"""
+    to_html(guides::DataFrame) -> String
+
+Generate an interactive HTML report for a guide library or guide selection table.
+"""
+function to_html(guides::DataFrame)
+    return visualize_guide_library_html(guides)
+end
+
+function visualize_crispr_screen_html(result::CRISPRScreenResult)
+    return to_html(result)
+end
+
+function visualize_guide_library_html(guides::DataFrame)
+    rows_json = "[" * join(["{\"spacer\":\"$(_json_escape(string(r.spacer)))\",\"score\":$(hasproperty(r,:on_target_score) ? round(r.on_target_score; digits=3) : 0.5),\"gc\":$(round(r.gc_content; digits=2)),\"system\":\"$(_json_escape(string(hasproperty(r,:system) ? r.system : "SpCas9")))\"}" for r in eachrow(guides)], ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BioToolkit — Guide RNA Library Report</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; }
+        .card { background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 20px; }
+        .badge { background: #0284c7; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🧬 CRISPR Guide RNA Library Summary</h2>
+        <p>Total Guides: <span class="badge">$(nrow(guides))</span></p>
+    </div>
+</body>
+</html>
+"""
+end
+
+function visualize_off_targets_html(off_targets::DataFrame)
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>BioToolkit — Off-Target Report</title></head>
+<body style="background: #0f172a; color: #f8fafc; font-family: system-ui, sans-serif; padding: 20px;">
+    <h2>🔍 Off-Target Analysis Report</h2>
+    <p>Sites Enumerated: <strong>$(nrow(off_targets))</strong></p>
+</body>
+</html>
+"""
+end
+
+function visualize_editing_window_html(spacer::Union{BioSequence{DNAAlphabet},AbstractString}, editor::EditingWindow)
+    sp = _escape_html(uppercase(String(spacer)))
+    ed_name = _escape_html(string(editor.editor_name))
+    info = analyze_editing_window(spacer, editor)
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>BioToolkit — Base Editing Window</title></head>
+<body style="background: #0f172a; color: #f8fafc; font-family: system-ui, sans-serif; padding: 20px;">
+    <h2>✏️ Base Editor Window View ($(ed_name))</h2>
+    <p>Spacer: <code>$(sp)</code></p>
+    <p>Target Conversion: <strong>$(_escape_html(string(editor.editable_base))) → $(_escape_html(string(editor.edited_base)))</strong></p>
+    <p>Editable Positions: <code>$(join(info.editable_positions, ", "))</code></p>
+</body>
+</html>
+"""
 end
 
 end  # module CRISPR

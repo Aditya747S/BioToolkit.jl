@@ -8,7 +8,14 @@ using SpecialFunctions
 using Printf
 using BGZFStreams
 using BigWig
+using SHA
 function shannon_entropy end
+function to_html end
+function export_html(obj::Any, path::String)
+    html_content = to_html(obj)
+    write(path, html_content)
+    return path
+end
 
 include("analysisresults.jl")
 include("biotypes.jl")
@@ -101,7 +108,7 @@ using .Enrichment: IDMapper, EnrichmentTerm, EnrichmentDatabase, EnrichmentResul
 using .Coevolution: ContactMap, PseudoLikelihoodModel, filter_alignment_for_dca, sequence_reweighting, fit_pseudolikelihood_model, compute_contact_scores, predict_contact_map, top_contact_pairs, fold_from_contacts, mutual_information_contacts, direct_information_contacts, column_conservation_scores, sequence_logo_entropy, evolutionary_coupling_network, contact_enrichment_statistics, shrinkage_precision_contacts, phylogenetic_correction, positional_covariation_matrix, gap_analysis, contact_precision_recall, alignment_quality_report
 using .SCOP: SCOPRecord, read_scop_records, parse_scop_record
 using .CATH: CATHRecord, read_cath_records, parse_cath_record
-using .CRISPR: GuideRNA, CRISPRSystem, OffTarget, EditingWindow, FMIndex, OffTargetIndex, OffTargetSearchDiagnostics, SpCas9, SaCas9, Cas12a, CasX, SpRY, BE3, ABE8e, CBE4max, MageckRRAResult, CRISPRScreenResult, build_offtarget_index, design_guides, score_on_target, find_pam_sites, enumerate_off_targets, cfd_score, mit_score, guide_gc_content, design_base_editor_guides, analyze_editing_window, design_pegrna, prime_editing_guide_score, crispr_screen_analysis, mageck_like_test, crispr_screen_nb, design_library, library_coverage_stats, design_hdr_template, predict_indels, indel_distribution, filter_guides, rank_guides, guide_specificity_score, genome_wide_offtarget_summary, pam_matches
+using .CRISPR: GuideRNA, CRISPRSystem, OffTarget, EditingWindow, FMIndex, OffTargetIndex, OffTargetSearchDiagnostics, SpCas9, SaCas9, Cas12a, CasX, SpRY, Cas13a, Cas13b, BE3, ABE8e, CBE4max, MageckRRAResult, CRISPRScreenResult, build_offtarget_index, design_guides, score_on_target, find_pam_sites, enumerate_off_targets, cfd_score, mit_score, guide_gc_content, design_base_editor_guides, analyze_editing_window, design_pegrna, prime_editing_guide_score, crispr_screen_analysis, mageck_like_test, crispr_screen_nb, design_library, library_coverage_stats, design_hdr_template, predict_indels, indel_distribution, filter_guides, rank_guides, guide_specificity_score, genome_wide_offtarget_summary, pam_matches, visualize_crispr_screen_html, visualize_guide_library_html, visualize_off_targets_html, visualize_editing_window_html
 
 include("browser.jl")
 

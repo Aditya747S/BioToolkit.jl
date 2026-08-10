@@ -2379,3 +2379,656 @@ function _pairwise_traceback_affine(
 
   return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
 end
+
+# ==============================================================================
+# Interactive HTML5/Canvas Visualizers for Alignment Module
+# ==============================================================================
+
+"""
+    _escape_html(s)
+
+Escape a string for safe interpolation into HTML markup.
+"""
+function _escape_html(s::AbstractString)
+    s = replace(s, '&' => "&amp;")
+    s = replace(s, '<' => "&lt;")
+    s = replace(s, '>' => "&gt;")
+    s = replace(s, '"' => "&quot;")
+    s = replace(s, '\'' => "&#39;")
+    return s
+end
+
+"""
+    _json_escape(s)
+
+Escape a string for inclusion inside a JSON literal embedded in a `<script>` tag.
+"""
+@inline function _json_escape(s::AbstractString)
+    s = escape_string(s)
+    s = replace(s, "</" => "<\\/")
+    return s
+end
+
+function _alignment_to_json(res::PairwiseAlignmentResult)
+    left_str = _json_escape(String(res.left))
+    right_str = _json_escape(String(res.right))
+    return "{\"left\":\"$left_str\",\"right\":\"$right_str\",\"score\":$(res.score),\"matches\":$(res.matches),\"identity\":$(res.identity)}"
+end
+
+"""
+    visualize_alignment_html(res::PairwiseAlignmentResult; title="Pairwise Sequence Alignment") -> String
+
+Generate an interactive HTML5/Canvas visualization for pairwise sequence alignment results.
+Displays aligned sequences with residue color-coding, consensus match marks, hover tooltips, and linear sequence viewport controls.
+"""
+function visualize_alignment_html(res::PairwiseAlignmentResult; title::String="Pairwise Sequence Alignment")
+    aln_len = length(res.left)
+    ident_pct = round(res.identity * 100, digits=1)
+    ident_color = ident_pct >= 80.0 ? "#10b981" : ident_pct >= 50.0 ? "#f59e0b" : "#ef4444"
+    aln_json = _alignment_to_json(res)
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title))</title>
+    <style>
+        :root {
+            --bg: #0f172a; --panel: #1e293b; --border: #334155;
+            --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+            --a: #10b981; --c: #3b82f6; --g: #f59e0b; --t: #ef4444; --gap: #64748b;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .title { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin: 0 0 12px 0; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .meta-item { background: rgba(15,23,42,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+        .meta-label { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
+        .meta-val { font-size: 1.1rem; font-weight: 600; color: var(--text); margin-top: 2px; }
+        canvas { width: 100%; height: 280px; display: block; border-radius: 8px; background: #0b1329; }
+        .controls { display: flex; gap: 14px; align-items: center; margin-bottom: 14px; }
+        .btn { background: #3b82f6; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        .btn:hover { background: #2563eb; }
+        .legend { display: flex; gap: 16px; font-weight: 600; font-size: 0.85rem; margin-top: 12px; }
+        .leg-item { display: flex; align-items: center; gap: 6px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">⚔️ $(_escape_html(title))</div>
+        <div class="meta-grid">
+            <div class="meta-item"><div class="meta-label">Alignment Score</div><div class="meta-val">$(res.score)</div></div>
+            <div class="meta-item"><div class="meta-label">Identity</div><div class="meta-val" style="color:$(ident_color)">$(ident_pct)%</div></div>
+            <div class="meta-item"><div class="meta-label">Matches</div><div class="meta-val">$(res.matches) / $(aln_len)</div></div>
+            <div class="meta-item"><div class="meta-label">Aligned Length</div><div class="meta-val">$(aln_len) bp</div></div>
+        </div>
+
+        <div class="controls">
+            <label style="font-size:0.88rem; color:var(--muted)">Scroll Position:</label>
+            <input type="range" id="posSlider" min="0" max="100" value="0" style="flex:1;" oninput="drawAlignment()">
+            <label style="font-size:0.88rem; color:var(--muted)">Window:</label>
+            <select id="winSelect" onchange="drawAlignment()" style="background:#0f172a; color:#fff; border:1px solid var(--border); padding:6px 10px; border-radius:6px;">
+                <option value="40">40 bp</option>
+                <option value="80" selected>80 bp</option>
+                <option value="120">120 bp</option>
+            </select>
+        </div>
+
+        <canvas id="alnCanvas"></canvas>
+
+        <div class="legend">
+            <div class="leg-item"><span class="dot" style="background:var(--a)"></span> A</div>
+            <div class="leg-item"><span class="dot" style="background:var(--c)"></span> C</div>
+            <div class="leg-item"><span class="dot" style="background:var(--g)"></span> G</div>
+            <div class="leg-item"><span class="dot" style="background:var(--t)"></span> T / U</div>
+            <div class="leg-item"><span class="dot" style="background:var(--gap)"></span> Gap (-)</div>
+        </div>
+    </div>
+
+    <script>
+        const aln = $(aln_json);
+        const canvas = document.getElementById('alnCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function getColor(b) {
+            const u = b.toUpperCase();
+            if (u === 'A') return '#10b981';
+            if (u === 'C') return '#3b82f6';
+            if (u === 'G') return '#f59e0b';
+            if (u === 'T' || u === 'U') return '#ef4444';
+            if (u === '-') return '#64748b';
+            return '#38bdf8';
+        }
+
+        function drawAlignment() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 280 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const w = canvas.parentElement.clientWidth;
+            const h = 280;
+            ctx.clearRect(0, 0, w, h);
+
+            const alnLen = aln.left.length;
+            if (alnLen === 0) return;
+
+            const winSize = parseInt(document.getElementById('winSelect').value);
+            const sliderVal = parseInt(document.getElementById('posSlider').value);
+            const startIdx = Math.floor((sliderVal / 100) * Math.max(0, alnLen - winSize));
+            const endIdx = Math.min(startIdx + winSize, alnLen);
+
+            const step = (w - 100) / (endIdx - startIdx);
+
+            ctx.font = 'bold 12px monospace';
+            ctx.textAlign = 'center';
+
+            // Labels
+            ctx.fillStyle = '#94a3b8';
+            ctx.textAlign = 'left';
+            ctx.fillText('Seq 1:', 20, 65);
+            ctx.fillText('Match:', 20, 115);
+            ctx.fillText('Seq 2:', 20, 165);
+
+            for (let i = startIdx; i < endIdx; i++) {
+                const x = 90 + (i - startIdx) * step + step / 2;
+                const b1 = aln.left[i];
+                const b2 = aln.right[i];
+
+                // Seq 1 tile
+                ctx.fillStyle = getColor(b1);
+                ctx.fillRect(x - step/2 + 2, 45, step - 4, 30);
+                ctx.fillStyle = '#ffffff';
+                ctx.textAlign = 'center';
+                ctx.fillText(b1, x, 65);
+
+                // Match symbol
+                if (b1 === b2 && b1 !== '-') {
+                    ctx.fillStyle = '#10b981';
+                    ctx.fillText('|', x, 115);
+                } else if (b1 !== '-' && b2 !== '-') {
+                    ctx.fillStyle = '#ef4444';
+                    ctx.fillText('•', x, 115);
+                } else {
+                    ctx.fillStyle = '#64748b';
+                    ctx.fillText(' ', x, 115);
+                }
+
+                // Seq 2 tile
+                ctx.fillStyle = getColor(b2);
+                ctx.fillRect(x - step/2 + 2, 145, step - 4, 30);
+                ctx.fillStyle = '#ffffff';
+                ctx.fillText(b2, x, 165);
+
+                // Coordinate tick
+                if ((i + 1) % 10 === 0 || i === startIdx) {
+                    ctx.fillStyle = '#64748b';
+                    ctx.font = '10px system-ui';
+                    ctx.fillText((i + 1) + '', x, 210);
+                    ctx.font = 'bold 12px monospace';
+                }
+            }
+        }
+
+        window.addEventListener('resize', drawAlignment);
+        setTimeout(drawAlignment, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+function to_html(res::PairwiseAlignmentResult)
+    return visualize_alignment_html(res)
+end
+
+function _posterior_matrix_to_json(res::PosteriorAlignmentResult)
+    mat = res.posterior_matrix[:, :, 1]
+    M, N = size(mat)
+    step_m = max(1, cld(M, 150))
+    step_n = max(1, cld(N, 150))
+    grid = [round(Float64(mat[i, j]), digits=3) for i in 1:step_m:M, j in 1:step_n:N]
+    rows = [ "[" * join(grid[i, :], ",") * "]" for i in 1:size(grid, 1) ]
+    matrix_json = "[" * join(rows, ",") * "]"
+    aln_json = _alignment_to_json(res.consensus_alignment)
+    return "{\"matrix\":$matrix_json,\"expected_accuracy\":$(res.expected_accuracy),\"log_likelihood\":$(res.log_likelihood),\"consensus\":$aln_json}"
+end
+
+"""
+    visualize_posterior_alignment_html(res::PosteriorAlignmentResult; title="Posterior Alignment Matrix") -> String
+
+Generate an interactive HTML5/Canvas 2D posterior match probability heatmap matrix.
+"""
+function visualize_posterior_alignment_html(res::PosteriorAlignmentResult; title::String="Posterior Alignment Matrix")
+    exp_acc = round(res.expected_accuracy, digits=3)
+    log_lh = round(res.log_likelihood, digits=2)
+    post_json = _posterior_matrix_to_json(res)
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title))</title>
+    <style>
+        :root {
+            --bg: #0f172a; --panel: #1e293b; --border: #334155;
+            --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .title { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin: 0 0 12px 0; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .meta-item { background: rgba(15,23,42,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+        .meta-label { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); }
+        .meta-val { font-size: 1.1rem; font-weight: 600; color: var(--text); margin-top: 2px; }
+        canvas { width: 100%; height: 380px; display: block; border-radius: 8px; background: #0b1329; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">🔥 $(_escape_html(title))</div>
+        <div class="meta-grid">
+            <div class="meta-item"><div class="meta-label">Expected Accuracy</div><div class="meta-val">$(exp_acc)</div></div>
+            <div class="meta-item"><div class="meta-label">Log Likelihood</div><div class="meta-val">$(log_lh)</div></div>
+            <div class="meta-item"><div class="meta-label">Consensus Score</div><div class="meta-val">$(res.consensus_alignment.score)</div></div>
+            <div class="meta-item"><div class="meta-label">Identity</div><div class="meta-val">$(round(res.consensus_alignment.identity * 100, digits=1))%</div></div>
+        </div>
+
+        <canvas id="matrixCanvas"></canvas>
+    </div>
+
+    <script>
+        const data = $(post_json);
+        const canvas = document.getElementById('matrixCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function drawMatrix() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 380 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const w = canvas.parentElement.clientWidth;
+            const h = 380;
+            ctx.clearRect(0, 0, w, h);
+
+            const grid = data.matrix;
+            const rows = grid.length;
+            if (rows === 0) return;
+            const cols = grid[0].length;
+
+            const cellW = (w - 80) / cols;
+            const cellH = (h - 60) / rows;
+
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    const p = grid[r][c];
+                    const red = Math.round(p * 245);
+                    const green = Math.round(p * 158 + (1 - p) * 19);
+                    const blue = Math.round((1 - p) * 41 + p * 248);
+
+                    ctx.fillStyle = `rgb(\${red},\${green},\${blue})`;
+                    ctx.fillRect(50 + c * cellW, 30 + r * cellH, cellW, cellH);
+                }
+            }
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '11px system-ui';
+            ctx.fillText('Target Sequence Position →', w / 2 - 60, h - 8);
+        }
+
+        window.addEventListener('resize', drawMatrix);
+        setTimeout(drawMatrix, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+function to_html(res::PosteriorAlignmentResult)
+    return visualize_posterior_alignment_html(res)
+end
+
+function _sequence_graph_to_json(graph::SequenceGraph)
+    node_items = [ "{\"id\":$i,\"seq\":\"$(_json_escape(String(n)))\"}" for (i, n) in enumerate(graph.nodes) ]
+    edge_items = [ "{\"u\":$(e[1]),\"v\":$(e[2])}" for e in graph.edges ]
+    return "{\"nodes\":[" * join(node_items, ",") * "],\"edges\":[" * join(edge_items, ",") * "]}"
+end
+
+"""
+    visualize_graph_alignment_html(res::GraphAlignmentResult; title="Sequence Graph Alignment") -> String
+
+Generate an interactive HTML5/Canvas DAG sequence graph alignment viewer.
+"""
+function visualize_graph_alignment_html(res::GraphAlignmentResult; title::String="Sequence Graph Alignment")
+    node_count = length(res.node_scores)
+    path_len = length(res.graph_path)
+    score = res.query_alignment.score
+    path_json = "[" * join(res.graph_path, ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title))</title>
+    <style>
+        :root {
+            --bg: #0f172a; --panel: #1e293b; --border: #334155;
+            --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .title { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin: 0 0 12px 0; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .meta-item { background: rgba(15,23,42,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+        .meta-label { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); }
+        .meta-val { font-size: 1.1rem; font-weight: 600; color: var(--text); margin-top: 2px; }
+        canvas { width: 100%; height: 340px; display: block; border-radius: 8px; background: #0b1329; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">🕸️ $(_escape_html(title))</div>
+        <div class="meta-grid">
+            <div class="meta-item"><div class="meta-label">Path Score</div><div class="meta-val">$(score)</div></div>
+            <div class="meta-item"><div class="meta-label">Path Nodes</div><div class="meta-val">$(path_len)</div></div>
+            <div class="meta-item"><div class="meta-label">Graph Nodes</div><div class="meta-val">$(node_count)</div></div>
+            <div class="meta-item"><div class="meta-label">Identity</div><div class="meta-val">$(round(res.query_alignment.identity * 100, digits=1))%</div></div>
+        </div>
+
+        <canvas id="graphCanvas"></canvas>
+    </div>
+
+    <script>
+        const path = $(path_json);
+        const canvas = document.getElementById('graphCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function drawGraph() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 340 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const w = canvas.parentElement.clientWidth;
+            const h = 340;
+            ctx.clearRect(0, 0, w, h);
+
+            if (path.length === 0) return;
+
+            const step = (w - 100) / path.length;
+            ctx.strokeStyle = '#10b981';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+
+            path.forEach((nodeId, idx) => {
+                const x = 50 + idx * step + step/2;
+                const y = h / 2;
+                if (idx === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            path.forEach((nodeId, idx) => {
+                const x = 50 + idx * step + step/2;
+                const y = h / 2;
+                ctx.fillStyle = '#38bdf8';
+                ctx.beginPath();
+                ctx.arc(x, y, 12, 0, 2 * Math.PI);
+                ctx.fill();
+
+                ctx.fillStyle = '#0f172a';
+                ctx.font = 'bold 11px system-ui';
+                ctx.textAlign = 'center';
+                ctx.fillText(nodeId + '', x, y + 4);
+            });
+        }
+
+        window.addEventListener('resize', drawGraph);
+        setTimeout(drawGraph, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+function to_html(res::GraphAlignmentResult)
+    return visualize_graph_alignment_html(res)
+end
+
+"""
+    visualize_sequence_graph_html(graph::SequenceGraph; title="Sequence Graph Structure") -> String
+
+Generate an interactive HTML5/Canvas DAG sequence graph structure viewer.
+"""
+function visualize_sequence_graph_html(graph::SequenceGraph; title::String="Sequence Graph Structure")
+    node_count = length(graph.nodes)
+    edge_count = length(graph.edges)
+    graph_json = _sequence_graph_to_json(graph)
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title))</title>
+    <style>
+        :root {
+            --bg: #0f172a; --panel: #1e293b; --border: #334155;
+            --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .title { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin: 0 0 12px 0; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .meta-item { background: rgba(15,23,42,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+        .meta-label { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); }
+        .meta-val { font-size: 1.1rem; font-weight: 600; color: var(--text); margin-top: 2px; }
+        canvas { width: 100%; height: 380px; display: block; border-radius: 8px; background: #0b1329; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">🧬 $(_escape_html(title))</div>
+        <div class="meta-grid">
+            <div class="meta-item"><div class="meta-label">Nodes</div><div class="meta-val">$(node_count)</div></div>
+            <div class="meta-item"><div class="meta-label">Edges</div><div class="meta-val">$(edge_count)</div></div>
+        </div>
+
+        <canvas id="graphCanvas"></canvas>
+    </div>
+
+    <script>
+        const graph = $(graph_json);
+        const canvas = document.getElementById('graphCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function drawGraph() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 380 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const w = canvas.parentElement.clientWidth;
+            const h = 380;
+            ctx.clearRect(0, 0, w, h);
+
+            const nodes = graph.nodes || [];
+            const edges = graph.edges || [];
+            if (nodes.length === 0) return;
+
+            const step = (w - 120) / Math.max(1, nodes.length - 1);
+
+            ctx.strokeStyle = '#64748b';
+            ctx.lineWidth = 2;
+            edges.forEach(e => {
+                const uIdx = e.u - 1;
+                const vIdx = e.v - 1;
+                if (uIdx >= 0 && uIdx < nodes.length && vIdx >= 0 && vIdx < nodes.length) {
+                    const x1 = 60 + uIdx * step;
+                    const y1 = h / 2;
+                    const x2 = 60 + vIdx * step;
+                    const y2 = h / 2;
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1);
+                    ctx.lineTo(x2, y2);
+                    ctx.stroke();
+                }
+            });
+
+            nodes.forEach((n, idx) => {
+                const x = 60 + idx * step;
+                const y = h / 2;
+
+                ctx.fillStyle = '#38bdf8';
+                ctx.beginPath();
+                ctx.arc(x, y, 16, 0, 2 * Math.PI);
+                ctx.fill();
+
+                ctx.fillStyle = '#0f172a';
+                ctx.font = 'bold 11px system-ui';
+                ctx.textAlign = 'center';
+                ctx.fillText(n.id + '', x, y + 4);
+
+                if (n.seq) {
+                    ctx.fillStyle = '#94a3b8';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(n.seq.length > 8 ? n.seq.substring(0, 6) + '..' : n.seq, x, y + 30);
+                }
+            });
+        }
+
+        window.addEventListener('resize', drawGraph);
+        setTimeout(drawGraph, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+function to_html(graph::SequenceGraph)
+    return visualize_sequence_graph_html(graph)
+end
+
+function _profile_result_to_json(res::ProfileAlignmentResult)
+    path_items = [ "{\"u\":$(p[1]),\"v\":$(p[2])}" for p in res.path ]
+    conf_items = [ round(c, digits=3) for c in res.posterior_confidence ]
+    return "{\"path\":[" * join(path_items, ",") * "],\"score\":$(res.score),\"confidence\":[" * join(conf_items, ",") * "]}"
+end
+
+"""
+    visualize_profile_alignment_html(res::ProfileAlignmentResult; title="Profile HMM Alignment Path") -> String
+
+Generate an interactive HTML5/Canvas visualization for Profile HMM alignment path and confidence scores.
+"""
+function visualize_profile_alignment_html(res::ProfileAlignmentResult; title::String="Profile HMM Alignment Path")
+    mean_conf = isempty(res.posterior_confidence) ? 0.0 : round(sum(res.posterior_confidence) / length(res.posterior_confidence), digits=3)
+    prof_json = _profile_result_to_json(res)
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(title))</title>
+    <style>
+        :root {
+            --bg: #0f172a; --panel: #1e293b; --border: #334155;
+            --text: #f8fafc; --muted: #94a3b8; --accent: #38bdf8;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .title { font-size: 1.5rem; font-weight: 700; color: var(--accent); margin: 0 0 12px 0; }
+        .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
+        .meta-item { background: rgba(15,23,42,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); }
+        .meta-label { font-size: 0.75rem; text-transform: uppercase; color: var(--muted); }
+        .meta-val { font-size: 1.1rem; font-weight: 600; color: var(--text); margin-top: 2px; }
+        canvas { width: 100%; height: 320px; display: block; border-radius: 8px; background: #0b1329; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">📊 $(_escape_html(title))</div>
+        <div class="meta-grid">
+            <div class="meta-item"><div class="meta-label">Profile Score</div><div class="meta-val">$(round(res.score, digits=2))</div></div>
+            <div class="meta-item"><div class="meta-label">Mean Confidence</div><div class="meta-val">$(mean_conf)</div></div>
+            <div class="meta-item"><div class="meta-label">Path Length</div><div class="meta-val">$(length(res.path))</div></div>
+        </div>
+
+        <canvas id="profCanvas"></canvas>
+    </div>
+
+    <script>
+        const prof = $(prof_json);
+        const canvas = document.getElementById('profCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function drawProfile() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 320 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const w = canvas.parentElement.clientWidth;
+            const h = 320;
+            ctx.clearRect(0, 0, w, h);
+
+            const conf = prof.confidence;
+            if (conf.length === 0) return;
+
+            const step = (w - 80) / conf.length;
+
+            ctx.fillStyle = '#38bdf8';
+            conf.forEach((c, i) => {
+                const x = 40 + i * step;
+                const barH = c * (h - 80);
+                ctx.fillRect(x, h - 40 - barH, Math.max(step - 2, 2), barH);
+            });
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '11px system-ui';
+            ctx.fillText('Alignment Position →', w / 2 - 50, h - 10);
+        }
+
+        window.addEventListener('resize', drawProfile);
+        setTimeout(drawProfile, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+function to_html(res::ProfileAlignmentResult)
+    return visualize_profile_alignment_html(res)
+end
+
+function to_html(profile::AlignmentProfileHMM)
+    pos_count = size(profile.match_emissions, 1)
+    alpha_len = length(profile.alphabet)
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profile HMM Model</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --border: #334155; --text: #f8fafc; --accent: #38bdf8; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+        .title { font-size: 1.4rem; font-weight: 700; color: var(--accent); margin-bottom: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="title">📊 Alignment Profile HMM</div>
+        <p>Positions: <strong>$(pos_count)</strong> | Alphabet size: <strong>$(alpha_len)</strong></p>
+    </div>
+</body>
+</html>
+"""
+end

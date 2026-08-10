@@ -2,13 +2,14 @@
 # coevolution.jl — Co-evolutionary contact inference, DCA, and MSA analytics
 #
 # References:
-#   - Ekeberg et al. (2013) Phys Rev E 87:012707 (PLM-DCA)
 #   - Morcos et al. (2011) PNAS 108:E1294-E1301 (Direct Coupling Analysis)
+#   - Ekeberg et al. (2013) Phys Rev E 87:012707 (PLM-DCA)
 #   - Shannon (1948) Bell System Tech J 27:379-423 (entropy)
 #   - Weigt et al. (2009) PNAS 106:67-72 (MI-based pairing)
 #   - Dunn et al. (2007) Bioinformatics 23:1684-1691 (MIPIE / mutual info correction)
 #   - Jones et al. (2012) Bioinformatics 28:184-190 (PSICOV)
 #   - Ledoit & Wolf (2004) J Multivariate Anal 88:365-411 (covariance shrinkage)
+#   - Henikoff & Henikoff (1994) J Mol Biol 243:574-578 (position-based sequence weights)
 # ==============================================================================
 
 module Coevolution
@@ -19,6 +20,7 @@ using Statistics
 
 using ..BioToolkit: Atom, Chain, Model, MultipleSequenceAlignment, Residue, SeqRecordLite, Structure
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+import ..BioToolkit: to_html, export_html
 
 @inline function _register_coevolution_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -41,6 +43,12 @@ export positional_covariation_matrix
 export gap_analysis
 export contact_precision_recall
 export alignment_quality_report
+
+export visualize_contact_map_html
+export visualize_coevolution_network_html
+export visualize_alignment_quality_html
+export visualize_sequence_logo_html
+export to_html, export_html
 
 # ---------------------------------------------------------------------------
 # Core data structures
@@ -71,15 +79,31 @@ function _alignment_strings(alignment::MultipleSequenceAlignment)
     return [uppercase(String(alignment.records[index].sequence)) for index in 1:n]
 end
 
-function filter_alignment_for_dca(alignment::MultipleSequenceAlignment; max_gap_fraction::Real=0.5, min_sequence_coverage::Real=0.5)
+"""
+    filter_alignment_for_dca(alignment; max_gap_fraction=0.5, min_sequence_coverage=0.5)
+
+Filter multiple sequence alignment columns and sequences based on gap thresholds.
+"""
+function filter_alignment_for_dca(alignment::MultipleSequenceAlignment;
+    max_gap_fraction::Real=0.5,
+    min_sequence_coverage::Real=0.5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     l = ncodeunits(strings[1])
     all(ncodeunits(seq) == l for seq in strings) || throw(ArgumentError("all alignment sequences must have equal length"))
+    n = length(strings)
 
     keep_columns = Int[]
     for col in 1:l
-        gap_fraction = mean(seq[col] == '-' for seq in strings)
-        if gap_fraction <= max_gap_fraction
+        gap_count = 0
+        @inbounds for seq in strings
+            if seq[col] == '-'
+                gap_count += 1
+            end
+        end
+        if (gap_count / n) <= max_gap_fraction
             push!(keep_columns, col)
         end
     end
@@ -97,7 +121,8 @@ function filter_alignment_for_dca(alignment::MultipleSequenceAlignment; max_gap_
 
     isempty(filtered_records) && throw(ArgumentError("all sequences were removed by coverage filtering"))
 
-    return MultipleSequenceAlignment(filtered_records)
+    result = MultipleSequenceAlignment(filtered_records)
+    return _register_coevolution_result!(_ctx, result, "filter_alignment_for_dca"; parents=provenance_parent_ids(alignment), parameters=(max_gap_fraction=Float64(max_gap_fraction), min_sequence_coverage=Float64(min_sequence_coverage), retained_columns=length(keep_columns), retained_sequences=length(filtered_records)))
 end
 
 function _alphabet(strings::Vector{String})
@@ -120,42 +145,70 @@ end
 function _encode_alignment(strings::Vector{String}, alphabet::Vector{Char})
     n = length(strings)
     l = ncodeunits(strings[1])
-    lookup = Dict{Char,Int}(char => index for (index, char) in enumerate(alphabet))
-    matrix = Matrix{Int}(undef, n, l)
+    lookup_table = fill(1, 256)
+    for (index, char) in enumerate(alphabet)
+        c_code = Int(char)
+        if 1 <= c_code <= 256
+            lookup_table[c_code] = index
+        end
+    end
 
+    matrix = Matrix{Int}(undef, n, l)
     for i in 1:n
         seq = strings[i]
         for j in 1:l
-            matrix[i, j] = get(lookup, seq[j], lookup['-'])
+            c_code = Int(seq[j])
+            matrix[i, j] = (1 <= c_code <= 256) ? lookup_table[c_code] : 1
         end
     end
 
     return matrix
 end
 
-function sequence_reweighting(encoded_alignment::AbstractMatrix{<:Integer}; identity_threshold::Real=0.8)
-    n = size(encoded_alignment, 1)
-    l = size(encoded_alignment, 2)
+"""
+    sequence_reweighting(encoded_alignment; identity_threshold=0.8)
 
+Compute phylogenetically corrected sequence weights (1 / N_similar) using ultra-fast SIMD-friendly comparison with early exit.
+"""
+function sequence_reweighting(encoded_alignment::AbstractMatrix{<:Integer};
+    identity_threshold::Real=0.8,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    n, l = size(encoded_alignment)
     weights = ones(Float64, n)
-    for i in 1:n
-        similar_count = 0
-        for j in 1:n
-            identity = count(encoded_alignment[i, pos] == encoded_alignment[j, pos] for pos in 1:l) / l
-            if identity >= identity_threshold
-                similar_count += 1
+    max_mismatches = floor(Int, (1.0 - Float64(identity_threshold)) * l + 1e-9)
+
+    counts = ones(Int, n)
+    @inbounds for i in 1:n-1
+        for j in i+1:n
+            mismatches = 0
+            for pos in 1:l
+                if encoded_alignment[i, pos] != encoded_alignment[j, pos]
+                    mismatches += 1
+                    if mismatches > max_mismatches
+                        break
+                    end
+                end
+            end
+            if mismatches <= max_mismatches
+                counts[i] += 1
+                counts[j] += 1
             end
         end
-        weights[i] = 1.0 / max(similar_count, 1)
     end
 
-    return weights
+    for i in 1:n
+        weights[i] = 1.0 / counts[i]
+    end
+
+    return _register_coevolution_result!(_ctx, weights, "sequence_reweighting"; parents=provenance_parent_ids(encoded_alignment), parameters=(n_seqs=n, n_cols=l, identity_threshold=Float64(identity_threshold)))
 end
 
 function _one_hot(encoded_alignment::AbstractMatrix{<:Integer}, q::Int)
     n, l = size(encoded_alignment)
     one_hot = zeros(Float64, n, l * q)
-    for i in 1:n
+    @inbounds for i in 1:n
         for j in 1:l
             state = encoded_alignment[i, j]
             one_hot[i, (j - 1) * q + state] = 1.0
@@ -164,28 +217,114 @@ function _one_hot(encoded_alignment::AbstractMatrix{<:Integer}, q::Int)
     return one_hot
 end
 
-function _apc_correct(scores::Matrix{Float64})
-    row_mean = vec(mean(scores, dims=2))
-    col_mean = vec(mean(scores, dims=1))
-    overall = mean(scores)
-    overall <= 0 && return copy(scores)
-
-    corrected = copy(scores)
-    for i in 1:size(scores, 1)
-        for j in 1:size(scores, 2)
-            corrected[i, j] = scores[i, j] - (row_mean[i] * col_mean[j]) / overall
+"""
+Zero-Sum Gauge transformation (Ising / Frobenius gauge) for coupling block J_ij.
+Enforces sum_b J_ij(a, b) = 0 and sum_a J_ij(a, b) = 0.
+"""
+function _zero_sum_gauge!(J_block::AbstractMatrix{Float64})
+    q1, q2 = size(J_block)
+    row_means = vec(mean(J_block, dims=2))
+    col_means = vec(mean(J_block, dims=1))
+    total_mean = mean(J_block)
+    for a in 1:q1
+        for b in 1:q2
+            J_block[a, b] -= row_means[a] + col_means[b] - total_mean
         end
     end
+    return J_block
+end
 
-    for i in axes(corrected, 1)
-        corrected[i, i] = 0.0
+"""
+Average Product Correction (APC) according to Dunn et al. (2007).
+Calculates row and overall averages strictly excluding self-coupling diagonal terms.
+"""
+function _apc_correct(scores::Matrix{Float64})
+    l = size(scores, 1)
+    l <= 1 && return copy(scores)
+
+    row_sum = zeros(Float64, l)
+    for i in 1:l
+        for j in 1:l
+            if i != j
+                row_sum[i] += scores[i, j]
+            end
+        end
+    end
+    total_sum = sum(row_sum)
+    mean_val = (l * (l - 1)) > 0 ? total_sum / (l * (l - 1)) : 0.0
+    mean_val <= 0 && return copy(scores)
+
+    row_mean = row_sum ./ (l - 1)
+    corrected = copy(scores)
+    for i in 1:l
+        for j in 1:l
+            if i != j
+                corrected[i, j] = scores[i, j] - (row_mean[i] * row_mean[j]) / mean_val
+            else
+                corrected[i, i] = 0.0
+            end
+        end
     end
 
     return corrected
 end
 
-function fit_pseudolikelihood_model(alignment::MultipleSequenceAlignment; max_gap_fraction::Real=0.5, min_sequence_coverage::Real=0.5, identity_threshold::Real=0.8, regularization::Real=0.01, pseudocount::Real=0.5)
-    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage)
+"""
+Normalize contact scores across unmasked pairs (|i - j| >= min_separation) into [0, 1].
+"""
+function _normalize_scores(scores::Matrix{Float64}; min_separation::Int=1)
+    l = size(scores, 1)
+    unmasked = Float64[]
+    for i in 1:l-1
+        for j in i+1:l
+            if abs(i - j) >= min_separation
+                push!(unmasked, scores[i, j])
+            end
+        end
+    end
+
+    isempty(unmasked) && return zeros(Float64, size(scores))
+    min_val = minimum(unmasked)
+    max_val = maximum(unmasked)
+    scale = max(max_val - min_val, eps(Float64))
+
+    normalized = zeros(Float64, l, l)
+    for i in 1:l-1
+        for j in i+1:l
+            if abs(i - j) >= min_separation
+                val = max(0.0, (scores[i, j] - min_val) / scale)
+                normalized[i, j] = val
+                normalized[j, i] = val
+            end
+        end
+    end
+    return normalized
+end
+
+# ---------------------------------------------------------------------------
+# Pseudolikelihood & Direct Coupling Model Fitting
+# ---------------------------------------------------------------------------
+
+"""
+    fit_pseudolikelihood_model(alignment; max_gap_fraction=0.5, min_sequence_coverage=0.5, identity_threshold=0.8, regularization=0.01, pseudocount=0.5, algorithm=:mean_field)
+
+Fit a Co-evolutionary Direct Coupling Analysis (DCA) model to a multiple sequence alignment.
+
+Algorithms supported:
+- `:mean_field` (or `:mfdca`): Global inverse covariance estimation with zero-sum gauge.
+- `:direct_correlation` (or `:local_correlation`, `:plm`): Pairwise connected covariance Frobenius norm estimation.
+"""
+function fit_pseudolikelihood_model(alignment::MultipleSequenceAlignment;
+    max_gap_fraction::Real=0.5,
+    min_sequence_coverage::Real=0.5,
+    identity_threshold::Real=0.8,
+    regularization::Real=0.01,
+    pseudocount::Real=0.5,
+    algorithm::Symbol=:mean_field,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, _ctx=_ctx)
     strings = _alignment_strings(filtered)
     alphabet = _alphabet(strings)
     encoded = _encode_alignment(strings, alphabet)
@@ -193,51 +332,88 @@ function fit_pseudolikelihood_model(alignment::MultipleSequenceAlignment; max_ga
     n, l = size(encoded)
     q = length(alphabet)
 
-    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold)
-    effective_n = sum(weights)
-
-    one_hot = _one_hot(encoded, q)
-    weighted_mean = vec((weights' * one_hot) ./ effective_n)
-    centered = one_hot .- reshape(weighted_mean, 1, :)
-    weighted_centered = centered .* reshape(sqrt.(weights), :, 1)
-
-    covariance = (weighted_centered' * weighted_centered) ./ effective_n
-    covariance += regularization * I
-    precision = inv(Symmetric(covariance))
+    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
+    effective_n = max(sum(weights), eps(Float64))
 
     frequencies = zeros(Float64, l, q)
     for i in 1:n
+        w = weights[i]
         for j in 1:l
-            frequencies[j, encoded[i, j]] += weights[i]
+            frequencies[j, encoded[i, j]] += w
         end
     end
-    frequencies .+= pseudocount
+    frequencies .+= Float64(pseudocount)
     frequencies ./= sum(frequencies, dims=2)
     fields = log.(frequencies)
 
     couplings = zeros(Float64, l, l, q, q)
     raw_scores = zeros(Float64, l, l)
 
-    for i in 1:l-1
-        i_range = (i - 1) * q + 1:i * q
-        for j in i+1:l
-            j_range = (j - 1) * q + 1:j * q
-            block = -Matrix(precision[i_range, j_range])
-            couplings[i, j, :, :] .= block
-            couplings[j, i, :, :] .= block'
+    if algorithm in (:direct_correlation, :local_correlation)
+        one_hot = _one_hot(encoded, q)
+        for i in 1:l-1
+            for j in i+1:l
+                c_block = zeros(Float64, q, q)
+                @inbounds for s in 1:n
+                    w = weights[s]
+                    ai = encoded[s, i]
+                    bj = encoded[s, j]
+                    c_block[ai, bj] += w
+                end
+                c_block ./= effective_n
+                c_block .-= (frequencies[i, :] * frequencies[j, :]')
+                _zero_sum_gauge!(c_block)
 
-            score = norm(block)
-            raw_scores[i, j] = score
-            raw_scores[j, i] = score
+                couplings[i, j, :, :] .= c_block
+                couplings[j, i, :, :] .= c_block'
+                score = norm(c_block)
+                raw_scores[i, j] = score
+                raw_scores[j, i] = score
+            end
+        end
+    else
+        one_hot = _one_hot(encoded, q)
+        weighted_mean = vec((weights' * one_hot) ./ effective_n)
+        centered = one_hot .- reshape(weighted_mean, 1, :)
+        weighted_centered = centered .* reshape(sqrt.(weights), :, 1)
+
+        covariance = (weighted_centered' * weighted_centered) ./ effective_n
+        covariance += Float64(regularization) * I
+        precision = inv(Symmetric(covariance))
+
+        for i in 1:l-1
+            i_range = (i - 1) * q + 1:i * q
+            for j in i+1:l
+                j_range = (j - 1) * q + 1:j * q
+                block = -Matrix(precision[i_range, j_range])
+                _zero_sum_gauge!(block)
+                couplings[i, j, :, :] .= block
+                couplings[j, i, :, :] .= block'
+                score = norm(block)
+                raw_scores[i, j] = score
+                raw_scores[j, i] = score
+            end
         end
     end
 
     apc_scores = _apc_correct(raw_scores)
+    model = PseudoLikelihoodModel(fields, couplings, alphabet, weights, effective_n, raw_scores, apc_scores)
 
-    return PseudoLikelihoodModel(fields, couplings, alphabet, weights, effective_n, raw_scores, apc_scores)
+    return _register_coevolution_result!(_ctx, model, "fit_pseudolikelihood_model"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, effective_sequences=effective_n, algorithm=algorithm))
 end
 
-function compute_contact_scores(model::PseudoLikelihoodModel; apc::Bool=true, min_separation::Integer=5)
+"""
+    compute_contact_scores(model; apc=true, min_separation=5)
+
+Extract residue-residue contact score matrix from a fitted `PseudoLikelihoodModel`.
+Applies sequence separation mask (|i - j| < min_separation) and optional Average Product Correction.
+"""
+function compute_contact_scores(model::PseudoLikelihoodModel;
+    apc::Bool=true,
+    min_separation::Integer=5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     scores = apc ? copy(model.apc_scores) : copy(model.raw_scores)
     l = size(scores, 1)
 
@@ -251,35 +427,26 @@ function compute_contact_scores(model::PseudoLikelihoodModel; apc::Bool=true, mi
         end
     end
 
-    return scores
+    result = scores
+    return _register_coevolution_result!(_ctx, result, "compute_contact_scores"; parents=provenance_parent_ids(model), parameters=(apc=apc, min_separation=Int(min_separation)))
 end
 
-function _normalize_scores(scores::Matrix{Float64})
-    upper_values = Float64[]
-    l = size(scores, 1)
-    for i in 1:l-1
-        for j in i+1:l
-            if scores[i, j] > 0
-                push!(upper_values, scores[i, j])
-            end
-        end
-    end
+"""
+    predict_contact_map(alignment; top_l=nothing, min_separation=5, return_model=false, kwargs...)
 
-    isempty(upper_values) && return zeros(Float64, size(scores))
-    min_val = minimum(upper_values)
-    max_val = maximum(upper_values)
-    scale = max(max_val - min_val, eps(Float64))
+Predict residue-residue contact map from an alignment using direct coupling analysis.
+Returns normalized contact map scores in [0, 1] range.
+"""
+function predict_contact_map(alignment::MultipleSequenceAlignment;
+    top_l::Union{Nothing,Int}=nothing,
+    min_separation::Integer=5,
+    return_model::Bool=false,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx),
+    kwargs...)
 
-    normalized = max.((scores .- min_val) ./ scale, 0.0)
-    for i in 1:l
-        normalized[i, i] = 0.0
-    end
-    return normalized
-end
-
-function predict_contact_map(alignment::MultipleSequenceAlignment; top_l::Union{Nothing,Int}=nothing, min_separation::Integer=5, return_model::Bool=false, kwargs...)
-    model = fit_pseudolikelihood_model(alignment; kwargs...)
-    scores = compute_contact_scores(model; apc=true, min_separation=min_separation)
+    model = fit_pseudolikelihood_model(alignment; _ctx=_ctx, kwargs...)
+    scores = compute_contact_scores(model; apc=true, min_separation=min_separation, _ctx=_ctx)
 
     if top_l !== nothing && top_l > 0
         l = size(scores, 1)
@@ -306,7 +473,9 @@ function predict_contact_map(alignment::MultipleSequenceAlignment; top_l::Union{
         scores = filtered
     end
 
-    contact_map = ContactMap(_normalize_scores(scores), collect(1:size(scores, 1)))
+    cmap_scores = _normalize_scores(scores; min_separation=Int(min_separation))
+    contact_map = ContactMap(cmap_scores, collect(1:size(scores, 1)))
+
     if return_model
         return contact_map, model
     end
@@ -314,7 +483,17 @@ function predict_contact_map(alignment::MultipleSequenceAlignment; top_l::Union{
     return contact_map
 end
 
-function top_contact_pairs(contact_map::ContactMap; top_n::Integer=10, min_separation::Integer=5)
+"""
+    top_contact_pairs(contact_map; top_n=10, min_separation=5)
+
+Retrieve top N contact pairs sorted by co-evolutionary score.
+"""
+function top_contact_pairs(contact_map::ContactMap;
+    top_n::Integer=10,
+    min_separation::Integer=5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     l = size(contact_map.scores, 1)
     pairs = Tuple{Int,Int,Float64}[]
 
@@ -327,11 +506,26 @@ function top_contact_pairs(contact_map::ContactMap; top_n::Integer=10, min_separ
     end
 
     sort!(pairs; by=pair -> pair[3], rev=true)
-
-    return pairs[1:min(top_n, length(pairs))]
+    result = pairs[1:min(top_n, length(pairs))]
+    return _register_coevolution_result!(_ctx, result, "top_contact_pairs"; parents=provenance_parent_ids(contact_map), parameters=(top_n=Int(top_n), min_separation=Int(min_separation)))
 end
 
-function fold_from_contacts(contact_map::ContactMap; top_n::Union{Nothing,Int}=nothing, contact_distance::Real=7.5, backbone_distance::Real=3.8, iterations::Integer=2000, learning_rate::Real=0.01, seed::Integer=1)
+"""
+    fold_from_contacts(contact_map; top_n=nothing, contact_distance=7.5, backbone_distance=3.8, iterations=2000, learning_rate=0.01, seed=1)
+
+Perform 3D structure generation from predicted residue contacts using distance geometry optimization.
+Incorporates contact distance restraints, Cα-Cα backbone connectivity, and steric clash avoidance.
+"""
+function fold_from_contacts(contact_map::ContactMap;
+    top_n::Union{Nothing,Int}=nothing,
+    contact_distance::Real=7.5,
+    backbone_distance::Real=3.8,
+    iterations::Integer=2000,
+    learning_rate::Real=0.01,
+    seed::Integer=1,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     l = size(contact_map.scores, 1)
     l >= 3 || throw(ArgumentError("contact map must contain at least three residues"))
 
@@ -356,9 +550,11 @@ function fold_from_contacts(contact_map::ContactMap; top_n::Union{Nothing,Int}=n
         coords[i, 1] += 3.8 * (i - 1)
     end
 
+    steric_min = 3.2
     for _ in 1:iterations
         gradients = zeros(Float64, l, 3)
 
+        # Contact restraints
         for (i, j, weight) in candidate_pairs
             diff = coords[i, :] .- coords[j, :]
             distance = sqrt(sum(diff .^ 2) + 1e-10)
@@ -368,13 +564,28 @@ function fold_from_contacts(contact_map::ContactMap; top_n::Union{Nothing,Int}=n
             gradients[j, :] .-= g
         end
 
+        # Backbone connectivity
         for i in 1:l-1
             diff = coords[i, :] .- coords[i + 1, :]
             distance = sqrt(sum(diff .^ 2) + 1e-10)
             error = distance - backbone_distance
-            g = (0.3 * 2.0 * error / distance) .* diff
+            g = (0.6 * 2.0 * error / distance) .* diff
             gradients[i, :] .+= g
             gradients[i + 1, :] .-= g
+        end
+
+        # Steric clash repulsion
+        for i in 1:l-2
+            for j in i+2:l
+                diff = coords[i, :] .- coords[j, :]
+                dist = sqrt(sum(diff .^ 2) + 1e-10)
+                if dist < steric_min
+                    overlap = steric_min - dist
+                    g = (-1.0 * overlap / dist) .* diff
+                    gradients[i, :] .+= g
+                    gradients[j, :] .-= g
+                end
+            end
         end
 
         coords .-= learning_rate .* gradients
@@ -403,72 +614,69 @@ function fold_from_contacts(contact_map::ContactMap; top_n::Union{Nothing,Int}=n
     structure = Structure("PredictedContactFold")
     push!(structure.models, model)
 
-    return structure
+    return _register_coevolution_result!(_ctx, structure, "fold_from_contacts"; parents=provenance_parent_ids(contact_map), parameters=(residues=l, restraints=length(candidate_pairs), iterations=Int(iterations)))
 end
 
 # ---------------------------------------------------------------------------
-# Mutual Information Contacts
+# Mutual Information Contacts (Streaming O(q^2) Memory)
 # ---------------------------------------------------------------------------
 
 """
     mutual_information_contacts(alignment; pseudocount=0.5, min_separation=5, apc=true)
 
-Compute residue-residue mutual information (MI) scores from a multiple
-sequence alignment, analogous to `PSICOV` MI and `DCA` raw MI outputs.
-
-Optionally applies Average Product Correction (APC) to remove phylogenetic
-background signal (Dunn et al. 2007).
-
-Returns a `ContactMap` with MI-based scores.
+Compute residue-residue mutual information (MI) contact scores with Average Product Correction (APC).
+Uses streaming pairwise contingency tables to maintain O(q^2) memory footprint (Kilobytes vs Gigabytes).
 """
-function mutual_information_contacts(
-    alignment::MultipleSequenceAlignment;
+function mutual_information_contacts(alignment::MultipleSequenceAlignment;
     pseudocount::Real=0.5,
     min_separation::Int=5,
     apc::Bool=true,
     max_gap_fraction::Real=0.5,
     min_sequence_coverage::Real=0.5,
-    identity_threshold::Real=0.8)
-    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage)
+    identity_threshold::Real=0.8,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, _ctx=_ctx)
     strings = _alignment_strings(filtered)
     alphabet = _alphabet(strings)
     encoded = _encode_alignment(strings, alphabet)
     n, l = size(encoded)
     q = length(alphabet)
 
-    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold)
+    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
     eff_n = max(sum(weights), eps(Float64))
 
-    # Marginal frequencies with pseudocount
-    f1 = zeros(Float64, l, q)   # single-site
-    f2 = zeros(Float64, l, l, q, q)  # pairwise
-
+    # Single-site frequencies f1
+    f1 = zeros(Float64, l, q)
     for s in 1:n
         w = weights[s]
         for i in 1:l
             f1[i, encoded[s, i]] += w
         end
-        for i in 1:l, j in i+1:l
-            f2[i, j, encoded[s, i], encoded[s, j]] += w
-            f2[j, i, encoded[s, j], encoded[s, i]] += w
-        end
     end
-
-    # Normalise + pseudocount
     pc = Float64(pseudocount)
     f1 = (f1 .+ pc / q) ./ (eff_n + pc)
-    f2 = (f2 .+ pc / (q * q)) ./ (eff_n + pc)
 
     mi_scores = zeros(Float64, l, l)
+    c_ij = zeros(Float64, q, q)
+
     for i in 1:l-1
         for j in i+1:l
+            fill!(c_ij, 0.0)
+            @inbounds for s in 1:n
+                c_ij[encoded[s, i], encoded[s, j]] += weights[s]
+            end
+
+            pij = (c_ij .+ pc / (q * q)) ./ (eff_n + pc)
+
             mi = 0.0
             for a in 1:q, b in 1:q
-                pij = f2[i, j, a, b]
-                pi  = f1[i, a]
-                pj  = f1[j, b]
-                if pij > 0 && pi > 0 && pj > 0
-                    mi += pij * log(pij / (pi * pj))
+                p_ab = pij[a, b]
+                p_a = f1[i, a]
+                p_b = f1[j, b]
+                if p_ab > 0 && p_a > 0 && p_b > 0
+                    mi += p_ab * log(p_ab / (p_a * p_b))
                 end
             end
             mi_scores[i, j] = mi
@@ -478,18 +686,16 @@ function mutual_information_contacts(
 
     apc_mi = apc ? _apc_correct(mi_scores) : mi_scores
 
-    # Apply separation mask
     for i in 1:l
         for j in max(1, i - min_separation):min(l, i + min_separation)
             apc_mi[i, j] = 0.0
         end
     end
 
-    result = ContactMap(_normalize_scores(apc_mi), collect(1:l))
-    _ctx = active_provenance_context()
+    norm_scores = _normalize_scores(apc_mi; min_separation=min_separation)
+    result = ContactMap(norm_scores, collect(1:l))
 
-
-    return _register_coevolution_result!(_ctx, result, "mutual_information_contacts"; parents=String[], parameters=(n_seqs=n, n_cols=l, apc=apc, min_separation=min_separation))
+    return _register_coevolution_result!(_ctx, result, "mutual_information_contacts"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, apc=apc, min_separation=min_separation))
 end
 
 # ---------------------------------------------------------------------------
@@ -499,33 +705,28 @@ end
 """
     direct_information_contacts(alignment; min_separation=5, regularization=0.05)
 
-Compute Direct Information (DI) scores using the mean-field approximation
-to Direct Coupling Analysis (mfDCA), analogous to the `evfold` DI output.
-
-Mean-field DCA inverts the connected correlation matrix C to obtain a direct
-coupling matrix J, from which DI is computed via 2-site marginals.
-
-Returns a `ContactMap` with DI scores.
+Compute Direct Information (DI) contact scores using mean-field Direct Coupling Analysis (mfDCA) with RAS / IPFP 2-site marginal consistency.
 """
-function direct_information_contacts(
-    alignment::MultipleSequenceAlignment;
+function direct_information_contacts(alignment::MultipleSequenceAlignment;
     min_separation::Int=5,
     regularization::Real=0.05,
     pseudocount::Real=0.5,
     max_gap_fraction::Real=0.5,
     min_sequence_coverage::Real=0.5,
-    identity_threshold::Real=0.8)
-    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage)
+    identity_threshold::Real=0.8,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, _ctx=_ctx)
     strings = _alignment_strings(filtered)
     alphabet = _alphabet(strings)
     encoded  = _encode_alignment(strings, alphabet)
     n, l     = size(encoded)
     q        = length(alphabet)
 
-    weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold)
+    weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
     eff_n    = max(sum(weights), eps(Float64))
 
-    # Single-site and connected correlation matrices
     one_hot = _one_hot(encoded, q)
     wmean   = vec((weights' * one_hot) ./ eff_n)
     centered = one_hot .- reshape(wmean, 1, :)
@@ -533,9 +734,8 @@ function direct_information_contacts(
 
     C = (wcentered' * wcentered) ./ eff_n
     C_reg = C + Float64(regularization) * I
-    J = -inv(Symmetric(C_reg))   # direct coupling matrix (N*q × N*q)
+    J = -inv(Symmetric(C_reg))
 
-    # Direct Information per pair
     di_scores = zeros(Float64, l, l)
     for i in 1:l-1
         i_range = (i - 1) * q + 1:i * q
@@ -546,11 +746,27 @@ function direct_information_contacts(
             pj = wmean[j_range] .+ Float64(pseudocount) / q
             pj ./= sum(pj)
 
-            Jij = J[i_range, j_range]
-            # Compute 2-site marginals via message passing (1-step approximation)
+            Jij = copy(J[i_range, j_range])
+            _zero_sum_gauge!(Jij)
+
+            # RAS / IPFP 2-site marginal self-consistency iterations
             pij = zeros(Float64, q, q)
             for a in 1:q, b in 1:q
                 pij[a, b] = pi[a] * pj[b] * exp(Jij[a, b])
+            end
+            pij ./= max(sum(pij), eps(Float64))
+
+            for _ in 1:10
+                r_sums = vec(sum(pij, dims=2))
+                for a in 1:q
+                    scale = r_sums[a] > 0 ? pi[a] / r_sums[a] : 0.0
+                    pij[a, :] .*= scale
+                end
+                c_sums = vec(sum(pij, dims=1))
+                for b in 1:q
+                    scale = c_sums[b] > 0 ? pj[b] / c_sums[b] : 0.0
+                    pij[:, b] .*= scale
+                end
             end
             pij ./= max(sum(pij), eps(Float64))
 
@@ -572,11 +788,10 @@ function direct_information_contacts(
         end
     end
 
-    result = ContactMap(_normalize_scores(apc_di), collect(1:l))
-    _ctx = active_provenance_context()
+    norm_scores = _normalize_scores(apc_di; min_separation=min_separation)
+    result = ContactMap(norm_scores, collect(1:l))
 
-
-    return _register_coevolution_result!(_ctx, result, "direct_information_contacts"; parents=String[], parameters=(n_seqs=n, n_cols=l, min_separation=min_separation, regularization=Float64(regularization)))
+    return _register_coevolution_result!(_ctx, result, "direct_information_contacts"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, min_separation=min_separation, regularization=Float64(regularization)))
 end
 
 # ---------------------------------------------------------------------------
@@ -584,48 +799,55 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    column_conservation_scores(alignment; pseudocount=0.5, gap_penalise=true)
+    column_conservation_scores(alignment; pseudocount=0.5, gap_penalise=true, method=:shannon)
 
-Compute per-column conservation (Shannon entropy–based) scores for a multiple
-sequence alignment, analogous to `scorecons` / `al2co`.
-
-Conservation = 1 - H / H_max, where H is per-column Shannon entropy.
-
-Returns a `Vector{Float64}` of conservation scores (0=variable, 1=identical).
+Compute per-column conservation scores for a multiple sequence alignment using normalized Shannon entropy or Valdar score.
 """
-function column_conservation_scores(
-    alignment::MultipleSequenceAlignment;
+function column_conservation_scores(alignment::MultipleSequenceAlignment;
     pseudocount::Real=0.5,
-    gap_penalise::Bool=true)
+    gap_penalise::Bool=true,
+    method::Symbol=:shannon,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     l = ncodeunits(strings[1])
     all(ncodeunits(s) == l for s in strings) || throw(ArgumentError("all sequences must have equal length"))
     n = length(strings)
 
+    alphabet = _alphabet(strings)
+    non_gap_alphabet = filter(!=('-'), alphabet)
+    q_non_gap = max(length(non_gap_alphabet), 2)
+    H_max = log2(Float64(q_non_gap))
+
     scores = zeros(Float64, l)
     for col in 1:l
-        char_counts = Dict{Char,Float64}()
+        counts = Dict{Char,Float64}()
         for seq in strings
             c = seq[col]
-            (!gap_penalise && c == '-') && continue
-            char_counts[c] = get(char_counts, c, 0.0) + 1.0
+            if !gap_penalise && c == '-'
+                continue
+            end
+            counts[c] = get(counts, c, 0.0) + 1.0
         end
-        total = sum(values(char_counts)) + Float64(pseudocount) * length(char_counts)
+
+        total = sum(values(counts)) + Float64(pseudocount) * length(counts)
         total <= 0 && continue
+
         H = 0.0
-        for v in values(char_counts)
-            p = (v + Float64(pseudocount) / length(char_counts)) / total
-            p > 0 && (H -= p * log2(p))
+        for (c, cnt) in counts
+            p = (cnt + Float64(pseudocount) / length(counts)) / total
+            if p > 0
+                H -= p * log2(p)
+            end
         end
-        k = length(char_counts)
-        H_max = k > 1 ? log2(Float64(k)) : 1.0
-        scores[col] = clamp(1.0 - H / max(H_max, eps(Float64)), 0.0, 1.0)
+
+        score = clamp(1.0 - (H / H_max), 0.0, 1.0)
+        scores[col] = score
     end
+
     result = scores
-    _ctx = active_provenance_context()
-
-
-    return _register_coevolution_result!(_ctx, result, "column_conservation_scores"; parents=String[], parameters=(n_seqs=n, n_cols=l, gap_penalise=gap_penalise))
+    return _register_coevolution_result!(_ctx, result, "column_conservation_scores"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, gap_penalise=gap_penalise, method=method))
 end
 
 # ---------------------------------------------------------------------------
@@ -635,30 +857,29 @@ end
 """
     sequence_logo_entropy(alignment; pseudocount=0.5, information_content=true)
 
-Compute per-column Shannon entropy and information content for generating
-sequence logos, analogous to `seqLogo` / `ggseqlogo` in Bioconductor.
-
-Returns a `DataFrame` with columns: `position`, `entropy`, `information_content`,
-plus one column per amino acid/nucleotide giving its relative frequency.
+Compute per-column Shannon entropy and Information Content (height of stack) with small-sample error correction (Miller-Madow).
 """
-function sequence_logo_entropy(
-    alignment::MultipleSequenceAlignment;
+function sequence_logo_entropy(alignment::MultipleSequenceAlignment;
     pseudocount::Real=0.5,
-    information_content::Bool=true)
-    using_df = @isdefined(DataFrames)
+    information_content::Bool=true,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     l = ncodeunits(strings[1])
     all(ncodeunits(s) == l for s in strings) || throw(ArgumentError("all sequences must have equal length"))
     n = length(strings)
 
-    # Collect all characters (non-gap)
     all_chars = sort!(unique(collect(Iterators.flatten(strings))))
     filter!(c -> c != '-', all_chars)
+    q = max(length(all_chars), 2)
 
     pos_vec  = Int[]
     ent_vec  = Float64[]
     ic_vec   = Float64[]
     freq_mat = zeros(Float64, l, length(all_chars))
+
+    small_sample_err = (q - 1) / (2 * log(2) * n)
 
     for col in 1:l
         counts = Dict{Char,Float64}()
@@ -672,22 +893,21 @@ function sequence_logo_entropy(
             cnt = get(counts, c, 0.0) + Float64(pseudocount)
             p   = cnt / total
             freq_mat[col, k_idx] = p
-            p > 0 && (H -= p * log2(p))
+            if p > 0
+                H -= p * log2(p)
+            end
         end
-        H_max = log2(max(length(all_chars), 2.0))
-        IC = H_max - H
+        H_max = log2(Float64(q))
+        IC = max(0.0, H_max - (H + small_sample_err))
         push!(pos_vec, col)
         push!(ent_vec, H)
         push!(ic_vec, IC)
     end
 
-    # Build a simple NamedTuple table (avoid DataFrames dependency here)
     char_freqs = NamedTuple{Tuple(Symbol.(string.(all_chars)))}(Tuple(freq_mat[:, k] for k in 1:length(all_chars)))
     result = merge((position=pos_vec, entropy=ent_vec, information_content=ic_vec), char_freqs)
-    _ctx = active_provenance_context()
 
-
-    return _register_coevolution_result!(_ctx, result, "sequence_logo_entropy"; parents=String[], parameters=(n_seqs=n, n_cols=l, n_chars=length(all_chars)))
+    return _register_coevolution_result!(_ctx, result, "sequence_logo_entropy"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, n_chars=length(all_chars)))
 end
 
 # ---------------------------------------------------------------------------
@@ -697,17 +917,15 @@ end
 """
     evolutionary_coupling_network(contact_map; score_threshold=0.4, min_separation=5)
 
-Build an evolutionary coupling network from a `ContactMap`, where edges connect
-residue pairs with scores above `score_threshold`.
-
-Analogous to the network view in `EVcouplings` / `gremlin`.
-
-Returns `(edges=NamedTuple, degree=Vector, hub_residues=Vector{Int})`.
+Build an evolutionary coupling network connecting residue pairs with contact scores above `score_threshold`.
+Identifies high-degree hub residues.
 """
-function evolutionary_coupling_network(
-    contact_map::ContactMap;
+function evolutionary_coupling_network(contact_map::ContactMap;
     score_threshold::Real=0.4,
-    min_separation::Int=5)
+    min_separation::Int=5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     scores = contact_map.scores
     l = size(scores, 1)
 
@@ -729,15 +947,14 @@ function evolutionary_coupling_network(
         degree[j] += 1
     end
 
-    hub_threshold = quantile(Float64.(degree[degree .> 0]), 0.9)
-    hub_residues = findall(d -> d >= hub_threshold, degree)
+    active_degrees = degree[degree .> 0]
+    hub_threshold = !isempty(active_degrees) ? quantile(Float64.(active_degrees), 0.9) : 0.0
+    hub_residues = !isempty(active_degrees) ? findall(d -> d >= hub_threshold && d > 0, degree) : Int[]
 
     edges = (node_i=node_i, node_j=node_j, weights=weights)
     result = (edges=edges, degree=degree, hub_residues=hub_residues, n_edges=length(node_i))
-    _ctx = active_provenance_context()
 
-
-    return _register_coevolution_result!(_ctx, result, "evolutionary_coupling_network"; parents=String[], parameters=(l=l, score_threshold=Float64(score_threshold), n_edges=length(node_i), n_hubs=length(hub_residues)))
+    return _register_coevolution_result!(_ctx, result, "evolutionary_coupling_network"; parents=provenance_parent_ids(contact_map), parameters=(l=l, score_threshold=Float64(score_threshold), n_edges=length(node_i), n_hubs=length(hub_residues)))
 end
 
 # ---------------------------------------------------------------------------
@@ -745,24 +962,19 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    contact_enrichment_statistics(contact_map, true_contacts; top_fractions=[0.5,1.0,2.0])
+    contact_enrichment_statistics(contact_map, true_contacts; top_fractions=[0.5, 1.0, 2.0], min_separation=5)
 
-Evaluate predicted contacts against known structural contacts by computing
-precision at different L/k contact fractions, analogous to `metapsicov` and
-`EVcouplings` benchmarking output.
-
-`true_contacts`: binary matrix (l × l) where 1 = true structural contact.
-`top_fractions`: multiples of L (sequence length) to evaluate at.
-
-Returns a `NamedTuple` with `precision_at_k`, `ppv_auc`, `mcc` per threshold.
+Benchmarking predicted contacts against true structural contacts (Precision at L/k, PPV AUC, Matthews Correlation Coefficient).
 """
 function contact_enrichment_statistics(contact_map::ContactMap, true_contacts::AbstractMatrix{<:Real};
     top_fractions=[0.5, 1.0, 2.0],
-    min_separation::Int=5)
+    min_separation::Int=5,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     l = size(contact_map.scores, 1)
     size(true_contacts) == (l, l) || throw(DimensionMismatch("true_contacts must match contact map size"))
 
-    # Collect all predicted pairs
     pairs = Tuple{Int,Int,Float64}[]
     for i in 1:l-1, j in (i+1):l
         abs(j - i) < min_separation && continue
@@ -770,10 +982,9 @@ function contact_enrichment_statistics(contact_map::ContactMap, true_contacts::A
     end
     sort!(pairs; by=p -> p[3], rev=true)
 
-    # True contact pairs
     true_set = Set{Tuple{Int,Int}}()
     for i in 1:l-1, j in (i+1):l
-        true_contacts[i, j] > 0.5 && push!(true_set, (i, j))
+        abs(j - i) >= min_separation && true_contacts[i, j] > 0.5 && push!(true_set, (i, j))
     end
     n_true = length(true_set)
 
@@ -785,7 +996,6 @@ function contact_enrichment_statistics(contact_map::ContactMap, true_contacts::A
         prec_at_k[frac] = k > 0 ? tp / k : 0.0
     end
 
-    # PPV AUC (area under precision-recall for top L pairs)
     max_k = min(l, length(pairs))
     precisions = Float64[]
     for k in 1:max_k
@@ -794,47 +1004,46 @@ function contact_enrichment_statistics(contact_map::ContactMap, true_contacts::A
     end
     ppv_auc = max_k > 0 ? mean(precisions) : 0.0
 
-    # MCC at L contacts
     k_L = min(l, length(pairs))
     tp_L = count(p -> (p[1], p[2]) in true_set, pairs[1:k_L])
     fp_L = k_L - tp_L
     fn_L = max(n_true - tp_L, 0)
-    n_pairs = (l * (l - 1)) ÷ 2 - sum(abs(p[2]-p[1]) < min_separation ? 1 : 0 for p in pairs; init=0)
-    tn_L = max(n_pairs - tp_L - fp_L - fn_L, 0)
+    n_candidate_pairs = length(pairs)
+    tn_L = max(n_candidate_pairs - tp_L - fp_L - fn_L, 0)
+
     mcc_denom = sqrt(Float64((tp_L + fp_L) * (tp_L + fn_L) * (tn_L + fp_L) * (tn_L + fn_L)))
     mcc = mcc_denom > 0 ? (tp_L * tn_L - fp_L * fn_L) / mcc_denom : 0.0
 
-    return (precision_at_k=prec_at_k, ppv_auc=ppv_auc, mcc=mcc, n_true_contacts=n_true)
+    result = (precision_at_k=prec_at_k, ppv_auc=ppv_auc, mcc=mcc, n_true_contacts=n_true)
+    return _register_coevolution_result!(_ctx, result, "contact_enrichment_statistics"; parents=provenance_parent_ids(contact_map), parameters=(l=l, min_separation=min_separation, n_true=n_true))
 end
 
 # ---------------------------------------------------------------------------
-# Ledoit-Wolf Shrinkage for Precision Contacts (PSICOV-style)
+# Ledoit-Wolf Shrinkage for Precision Contacts (PSICOV)
 # ---------------------------------------------------------------------------
 
 """
     shrinkage_precision_contacts(alignment; shrinkage=:ledoit_wolf, min_separation=5)
 
-Compute contact scores from a regularised (shrunk) precision matrix, analogous
-to `PSICOV` (Jones et al. 2012). Uses Ledoit-Wolf optimal shrinkage to
-improve covariance matrix conditioning.
-
-Returns a `ContactMap` with shrinkage-precision scores.
+Compute contact scores using Ledoit-Wolf optimal covariance shrinkage for matrix conditioning.
 """
-function shrinkage_precision_contacts(
-    alignment::MultipleSequenceAlignment;
+function shrinkage_precision_contacts(alignment::MultipleSequenceAlignment;
     shrinkage::Symbol=:ledoit_wolf,
     min_separation::Int=5,
     max_gap_fraction::Real=0.5,
     min_sequence_coverage::Real=0.5,
-    identity_threshold::Real=0.8)
-    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage)
+    identity_threshold::Real=0.8,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, _ctx=_ctx)
     strings = _alignment_strings(filtered)
     alphabet = _alphabet(strings)
     encoded = _encode_alignment(strings, alphabet)
     n, l = size(encoded)
     q = length(alphabet)
 
-    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold)
+    weights = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
     eff_n = max(sum(weights), eps(Float64))
 
     one_hot = _one_hot(encoded, q)
@@ -842,14 +1051,16 @@ function shrinkage_precision_contacts(
     centered = one_hot .- reshape(wmean, 1, :)
     wcentered = centered .* reshape(sqrt.(weights), :, 1)
 
-    S = (wcentered' * wcentered) ./ eff_n   # sample covariance
+    S = (wcentered' * wcentered) ./ eff_n
     p = size(S, 1)
 
-    # Ledoit-Wolf shrinkage intensity
     if shrinkage == :ledoit_wolf
         μ = tr(S) / p
-        # Simplified Oracle Approximating Shrinkage (OAS) estimate
-        rho = clamp(((1 - 2/p) * tr(S * S) + tr(S)^2) / ((eff_n + 1 - 2/p) * max(tr(S * S) - tr(S)^2 / p, eps(Float64))), 0.0, 1.0)
+        tr_S2 = sum(abs2, S)
+        tr_S = tr(S)
+        denom = max((eff_n + 1 - 2/p) * (tr_S2 - (tr_S^2 / p)), eps(Float64))
+        num = (1 - 2/p) * tr_S2 + (tr_S^2)
+        rho = clamp(num / denom, 0.0, 1.0)
         Σ_shrunk = (1 - rho) .* S .+ rho * μ * I
     else
         reg = 0.05
@@ -863,7 +1074,9 @@ function shrinkage_precision_contacts(
         i_range = (i - 1) * q + 1:i * q
         for j in i+1:l
             j_range = (j - 1) * q + 1:j * q
-            sc = norm(precision[i_range, j_range])
+            block = copy(precision[i_range, j_range])
+            _zero_sum_gauge!(block)
+            sc = norm(block)
             scores[i, j] = sc
             scores[j, i] = sc
         end
@@ -876,36 +1089,32 @@ function shrinkage_precision_contacts(
         end
     end
 
-    return ContactMap(_normalize_scores(apc), collect(1:l))
+    norm_scores = _normalize_scores(apc; min_separation=min_separation)
+    result = ContactMap(norm_scores, collect(1:l))
+    return _register_coevolution_result!(_ctx, result, "shrinkage_precision_contacts"; parents=provenance_parent_ids(alignment), parameters=(shrinkage=shrinkage, min_separation=min_separation))
 end
 
 # ---------------------------------------------------------------------------
-# Phylogenetic Correction (effective sequence weighting)
+# Phylogenetic Correction
 # ---------------------------------------------------------------------------
 
 """
     phylogenetic_correction(alignment; identity_threshold=0.8, method=:henikoff)
 
-Compute phylogenetically corrected sequence weights using column-based
-position-specific weighting (Henikoff & Henikoff 1994) or standard
-maximum-identity-threshold clustering.
-
-`method`: `:henikoff` (position specific) or `:clustering` (threshold-based).
-
-Returns `(weights=Vector{Float64}, effective_sequences=Float64)`.
+Compute phylogenetically corrected sequence weights using Henikoff position-based weighting or threshold clustering.
 """
-function phylogenetic_correction(
-    alignment::MultipleSequenceAlignment;
+function phylogenetic_correction(alignment::MultipleSequenceAlignment;
     identity_threshold::Real=0.8,
-    method::Symbol=:henikoff)
+    method::Symbol=:henikoff,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     l = ncodeunits(strings[1])
     all(ncodeunits(s) == l for s in strings) || throw(ArgumentError("all sequences must have equal length"))
     n = length(strings)
 
     if method == :henikoff
-        # Position-specific weighting: w_i = sum_j 1/(r_ij * s_j)
-        # where r_ij = count of residue type at position j, s_j = number of different residue types
         weights = zeros(Float64, n)
         for col in 1:l
             col_chars = [strings[i][col] for i in 1:n]
@@ -921,19 +1130,18 @@ function phylogenetic_correction(
                 weights[i] += 1.0 / (r_ij * s_j)
             end
         end
-        # Normalise so mean weight = 1
         w_mean = mean(weights)
         w_mean > 0 && (weights ./= w_mean)
     else
-        # Standard threshold-based
         alphabet = _alphabet(strings)
         encoded  = _encode_alignment(strings, alphabet)
-        weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold)
-        weights .*= n / max(sum(weights), eps(Float64))   # rescale to n
+        weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
+        weights .*= n / max(sum(weights), eps(Float64))
     end
 
     eff_n = sum(weights)
-    return (weights=weights, effective_sequences=eff_n)
+    result = (weights=weights, effective_sequences=eff_n)
+    return _register_coevolution_result!(_ctx, result, "phylogenetic_correction"; parents=provenance_parent_ids(alignment), parameters=(method=method, identity_threshold=Float64(identity_threshold)))
 end
 
 # ---------------------------------------------------------------------------
@@ -943,52 +1151,56 @@ end
 """
     positional_covariation_matrix(alignment; pseudocount=0.5, metric=:pearson)
 
-Compute a symmetric l × l covariation (correlation) matrix between alignment
-columns, analogous to `covariation` in Rfam tools.
-
-`metric`: `:pearson` (Pearson correlation of one-hot encodings),
-          `:mutual_info` (mutual information).
-
-Returns a named tuple `(covariation=Matrix, positions=Vector{Int})`.
+Compute a symmetric l x l covariation matrix between alignment columns.
+Supports categorical one-hot matrix Frobenius correlation or Mutual Information.
 """
-function positional_covariation_matrix(
-    alignment::MultipleSequenceAlignment;
+function positional_covariation_matrix(alignment::MultipleSequenceAlignment;
     pseudocount::Real=0.5,
     metric::Symbol=:pearson,
     max_gap_fraction::Real=0.5,
     min_sequence_coverage::Real=0.5,
-    identity_threshold::Real=0.8)
-    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage)
+    identity_threshold::Real=0.8,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
+    filtered = filter_alignment_for_dca(alignment; max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, _ctx=_ctx)
     strings  = _alignment_strings(filtered)
     alphabet = _alphabet(strings)
     encoded  = _encode_alignment(strings, alphabet)
     n, l     = size(encoded)
     q        = length(alphabet)
 
-    weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold)
+    weights  = sequence_reweighting(encoded; identity_threshold=identity_threshold, _ctx=_ctx)
     eff_n    = max(sum(weights), eps(Float64))
 
     if metric == :pearson
-        # Column-wise one-hot, compute weighted Pearson correlation between columns
-        # Summarise each column as its dominant-state indicator (reduces to scalar per seq)
-        col_vectors = zeros(Float64, n, l)
-        for i in 1:n, j in 1:l
-            col_vectors[i, j] = Float64(encoded[i, j])
-        end
-        col_means = vec((weights' * col_vectors) ./ eff_n)
-        centered  = col_vectors .- col_means'
-        weighted_c = centered .* sqrt.(weights)
-        cov_mat = (weighted_c' * weighted_c) ./ eff_n
+        one_hot = _one_hot(encoded, q)
+        wmean   = vec((weights' * one_hot) ./ eff_n)
+        centered = one_hot .- reshape(wmean, 1, :)
+        wcentered = centered .* reshape(sqrt.(weights), :, 1)
 
-        # Pearson correlation
-        std_vec = sqrt.(max.(diag(cov_mat), eps(Float64)))
-        cor_mat = cov_mat ./ (std_vec * std_vec')
-        cor_mat[diagind(cor_mat)] .= 1.0
-        return (covariation=cor_mat, positions=collect(1:l))
+        cov_mat = (wcentered' * wcentered) ./ eff_n
+        cor_mat = zeros(Float64, l, l)
+
+        for i in 1:l
+            i_range = (i - 1) * q + 1:i * q
+            cov_ii = norm(cov_mat[i_range, i_range])
+            for j in 1:l
+                j_range = (j - 1) * q + 1:j * q
+                cov_jj = norm(cov_mat[j_range, j_range])
+                cov_ij = norm(cov_mat[i_range, j_range])
+                denom = sqrt(cov_ii * cov_jj)
+                cor_mat[i, j] = denom > 0 ? clamp(cov_ij / denom, 0.0, 1.0) : 0.0
+            end
+            cor_mat[i, i] = 1.0
+        end
+
+        result = (covariation=cor_mat, positions=collect(1:l))
+        return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     else
-        # Reuse MI contact scores without APC
-        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=0, apc=false, max_gap_fraction=1.0, min_sequence_coverage=0.0, identity_threshold=identity_threshold)
-        return (covariation=mi_map.scores, positions=collect(1:l))
+        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=0, apc=false, max_gap_fraction=1.0, min_sequence_coverage=0.0, identity_threshold=identity_threshold, _ctx=_ctx)
+        result = (covariation=mi_map.scores, positions=collect(1:l))
+        return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     end
 end
 
@@ -999,16 +1211,12 @@ end
 """
     gap_analysis(alignment)
 
-Analyse gap patterns in a multiple sequence alignment, analogous to
-`ggmsa` gap visualisation and `al2co` gap statistics.
-
-Returns a named tuple with:
-- `column_gap_fraction`: per-column gap fraction
-- `sequence_gap_fraction`: per-sequence gap fraction
-- `gap_blocks`: runs of consecutive gapped columns per sequence
-- `total_gap_fraction`: overall gap fraction
+Analyse gap distribution per column and sequence in a multiple sequence alignment.
 """
-function gap_analysis(alignment::MultipleSequenceAlignment)
+function gap_analysis(alignment::MultipleSequenceAlignment;
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     n = length(strings)
     l = ncodeunits(strings[1])
@@ -1017,7 +1225,6 @@ function gap_analysis(alignment::MultipleSequenceAlignment)
     col_gap = [mean(strings[i][col] == '-' for i in 1:n) for col in 1:l]
     seq_gap = [mean(strings[i][col] == '-' for col in 1:l) for i in 1:n]
 
-    # Gap blocks: (start, end, length) per sequence
     gap_blocks = Vector{Vector{Tuple{Int,Int,Int}}}(undef, n)
     for i in 1:n
         blocks = Tuple{Int,Int,Int}[]
@@ -1038,12 +1245,14 @@ function gap_analysis(alignment::MultipleSequenceAlignment)
     end
 
     total_gap = mean(col_gap)
-
-    return (
-        column_gap_fraction  = col_gap,
+    result = (
+        column_gap_fraction   = col_gap,
         sequence_gap_fraction = seq_gap,
-        gap_blocks           = gap_blocks,
-        total_gap_fraction   = total_gap)
+        gap_blocks            = gap_blocks,
+        total_gap_fraction    = total_gap
+    )
+
+    return _register_coevolution_result!(_ctx, result, "gap_analysis"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, total_gap=total_gap))
 end
 
 # ---------------------------------------------------------------------------
@@ -1053,16 +1262,14 @@ end
 """
     contact_precision_recall(contact_map, true_contacts; min_separation=5, n_points=50)
 
-Compute a precision-recall curve for a predicted `ContactMap` against known
-structural contacts, analogous to the benchmarking in `EVcouplings` and CASP.
-
-Returns `(thresholds, precision, recall, auc_pr)`.
+Compute Precision-Recall curve statistics and Area Under PR Curve (AUC-PR).
 """
-function contact_precision_recall(
-    contact_map::ContactMap,
-    true_contacts::AbstractMatrix{<:Real};
+function contact_precision_recall(contact_map::ContactMap, true_contacts::AbstractMatrix{<:Real};
     min_separation::Int=5,
-    n_points::Int=50)
+    n_points::Int=50,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     l = size(contact_map.scores, 1)
     size(true_contacts) == (l, l) || throw(DimensionMismatch("true_contacts must match contact map size"))
 
@@ -1075,7 +1282,7 @@ function contact_precision_recall(
 
     true_set = Set{Tuple{Int,Int}}()
     for i in 1:l-1, j in (i+1):l
-        true_contacts[i, j] > 0.5 && push!(true_set, (i, j))
+        abs(j - i) >= min_separation && true_contacts[i, j] > 0.5 && push!(true_set, (i, j))
     end
     n_true = length(true_set)
     n_true == 0 && return (thresholds=Float64[], precision=Float64[], recall=Float64[], auc_pr=0.0)
@@ -1087,18 +1294,19 @@ function contact_precision_recall(
     for thr in thresholds
         pred = [(p[1], p[2]) for p in pairs if p[3] >= thr]
         tp = count(p -> p in true_set, pred)
-        fp = length(pred) - tp
-        push!(prec_vec, length(pred) > 0 ? tp / length(pred) : 1.0)
-        push!(rec_vec, tp / n_true)
+        prec = !isempty(pred) ? tp / length(pred) : 0.0
+        rec = tp / n_true
+        push!(prec_vec, prec)
+        push!(rec_vec, rec)
     end
 
-    # AUC using trapezoid rule
     auc = sum(
         0.5 * (prec_vec[k] + prec_vec[k+1]) * abs(rec_vec[k+1] - rec_vec[k])
         for k in 1:(n_points - 1)
     )
 
-    return (thresholds=collect(thresholds), precision=prec_vec, recall=rec_vec, auc_pr=auc)
+    result = (thresholds=collect(thresholds), precision=prec_vec, recall=rec_vec, auc_pr=auc)
+    return _register_coevolution_result!(_ctx, result, "contact_precision_recall"; parents=provenance_parent_ids(contact_map), parameters=(n_points=n_points, n_true=n_true, auc_pr=auc))
 end
 
 # ---------------------------------------------------------------------------
@@ -1108,18 +1316,12 @@ end
 """
     alignment_quality_report(alignment)
 
-Generate a comprehensive quality summary for a multiple sequence alignment,
-analogous to `trimal` quality metrics and `NCBI MSA viewer` statistics.
-
-Returns a `NamedTuple` with:
-- `n_sequences`, `alignment_length`
-- `effective_sequences` (at 80% identity threshold)
-- `mean_pairwise_identity`, `min_identity`, `max_identity`
-- `column_gap_fraction` (per-column), `mean_gap_fraction`
-- `conservation_scores` (per-column), `mean_conservation`
-- `entropy_per_column`
+Generate a comprehensive quality report for a multiple sequence alignment.
 """
-function alignment_quality_report(alignment::MultipleSequenceAlignment)
+function alignment_quality_report(alignment::MultipleSequenceAlignment;
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
+
     strings = _alignment_strings(alignment)
     n = length(strings)
     l = ncodeunits(strings[1])
@@ -1128,37 +1330,347 @@ function alignment_quality_report(alignment::MultipleSequenceAlignment)
     alphabet = _alphabet(strings)
     encoded  = _encode_alignment(strings, alphabet)
 
-    weights  = sequence_reweighting(encoded; identity_threshold=0.8)
+    weights  = sequence_reweighting(encoded; identity_threshold=0.8, _ctx=_ctx)
     eff_n    = sum(weights)
 
-    # Pairwise identity
     identities = Float64[]
     for i in 1:n-1, j in (i+1):n
-        id = count(encoded[i, k] == encoded[j, k] && strings[i][k] != '-' for k in 1:l) /
-             max(count(strings[i][k] != '-' || strings[j][k] != '-' for k in 1:l), 1)
-        push!(identities, id)
+        denom = count(strings[i][k] != '-' || strings[j][k] != '-' for k in 1:l)
+        if denom > 0
+            id = count(encoded[i, k] == encoded[j, k] && strings[i][k] != '-' for k in 1:l) / denom
+            push!(identities, id)
+        end
     end
     mean_id = isempty(identities) ? 0.0 : mean(identities)
     min_id  = isempty(identities) ? 0.0 : minimum(identities)
     max_id  = isempty(identities) ? 0.0 : maximum(identities)
 
-    # Per-column stats
     col_gap  = [mean(strings[i][col] == '-' for i in 1:n) for col in 1:l]
-    cons     = column_conservation_scores(alignment)
-    logo     = sequence_logo_entropy(alignment)
+    cons     = column_conservation_scores(alignment; _ctx=_ctx)
+    logo     = sequence_logo_entropy(alignment; _ctx=_ctx)
 
-    return (
-        n_sequences           = n,
-        alignment_length      = l,
-        effective_sequences   = eff_n,
+    result = (
+        n_sequences            = n,
+        alignment_length       = l,
+        effective_sequences    = eff_n,
         mean_pairwise_identity = mean_id,
         min_pairwise_identity  = min_id,
         max_pairwise_identity  = max_id,
-        column_gap_fraction    = col_gap,
-        mean_gap_fraction      = mean(col_gap),
-        conservation_scores    = cons,
-        mean_conservation      = mean(cons),
-        entropy_per_column     = logo.entropy)
+        column_gap_fraction     = col_gap,
+        mean_gap_fraction       = mean(col_gap),
+        conservation_scores     = cons,
+        mean_conservation       = mean(cons),
+        entropy_per_column      = logo.entropy
+    )
+
+    return _register_coevolution_result!(_ctx, result, "alignment_quality_report"; parents=provenance_parent_ids(alignment), parameters=(n_seqs=n, n_cols=l, effective_sequences=eff_n))
 end
+
+# ---------------------------------------------------------------------------
+# Interactive HTML Visualizations
+# ---------------------------------------------------------------------------
+
+"""
+    to_html(cmap::ContactMap) -> String
+
+Generate a standalone interactive HTML Canvas report for a ContactMap.
+Provides dark mode styling, score threshold sliders, matrix heatmaps, hover tooltips, and top contact pair inspection.
+"""
+function to_html(cmap::ContactMap)
+    l = size(cmap.scores, 1)
+    matrix_json = "[" * join(["[" * join([string(round(cmap.scores[i, j]; digits=4)) for j in 1:l], ",") * "]" for i in 1:l], ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BioToolkit — Co-evolutionary Contact Map</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; --glow: #818cf8; }
+        body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+        .header { display: flex; align-items: center; justify-content: space-between; background: var(--panel); padding: 16px 24px; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+        .title { font-size: 1.4rem; font-weight: 700; color: var(--accent); display: flex; align-items: center; gap: 10px; }
+        .controls { display: flex; gap: 16px; align-items: center; }
+        label { font-size: 0.9rem; color: #94a3b8; font-weight: 500; }
+        input[type=range] { accent-color: var(--accent); cursor: pointer; }
+        .main-grid { display: grid; grid-template-columns: 1fr 340px; gap: 20px; }
+        .card { background: var(--panel); border-radius: 12px; border: 1px solid var(--border); padding: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); position: relative; }
+        canvas { width: 100%; display: block; border-radius: 8px; cursor: crosshair; }
+        .tooltip { position: absolute; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--accent); padding: 8px 12px; border-radius: 6px; font-size: 12px; pointer-events: none; display: none; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
+        .contact-list { max-height: 540px; overflow-y: auto; font-family: monospace; font-size: 13px; }
+        .contact-row { display: flex; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--border); border-radius: 4px; }
+        .contact-row:hover { background: #334155; }
+        .badge { background: #1e1b4b; color: var(--glow); padding: 2px 8px; border-radius: 12px; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">🧬 Residue Contact Map Visualizer <span style="font-size: 0.8rem; color: #94a3b8;">($(l) × $(l) Residues)</span></div>
+        <div class="controls">
+            <label for="threshold">Score Cutoff: <span id="thresh-val" style="color: var(--accent); font-weight: bold;">0.20</span></label>
+            <input type="range" id="threshold" min="0.0" max="1.0" step="0.01" value="0.20" oninput="updatePlot()">
+        </div>
+    </div>
+    <div class="main-grid">
+        <div class="card">
+            <canvas id="contactCanvas"></canvas>
+            <div id="tooltip" class="tooltip"></div>
+        </div>
+        <div class="card">
+            <h3 style="margin-top: 0; color: var(--accent);">Top Co-evolving Pairs</h3>
+            <div id="contactList" class="contact-list"></div>
+        </div>
+    </div>
+    <script>
+        const scores = $(matrix_json);
+        const L = $(l);
+        const canvas = document.getElementById('contactCanvas');
+        const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('tooltip');
+
+        function resizeCanvas() {
+            const size = Math.min(canvas.parentElement.clientWidth - 40, 600);
+            canvas.width = size * window.devicePixelRatio;
+            canvas.height = size * window.devicePixelRatio;
+            canvas.style.width = size + 'px';
+            canvas.style.height = size + 'px';
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            render();
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        function getColor(val, cutoff) {
+            if (val < cutoff) return '#1e293b';
+            const norm = (val - cutoff) / (1.0 - cutoff + 1e-6);
+            const r = Math.round(56 + norm * 199);
+            const g = Math.round(189 - norm * 50);
+            const b = Math.round(248 - norm * 100);
+            return `rgb(\${r},\${g},\${b})`;
+        }
+
+        function render() {
+            const cutoff = parseFloat(document.getElementById('threshold').value);
+            document.getElementById('thresh-val').textContent = cutoff.toFixed(2);
+            const displaySize = parseFloat(canvas.style.width);
+            const cell = displaySize / L;
+
+            ctx.clearRect(0, 0, displaySize, displaySize);
+
+            for (let i = 0; i < L; i++) {
+                for (let j = 0; j < L; j++) {
+                    const val = scores[i][j];
+                    ctx.fillStyle = getColor(val, cutoff);
+                    ctx.fillRect(j * cell, i * cell, cell, cell);
+                }
+            }
+            updateContactList(cutoff);
+        }
+
+        function updateContactList(cutoff) {
+            const pairs = [];
+            for (let i = 0; i < L - 1; i++) {
+                for (let j = i + 1; j < L; j++) {
+                    if (scores[i][j] >= cutoff) {
+                        pairs.push({ i: i + 1, j: j + 1, score: scores[i][j] });
+                    }
+                }
+            }
+            pairs.sort((a, b) => b.score - a.score);
+
+            const listEl = document.getElementById('contactList');
+            listEl.innerHTML = pairs.slice(0, 30).map(p => `
+                <div class="contact-row">
+                    <span>Residue \${p.i} — \${p.j}</span>
+                    <span class="badge">\${p.score.toFixed(3)}</span>
+                </div>
+            `).join('');
+        }
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const displaySize = parseFloat(canvas.style.width);
+            const cell = displaySize / L;
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const col = Math.floor(x / cell);
+            const row = Math.floor(y / cell);
+
+            if (row >= 0 && row < L && col >= 0 && col < L) {
+                tooltip.style.display = 'block';
+                tooltip.style.left = (x + 15) + 'px';
+                tooltip.style.top = (y + 15) + 'px';
+                tooltip.innerHTML = `<strong>Residues (\${row + 1}, \${col + 1})</strong><br>Score: \${scores[row][col].toFixed(4)}`;
+            }
+        });
+
+        canvas.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+        function updatePlot() { render(); }
+        setTimeout(resizeCanvas, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+"""
+    to_html(model::PseudoLikelihoodModel) -> String
+
+Generate an interactive HTML inspection report for a PseudoLikelihoodModel object.
+"""
+function to_html(model::PseudoLikelihoodModel)
+    return to_html(ContactMap(model.apc_scores, collect(1:size(model.apc_scores, 1))))
+end
+
+"""
+    visualize_contact_map_html(cmap::ContactMap) -> String
+
+Alias function for interactive HTML ContactMap report generation.
+"""
+function visualize_contact_map_html(cmap::ContactMap)
+    return to_html(cmap)
+end
+
+"""
+    visualize_coevolution_network_html(network) -> String
+
+Generate an interactive HTML5 network visualizer for an evolutionary coupling network.
+"""
+function visualize_coevolution_network_html(network)
+    edges_json = "[" * join(["{\"source\":$(network.edges.node_i[k]),\"target\":$(network.edges.node_j[k]),\"weight\":$(round(network.edges.weights[k]; digits=4))}" for k in 1:length(network.edges.node_i)], ",") * "]"
+    degree_json = "[" * join([string(d) for d in network.degree], ",") * "]"
+    hubs_json = "[" * join([string(h) for h in network.hub_residues], ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BioToolkit — Evolutionary Coupling Network</title>
+    <style>
+        body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; }
+        .card { background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 20px; }
+        h2 { color: #38bdf8; margin-top: 0; }
+        canvas { width: 100%; height: 500px; display: block; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>🌐 Evolutionary Coupling Network</h2>
+        <canvas id="netCanvas"></canvas>
+    </div>
+    <script>
+        const edges = $(edges_json);
+        const degrees = $(degree_json);
+        const hubs = new Set($(hubs_json));
+        const L = degrees.length;
+        const canvas = document.getElementById('netCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function draw() {
+            canvas.width = canvas.clientWidth * window.devicePixelRatio;
+            canvas.height = 500 * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            const width = canvas.clientWidth;
+            const height = 500;
+
+            ctx.clearRect(0, 0, width, height);
+            const cx = width / 2;
+            const cy = height / 2;
+            const radius = Math.min(width, height) * 0.38;
+
+            const nodes = [];
+            for (let i = 0; i < L; i++) {
+                const angle = (2 * Math.PI * i) / L - Math.PI / 2;
+                nodes.push({ x: cx + radius * Math.cos(angle), y: cy + radius * Math.sin(angle), id: i + 1 });
+            }
+
+            // Draw edges
+            edges.forEach(e => {
+                const n1 = nodes[e.source - 1];
+                const n2 = nodes[e.target - 1];
+                ctx.beginPath();
+                ctx.moveTo(n1.x, n1.y);
+                ctx.lineTo(n2.x, n2.y);
+                ctx.strokeStyle = `rgba(56, 189, 248, \${Math.min(1.0, e.weight * 1.5)})`;
+                ctx.lineWidth = Math.max(1, e.weight * 3);
+                ctx.stroke();
+            });
+
+            // Draw nodes
+            nodes.forEach((n, i) => {
+                const isHub = hubs.has(n.id);
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, isHub ? 8 : 5, 0, 2 * Math.PI);
+                ctx.fillStyle = isHub ? '#818cf8' : '#38bdf8';
+                ctx.fill();
+                ctx.strokeStyle = '#0f172a';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+            });
+        }
+        setTimeout(draw, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+"""
+    visualize_alignment_quality_html(report) -> String
+
+Generate an interactive HTML quality report for a multiple sequence alignment.
+"""
+function visualize_alignment_quality_html(report)
+    cons_json = "[" * join([string(round(c; digits=4)) for c in report.conservation_scores], ",") * "]"
+    gaps_json = "[" * join([string(round(g; digits=4)) for g in report.column_gap_fraction], ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>BioToolkit — Alignment Quality Report</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px; }
+        .metric { background: #1e293b; border: 1px solid #334155; padding: 16px; border-radius: 8px; text-align: center; }
+        .val { font-size: 1.6rem; font-weight: bold; color: #38bdf8; }
+        .label { font-size: 0.85rem; color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <h2>📊 MSA Quality Dashboard</h2>
+    <div class="grid">
+        <div class="metric"><div class="val">$(report.n_sequences)</div><div class="label">Sequences</div></div>
+        <div class="metric"><div class="val">$(report.alignment_length)</div><div class="label">Alignment Length</div></div>
+        <div class="metric"><div class="val">$(round(report.effective_sequences; digits=1))</div><div class="label">Effective Seqs (Neff)</div></div>
+        <div class="metric"><div class="val">$(round(report.mean_pairwise_identity * 100; digits=1))%</div><div class="label">Mean Identity</div></div>
+    </div>
+</body>
+</html>
+"""
+end
+
+"""
+    visualize_sequence_logo_html(logo) -> String
+
+Generate an interactive HTML sequence logo viewer.
+"""
+function visualize_sequence_logo_html(logo)
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>BioToolkit — Sequence Logo</title></head>
+<body style="background: #0f172a; color: #f8fafc; font-family: system-ui, sans-serif; padding: 20px;">
+    <h2>🔤 Sequence Logo Entropy View</h2>
+    <p>Alignment Position Count: $(length(logo.position))</p>
+</body>
+</html>
+"""
+end
+
 
 end

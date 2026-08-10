@@ -26,6 +26,8 @@ using Plots
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_container_provenance!, register_provenance!
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 
+import ..BioToolkit: to_html, export_html
+
 export PatientCohort, KaplanMeierResult, CoxResult, CoxTermResult, MAFRecord, MAFSummary
 export read_maf, summarize_maf, tcga_query, tcga_download_files, merge_tcga_count_files, tcga_ingest, kaplan_meier, logrank_test, cox_ph
 export forest_plot, survival_roc, cif_curve, neural_cox, dose_response_curve, oncoprint
@@ -64,6 +66,9 @@ Kaplan-Meier survival curve summary with event and censoring counts.
 struct KaplanMeierResult <: AbstractAnalysisResult
     time::Vector{Float64}
     survival::Vector{Float64}
+    std_error::Vector{Float64}
+    ci_lower::Vector{Float64}
+    ci_upper::Vector{Float64}
     at_risk::Vector{Int}
     events::Vector{Int}
     censored::Vector{Int}
@@ -72,8 +77,15 @@ struct KaplanMeierResult <: AbstractAnalysisResult
     provenance::ResultProvenance
 end
 
-KaplanMeierResult(time, survival, at_risk, events, censored, censor_times, censor_survival) =
-    KaplanMeierResult(time, survival, at_risk, events, censored, censor_times, censor_survival, provenance_record("KaplanMeierResult", "clinical"))
+KaplanMeierResult(time, survival, std_error, ci_lower, ci_upper, at_risk, events, censored, censor_times, censor_survival) =
+    KaplanMeierResult(time, survival, std_error, ci_lower, ci_upper, at_risk, events, censored, censor_times, censor_survival, provenance_record("KaplanMeierResult", "clinical"))
+
+function KaplanMeierResult(time, survival, at_risk, events, censored, censor_times, censor_survival)
+    se = zeros(Float64, length(survival))
+    cil = copy(survival)
+    ciu = copy(survival)
+    return KaplanMeierResult(time, survival, se, cil, ciu, at_risk, events, censored, censor_times, censor_survival)
+end
 
 """
     CoxTermResult
@@ -311,33 +323,86 @@ end
 Compute a Kaplan-Meier survival estimate from event times and censoring status.
 """
 function kaplan_meier(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    sorted_time, sorted_status = _sorted_event_data(time, status)
-    unique_times = sort(unique(sorted_time[sorted_status .> 0]))
+    n_obs = length(time)
+    n_obs == length(status) || throw(ArgumentError("time and status must have equal length"))
+
+    order = sortperm(time)
+    sorted_time = Float64.(time)[order]
+    sorted_status = Int.(status)[order]
+
+    unique_times = Float64[]
     survival = Float64[]
+    std_error = Float64[]
+    ci_lower = Float64[]
+    ci_upper = Float64[]
     at_risk = Int[]
     events = Int[]
     censored = Int[]
     censor_times = Float64[]
     censor_survival = Float64[]
-    current_survival = 1.0
 
-    for event_time in unique_times
-        risk = count(t -> t >= event_time, sorted_time)
-        event_count, censor_count = _count_tie_events(sorted_time, sorted_status, event_time)
-        risk > 0 || continue
-        current_survival *= (1 - event_count / risk)
-        push!(survival, current_survival)
-        push!(at_risk, risk)
-        push!(events, event_count)
-        push!(censored, censor_count)
-        for _ in 1:censor_count
-            push!(censor_times, event_time)
-            push!(censor_survival, current_survival)
+    current_survival = 1.0
+    greenwood_sum = 0.0
+    current_at_risk = n_obs
+    i = 1
+
+    while i <= n_obs
+        t_current = sorted_time[i]
+        d_count = 0
+        c_count = 0
+
+        while i <= n_obs && sorted_time[i] == t_current
+            if sorted_status[i] > 0
+                d_count += 1
+            else
+                c_count += 1
+            end
+            i += 1
         end
+
+        n_curr = current_at_risk
+        if d_count > 0 && n_curr > 0
+            current_survival *= (1.0 - d_count / n_curr)
+            if n_curr > d_count
+                greenwood_sum += d_count / (n_curr * (n_curr - d_count))
+            end
+            se = current_survival * sqrt(greenwood_sum)
+
+            if current_survival > 0 && current_survival < 1
+                log_s = log(current_survival)
+                theta = 1.96 * se / (current_survival * abs(log_s))
+                cil = clamp(current_survival^exp(theta), 0.0, 1.0)
+                ciu = clamp(current_survival^exp(-theta), 0.0, 1.0)
+            else
+                cil = current_survival
+                ciu = current_survival
+            end
+
+            push!(unique_times, t_current)
+            push!(survival, current_survival)
+            push!(std_error, se)
+            push!(ci_lower, cil)
+            push!(ci_upper, ciu)
+            push!(at_risk, n_curr)
+            push!(events, d_count)
+            push!(censored, c_count)
+
+            for _ in 1:c_count
+                push!(censor_times, t_current)
+                push!(censor_survival, current_survival)
+            end
+        else
+            for _ in 1:c_count
+                push!(censor_times, t_current)
+                push!(censor_survival, current_survival)
+            end
+        end
+
+        current_at_risk -= (d_count + c_count)
     end
 
-    result = KaplanMeierResult(unique_times, survival, at_risk, events, censored, censor_times, censor_survival)
-    return provenance_result!(_ctx, result, "kaplan_meier"; parents=provenance_parent_ids(time, status), parameters=(n=length(time), event_times=length(unique_times)))
+    result = KaplanMeierResult(unique_times, survival, std_error, ci_lower, ci_upper, at_risk, events, censored, censor_times, censor_survival)
+    return provenance_result!(_ctx, result, "kaplan_meier"; parents=provenance_parent_ids(time, status), parameters=(n=n_obs, event_times=length(unique_times)))
 end
 
 """
@@ -357,45 +422,91 @@ function kaplan_meier_plot(result::KaplanMeierResult; title::String="Kaplan-Meie
     return provenance_result!(_ctx, plt, "kaplan_meier_plot"; parents=provenance_parent_ids(result), parameters=(title=title, show_censors=show_censors))
 end
 
-function _logrank_components(time::Vector{Float64}, status::Vector{Int}, groups::Vector{Int})
-    unique_times = sort(unique(time[status .> 0]))
-    observed = 0.0
-    expected = 0.0
-    variance = 0.0
-    for event_time in unique_times
-        at_risk = time .>= event_time
-        events_now = (time .== event_time) .& (status .> 0)
-        n = count(at_risk)
-        d = count(events_now)
-        n1 = count(at_risk .& (groups .== 1))
-        d1 = count(events_now .& (groups .== 1))
-        n > 0 || continue
-        e1 = d * n1 / n
-        v1 = n > 1 ? d * (n1 / n) * (1 - n1 / n) * (n - d) / (n - 1 + eps()) : 0.0
-        observed += d1
-        expected += e1
-        variance += v1
-    end
-    return observed, expected, variance
-end
-
 """
     logrank_test(time, status, groups)
 
-Compare two survival groups with a log-rank test.
+Compare survival distributions across two or more groups with a log-rank test.
 """
 function logrank_test(time::AbstractVector{<:Real}, status::AbstractVector{<:Integer}, groups::AbstractVector; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    sorted_time, sorted_status = _sorted_event_data(time, status)
-    length(groups) == length(time) || throw(ArgumentError("groups must match time and status"))
-    levels = _validated_group_levels(groups)
-    group_map = Dict(levels[1] => 1, levels[2] => 2)
-    reorder = sortperm(Float64.(time))
-    reordered_groups = Int[group_map[groups[index]] for index in reorder]
-    observed, expected, variance = _logrank_components(sorted_time, sorted_status, reordered_groups)
-    statistic = variance > 0 ? (observed - expected)^2 / variance : 0.0
-    pvalue = ccdf(Chisq(1), statistic)
-    result = (statistic=statistic, pvalue=pvalue, observed=observed, expected=expected, variance=variance)
-    return provenance_result!(_ctx, result, "logrank_test"; parents=provenance_parent_ids(time, status, groups), parameters=(n=length(time), group_count=length(levels), pvalue=pvalue))
+    n = length(time)
+    (n == length(status) && n == length(groups)) || throw(ArgumentError("time, status, and groups must have equal length"))
+
+    levels = unique(groups)
+    K = length(levels)
+    K >= 2 || throw(ArgumentError("groups must contain at least 2 distinct levels"))
+
+    group_map = Dict(lev => idx for (idx, lev) in enumerate(levels))
+    g_encoded = Int[group_map[g] for g in groups]
+
+    order = sortperm(time)
+    t_sorted = Float64.(time)[order]
+    s_sorted = Int.(status)[order]
+    g_sorted = g_encoded[order]
+
+    n_group = zeros(Int, K)
+    for g in g_encoded
+        n_group[g] += 1
+    end
+
+    observed = zeros(Float64, K)
+    expected = zeros(Float64, K)
+    V = zeros(Float64, K, K)
+
+    i = 1
+    while i <= n
+        t_curr = t_sorted[i]
+        d_group = zeros(Int, K)
+        c_group = zeros(Int, K)
+
+        while i <= n && t_sorted[i] == t_curr
+            g = g_sorted[i]
+            if s_sorted[i] > 0
+                d_group[g] += 1
+            else
+                c_group[g] += 1
+            end
+            i += 1
+        end
+
+        d_total = sum(d_group)
+        n_total = sum(n_group)
+
+        if d_total > 0 && n_total > 1
+            factor = (n_total - d_total) / (n_total - 1)
+            for g in 1:K
+                n_g = n_group[g]
+                e_g = d_total * (n_g / n_total)
+                observed[g] += d_group[g]
+                expected[g] += e_g
+
+                for m in 1:K
+                    n_m = n_group[m]
+                    if g == m
+                        V[g, g] += d_total * factor * (n_g / n_total) * (1.0 - n_g / n_total)
+                    else
+                        V[g, m] += -d_total * factor * (n_g / n_total) * (n_m / n_total)
+                    end
+                end
+            end
+        end
+
+        for g in 1:K
+            n_group[g] -= (d_group[g] + c_group[g])
+        end
+    end
+
+    df = K - 1
+    Z = observed[1:df] .- expected[1:df]
+    V_sub = V[1:df, 1:df]
+    statistic = try
+        dot(Z, V_sub \ Z)
+    catch
+        dot(Z, pinv(V_sub) * Z)
+    end
+    pvalue = ccdf(Chisq(df), max(statistic, 0.0))
+
+    result = (statistic=statistic, pvalue=pvalue, df=df, observed=observed[1], expected=expected[1], variance=V[1,1])
+    return provenance_result!(_ctx, result, "logrank_test"; parents=provenance_parent_ids(time, status, groups), parameters=(n=n, group_count=K, statistic=statistic, pvalue=pvalue))
 end
 
 function _encode_covariate(values::AbstractVector, term_name::String)
@@ -467,30 +578,62 @@ function _cox_order(time::Vector{Float64}, status::Vector{Int})
 end
 
 function _cox_loglik_gradient_hessian(beta::Vector{Float64}, X::Matrix{Float64}, time::Vector{Float64}, status::Vector{Int})
+    N, p = size(X)
     eta = X * beta
     risk = exp.(clamp.(eta, -40.0, 40.0))
-    p = size(X, 2)
+
     loglik = 0.0
     gradient = zeros(Float64, p)
     hessian = zeros(Float64, p, p)
-    for i in eachindex(time)
-        status[i] > 0 || continue
-        risk_set = time .>= time[i]
-        risk_indices = findall(risk_set)
-        denom = sum(risk[risk_indices])
-        denom <= 0 && continue
-        weighted_x = zeros(Float64, p)
-        for j in risk_indices
-            weighted_x .+= risk[j] .* X[j, :]
+
+    S0 = 0.0
+    S1 = zeros(Float64, p)
+    S2 = zeros(Float64, p, p)
+
+    i = 1
+    while i <= N
+        t_curr = time[i]
+        start_idx = i
+
+        while i <= N && time[i] == t_curr
+            w = risk[i]
+            x_i = @view X[i, :]
+            S0 += w
+            @inbounds for k in 1:p
+                S1[k] += w * x_i[k]
+                for l in 1:p
+                    S2[k, l] += w * x_i[k] * x_i[l]
+                end
+            end
+            i += 1
         end
-        weighted_x ./= denom
-        loglik += dot(X[i, :], beta) - log(denom)
-        gradient .+= X[i, :] .- weighted_x
-        for j in risk_indices
-            centered = X[j, :] .- weighted_x
-            hessian .-= (risk[j] / denom) .* (centered * centered')
+
+        d_events = 0
+        for j in start_idx:(i-1)
+            if status[j] > 0
+                d_events += 1
+            end
+        end
+
+        if d_events > 0 && S0 > 0.0
+            E_x = S1 ./ S0
+            for j in start_idx:(i-1)
+                if status[j] > 0
+                    x_j = @view X[j, :]
+                    loglik += dot(x_j, beta) - log(S0)
+                    gradient .+= x_j .- E_x
+                end
+            end
+
+            for k in 1:p
+                for l in 1:p
+                    v_kl = (S2[k, l] / S0) - E_x[k] * E_x[l]
+                    hessian[k, l] -= d_events * v_kl
+                end
+            end
         end
     end
+
     return loglik, gradient, hessian
 end
 
@@ -1301,30 +1444,502 @@ function propensity_score_match(clinical::DataFrame; treatment_col::Symbol=:trea
     ps = 1.0 ./ (1.0 .+ exp.(-clamp.(X * β, -25.0, 25.0)))
 
     treated = findall(==(1.0), y)
-    controls = Set(findall(==(0.0), y))
+    controls_vec = findall(==(0.0), y)
+
+    ctrl_perm = sortperm(ps[controls_vec])
+    sorted_controls = controls_vec[ctrl_perm]
+    sorted_ctrl_ps = ps[sorted_controls]
+    ctrl_matched = zeros(Bool, length(sorted_controls))
+
     matches = DataFrame(treated_index=Int[], control_index=Int[], treated_ps=Float64[], control_ps=Float64[], abs_distance=Float64[])
 
     for ti in sort(treated; by=i -> ps[i], rev=true)
-        isempty(controls) && break
+        p_t = ps[ti]
+        idx = searchsortedfirst(sorted_ctrl_ps, p_t)
+
         for _ in 1:ratio
-            isempty(controls) && break
-            best = 0
+            best_ci = 0
+            best_idx = 0
             best_dist = Inf
-            for ci in controls
-                d = abs(ps[ti] - ps[ci])
-                if d < best_dist
-                    best_dist = d
-                    best = ci
+
+            left = min(max(idx, 1), length(sorted_controls))
+            right = left
+
+            search_window = 0
+            while (left >= 1 || right <= length(sorted_controls)) && search_window < 200
+                if left >= 1 && !ctrl_matched[left]
+                    d = abs(p_t - sorted_ctrl_ps[left])
+                    if d < best_dist
+                        best_dist = d
+                        best_ci = sorted_controls[left]
+                        best_idx = left
+                    end
                 end
+                if right <= length(sorted_controls) && !ctrl_matched[right]
+                    d = abs(p_t - sorted_ctrl_ps[right])
+                    if d < best_dist
+                        best_dist = d
+                        best_ci = sorted_controls[right]
+                        best_idx = right
+                    end
+                end
+
+                if best_ci != 0 && best_dist < (left >= 1 ? abs(p_t - sorted_ctrl_ps[left]) : Inf) && (right > length(sorted_controls) || best_dist < abs(p_t - sorted_ctrl_ps[right]))
+                    break
+                end
+
+                left -= 1
+                right += 1
+                search_window += 1
             end
-            best == 0 && break
-            delete!(controls, best)
-            push!(matches, (ti, best, ps[ti], ps[best], best_dist))
+
+            if best_ci != 0
+                ctrl_matched[best_idx] = true
+                push!(matches, (ti, best_ci, p_t, ps[best_ci], best_dist))
+            else
+                break
+            end
         end
     end
 
     result = (matches=matches, propensity_score=ps, coefficients=β, covariates=vcat(:intercept, covariates))
     return provenance_result!(_ctx, result, "propensity_score_match"; parents=provenance_parent_ids(clinical), parameters=(row_count=nrow(clinical), treatment_col=treatment_col, covariate_count=length(covariates), ratio=ratio, match_count=nrow(matches)))
+end
+
+# ==============================================================================
+# Interactive HTML Exports for Clinical Results
+# ==============================================================================
+
+function to_html(km::KaplanMeierResult)
+    data_json = replace(JSON.json(Dict(
+        "time" => km.time,
+        "survival" => km.survival,
+        "std_error" => km.std_error,
+        "ci_lower" => km.ci_lower,
+        "ci_upper" => km.ci_upper,
+        "at_risk" => km.at_risk,
+        "events" => km.events,
+        "censored" => km.censored,
+        "censor_times" => km.censor_times,
+        "censor_survival" => km.censor_survival
+    )), "</" => "<\\/")
+
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kaplan-Meier Survival Analysis - BioToolkit</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); max-width: 960px; margin: 0 auto; border: 1px solid #334155; }
+        h2 { margin-top: 0; color: #38bdf8; font-weight: 600; }
+        .canvas-container { position: relative; width: 100%; height: 420px; background: #0f172a; border-radius: 8px; border: 1px solid #334155; }
+        canvas { width: 100%; height: 100%; display: block; }
+        .risk-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
+        .risk-table th, .risk-table td { padding: 8px 12px; text-align: center; border-bottom: 1px solid #334155; }
+        .risk-table th { background: #334155; color: #94a3b8; font-weight: 500; }
+        .badge { background: #0284c7; color: white; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-block; margin-bottom: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="badge">Clinical Genomics Engine</span>
+        <h2>Kaplan-Meier Survival Analysis</h2>
+        <div class="canvas-container" id="container">
+            <canvas id="kmCanvas"></canvas>
+        </div>
+        <table class="risk-table">
+            <thead>
+                <tr><th>Time</th><th>At Risk</th><th>Events</th><th>Censored</th><th>Survival %</th><th>95% CI</th></tr>
+            </thead>
+            <tbody id="riskTableBody"></tbody>
+        </table>
+    </div>
+
+    <script>
+        const kmData = $data_json;
+        const canvas = document.getElementById('kmCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('container');
+
+        function resize() {
+            canvas.width = container.clientWidth * window.devicePixelRatio;
+            canvas.height = container.clientHeight * window.devicePixelRatio;
+            draw();
+        }
+
+        function draw() {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            const padLeft = 60 * window.devicePixelRatio;
+            const padRight = 30 * window.devicePixelRatio;
+            const padTop = 30 * window.devicePixelRatio;
+            const padBottom = 50 * window.devicePixelRatio;
+
+            const pw = w - padLeft - padRight;
+            const ph = h - padTop - padBottom;
+
+            const maxTime = kmData.time.length ? Math.max(...kmData.time) * 1.05 : 1.0;
+
+            function mapX(t) { return padLeft + (t / maxTime) * pw; }
+            function mapY(s) { return padTop + (1.0 - s) * ph; }
+
+            ctx.strokeStyle = '#334155';
+            ctx.lineWidth = 1;
+            for (let s = 0.0; s <= 1.0; s += 0.2) {
+                const y = mapY(s);
+                ctx.beginPath(); ctx.moveTo(padLeft, y); ctx.lineTo(w - padRight, y); ctx.stroke();
+                ctx.fillStyle = '#94a3b8'; ctx.font = `\${12 * window.devicePixelRatio}px sans-serif`;
+                ctx.textAlign = 'right'; ctx.fillText(s.toFixed(1), padLeft - 10, y + 4);
+            }
+
+            if (kmData.ci_lower.length && kmData.ci_upper.length) {
+                ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+                ctx.beginPath();
+                ctx.moveTo(mapX(0), mapY(1.0));
+                let curL = 1.0, curU = 1.0;
+                for (let i = 0; i < kmData.time.length; i++) {
+                    const x = mapX(kmData.time[i]);
+                    ctx.lineTo(x, mapY(curU));
+                    curU = kmData.ci_upper[i];
+                    ctx.lineTo(x, mapY(curU));
+                }
+                for (let i = kmData.time.length - 1; i >= 0; i--) {
+                    const x = mapX(kmData.time[i]);
+                    curL = kmData.ci_lower[i];
+                    ctx.lineTo(x, mapY(curL));
+                }
+                ctx.closePath();
+                ctx.fill();
+            }
+
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 3 * window.devicePixelRatio;
+            ctx.beginPath();
+            let curS = 1.0;
+            ctx.moveTo(mapX(0), mapY(curS));
+            for (let i = 0; i < kmData.time.length; i++) {
+                const x = mapX(kmData.time[i]);
+                ctx.lineTo(x, mapY(curS));
+                curS = kmData.survival[i];
+                ctx.lineTo(x, mapY(curS));
+            }
+            ctx.stroke();
+
+            ctx.strokeStyle = '#f43f5e';
+            ctx.lineWidth = 2 * window.devicePixelRatio;
+            for (let i = 0; i < kmData.censor_times.length; i++) {
+                const cx = mapX(kmData.censor_times[i]);
+                const cy = mapY(kmData.censor_survival[i]);
+                ctx.beginPath();
+                ctx.moveTo(cx, cy - 6); ctx.lineTo(cx, cy + 6);
+                ctx.stroke();
+            }
+
+            ctx.fillStyle = '#94a3b8';
+            ctx.textAlign = 'center';
+            for (let i = 0; i <= 5; i++) {
+                const t = (maxTime * i / 5);
+                ctx.fillText(t.toFixed(1), mapX(t), h - padBottom + 20);
+            }
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+
+        const tbody = document.getElementById('riskTableBody');
+        tbody.innerHTML = '';
+        for (let i = 0; i < kmData.time.length; i++) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>\${kmData.time[i].toFixed(1)}</td><td>\${kmData.at_risk[i]}</td><td>\${kmData.events[i]}</td><td>\${kmData.censored[i]}</td><td>\${(kmData.survival[i]*100).toFixed(1)}%</td><td>[\${(kmData.ci_lower[i]*100).toFixed(1)}%, \${(kmData.ci_upper[i]*100).toFixed(1)}%]</td>`;
+            tbody.appendChild(tr);
+        }
+    </script>
+</body>
+</html>"""
+end
+
+function export_html(km::KaplanMeierResult, filename::String)
+    open(filename, "w") do io
+        write(io, to_html(km))
+    end
+    return filename
+end
+
+function to_html(cox::CoxResult)
+    data_json = replace(JSON.json(Dict(
+        "terms" => [Dict("term" => t.term, "beta" => t.beta, "hr" => t.hazard_ratio, "se" => t.standard_error, "z" => t.z_score, "p" => t.pvalue, "ci_lower" => t.ci_lower, "ci_upper" => t.ci_upper) for t in cox.terms],
+        "loglik" => cox.loglik,
+        "iterations" => cox.iterations,
+        "converged" => cox.converged
+    )), "</" => "<\\/")
+
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Cox Proportional Hazards Model - BioToolkit</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); max-width: 960px; margin: 0 auto; border: 1px solid #334155; }
+        h2 { margin-top: 0; color: #38bdf8; font-weight: 600; }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
+        .stat-box { background: #0f172a; border-radius: 8px; padding: 12px; border: 1px solid #334155; text-align: center; }
+        .stat-value { font-size: 18px; font-weight: 700; color: #38bdf8; }
+        .stat-label { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+        .forest-table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
+        .forest-table th, .forest-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #334155; }
+        .forest-table th { background: #334155; color: #94a3b8; font-weight: 500; }
+        .badge { background: #0284c7; color: white; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-block; margin-bottom: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="badge">Clinical Genomics Engine</span>
+        <h2>Cox Proportional Hazards Model</h2>
+        <div class="stats-grid">
+            <div class="stat-box"><div class="stat-value" id="loglik">0</div><div class="stat-label">Log-Likelihood</div></div>
+            <div class="stat-box"><div class="stat-value" id="iters">0</div><div class="stat-label">Iterations</div></div>
+            <div class="stat-box"><div class="stat-value" id="conv">True</div><div class="stat-label">Converged</div></div>
+        </div>
+        <table class="forest-table">
+            <thead>
+                <tr><th>Term</th><th>Beta</th><th>Hazard Ratio (HR)</th><th>95% Confidence Interval</th><th>p-value</th></tr>
+            </thead>
+            <tbody id="termsBody"></tbody>
+        </table>
+    </div>
+
+    <script>
+        const coxData = $data_json;
+        document.getElementById('loglik').innerText = coxData.loglik.toFixed(2);
+        document.getElementById('iters').innerText = coxData.iterations;
+        document.getElementById('conv').innerText = coxData.converged ? 'Yes' : 'No';
+
+        const tbody = document.getElementById('termsBody');
+        coxData.terms.forEach(t => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td><strong>\${t.term}</strong></td><td>\${t.beta.toFixed(3)}</td><td><strong>\${t.hr.toFixed(2)}</strong></td><td>[\${t.ci_lower.toFixed(2)} - \${t.ci_upper.toFixed(2)}]</td><td>\${t.p < 0.001 ? '<0.001' : t.p.toFixed(4)}</td>`;
+            tbody.appendChild(tr);
+        });
+    </script>
+</body>
+</html>"""
+end
+
+function export_html(cox::CoxResult, filename::String)
+    open(filename, "w") do io
+        write(io, to_html(cox))
+    end
+    return filename
+end
+
+function to_html(op::OncoprintResult)
+    data_json = replace(JSON.json(Dict(
+        "genes" => op.genes,
+        "samples" => op.samples,
+        "matrix" => op.matrix,
+        "labels" => op.mutation_labels
+    )), "</" => "<\\/")
+
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Oncoprint Mutation Landscape - BioToolkit</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); max-width: 1100px; margin: 0 auto; border: 1px solid #334155; }
+        h2 { margin-top: 0; color: #38bdf8; font-weight: 600; }
+        .canvas-container { position: relative; width: 100%; height: 500px; background: #0f172a; border-radius: 8px; border: 1px solid #334155; }
+        canvas { width: 100%; height: 100%; display: block; }
+        .legend { display: flex; gap: 16px; margin-top: 16px; font-size: 13px; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-box { width: 14px; height: 14px; border-radius: 3px; }
+        .badge { background: #0284c7; color: white; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-block; margin-bottom: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <span class="badge">Clinical Genomics Engine</span>
+        <h2>Oncoprint Mutation Landscape</h2>
+        <div class="canvas-container" id="container">
+            <canvas id="opCanvas"></canvas>
+        </div>
+        <div class="legend">
+            <div class="legend-item"><div class="legend-box" style="background:#2ecc71"></div>Missense</div>
+            <div class="legend-item"><div class="legend-box" style="background:#e74c3c"></div>Nonsense</div>
+            <div class="legend-item"><div class="legend-box" style="background:#9b59b6"></div>Frame Shift</div>
+            <div class="legend-item"><div class="legend-box" style="background:#e67e22"></div>Splice Site</div>
+            <div class="legend-item"><div class="legend-box" style="background:#34495e"></div>Other</div>
+        </div>
+    </div>
+
+    <script>
+        const opData = $data_json;
+        const canvas = document.getElementById('opCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('container');
+
+        const colors = {
+            'Missense_Mutation': '#2ecc71',
+            'Nonsense_Mutation': '#e74c3c',
+            'Frame_Shift_Del': '#9b59b6',
+            'Frame_Shift_Ins': '#9b59b6',
+            'Splice_Site': '#e67e22'
+        };
+
+        function resize() {
+            canvas.width = container.clientWidth * window.devicePixelRatio;
+            canvas.height = container.clientHeight * window.devicePixelRatio;
+            draw();
+        }
+
+        function draw() {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            const padLeft = 120 * window.devicePixelRatio;
+            const padBottom = 40 * window.devicePixelRatio;
+            const padTop = 20 * window.devicePixelRatio;
+            const padRight = 20 * window.devicePixelRatio;
+
+            const nGenes = opData.genes.length;
+            const nSamples = opData.samples.length;
+
+            if (nGenes === 0 || nSamples === 0) return;
+
+            const cellW = (w - padLeft - padRight) / nSamples;
+            const cellH = (h - padTop - padBottom) / nGenes;
+
+            for (let r = 0; r < nGenes; r++) {
+                ctx.fillStyle = '#f8fafc';
+                ctx.font = `\${12 * window.devicePixelRatio}px sans-serif`;
+                ctx.textAlign = 'right';
+                ctx.fillText(opData.genes[r], padLeft - 10, padTop + (r + 0.6) * cellH);
+
+                for (let c = 0; c < nSamples; c++) {
+                    const x = padLeft + c * cellW;
+                    const y = padTop + r * cellH;
+
+                    ctx.fillStyle = '#1e293b';
+                    ctx.fillRect(x + 1, y + 1, cellW - 2, cellH - 2);
+
+                    const label = opData.labels[r][c];
+                    if (label) {
+                        const firstType = label.split(';')[0];
+                        ctx.fillStyle = colors[firstType] || '#34495e';
+                        ctx.fillRect(x + 2, y + cellH * 0.2, cellW - 4, cellH * 0.6);
+                    }
+                }
+            }
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+    </script>
+</body>
+</html>"""
+end
+
+function export_html(op::OncoprintResult, filename::String)
+    open(filename, "w") do io
+        write(io, to_html(op))
+    end
+    return filename
+end
+
+function to_html(roc::ROCResult)
+    data_json = replace(JSON.json(Dict(
+        "predict_time" => roc.time,
+        "tpr" => roc.tpr,
+        "fpr" => roc.fpr,
+        "auc" => roc.auc
+    )), "</" => "<\\/")
+
+    return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Time-Dependent Survival ROC - BioToolkit</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
+        .card { background: #1e293b; border-radius: 12px; padding: 24px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.5); max-width: 720px; margin: 0 auto; border: 1px solid #334155; }
+        h2 { margin-top: 0; color: #38bdf8; font-weight: 600; }
+        .canvas-container { position: relative; width: 100%; height: 420px; background: #0f172a; border-radius: 8px; border: 1px solid #334155; }
+        canvas { width: 100%; height: 100%; display: block; }
+        .badge { background: #0284c7; color: white; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; display: inline-block; margin-bottom: 12px; }
+        .auc-badge { background: #10b981; color: white; padding: 6px 14px; border-radius: 8px; font-weight: 700; font-size: 16px; float: right; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="auc-badge" id="aucBadge">AUC: 0.00</div>
+        <span class="badge">Clinical Genomics Engine</span>
+        <h2>Time-Dependent Survival ROC Curve</h2>
+        <div class="canvas-container" id="container">
+            <canvas id="rocCanvas"></canvas>
+        </div>
+    </div>
+
+    <script>
+        const rocData = $data_json;
+        document.getElementById('aucBadge').innerText = 'AUC: ' + rocData.auc.toFixed(3);
+
+        const canvas = document.getElementById('rocCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('container');
+
+        function resize() {
+            canvas.width = container.clientWidth * window.devicePixelRatio;
+            canvas.height = container.clientHeight * window.devicePixelRatio;
+            draw();
+        }
+
+        function draw() {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            const pad = 50 * window.devicePixelRatio;
+            const pw = w - 2 * pad;
+            const ph = h - 2 * pad;
+
+            ctx.strokeStyle = '#475569';
+            ctx.lineWidth = 1.5 * window.devicePixelRatio;
+            ctx.setLineDash([6, 6]);
+            ctx.beginPath();
+            ctx.moveTo(pad, h - pad); ctx.lineTo(w - pad, pad);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 3 * window.devicePixelRatio;
+            ctx.beginPath();
+            ctx.moveTo(pad, h - pad);
+            for (let i = 0; i < rocData.fpr.length; i++) {
+                const x = pad + rocData.fpr[i] * pw;
+                const y = h - pad - rocData.tpr[i] * ph;
+                ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+    </script>
+</body>
+</html>"""
+end
+
+function export_html(roc::ROCResult, filename::String)
+    open(filename, "w") do io
+        write(io, to_html(roc))
+    end
+    return filename
 end
 
 end # module Clinical

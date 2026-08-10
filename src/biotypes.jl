@@ -138,7 +138,7 @@ const AASeq = BioSequence{AminoAcidAlphabet}
 
 Construct a `BioSequence{A}` from a string, normalising to uppercase.
 """
-function BioSequence{A}(s::String; validate::Bool=true) where {A<:BioAlphabet}
+function BioSequence{A}(s::AbstractString; validate::Bool=true) where {A<:BioAlphabet}
     bytes = Vector{UInt8}(undef, ncodeunits(s))
     @inbounds for (i, byte) in enumerate(codeunits(s))
         bytes[i] = byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte)

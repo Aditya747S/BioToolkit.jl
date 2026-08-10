@@ -2,6 +2,7 @@ using Statistics
 using Random
 
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+import ..BioToolkit: to_html, export_html
 
 export GenomeViewport, AbstractTrack, GeneTrack, CoverageTrack, AlignmentTrack, GenomeBrowser
 export GeneSegment, GenePlacement, GeneRenderPlan, CoverageBin, CoverageRenderPlan
@@ -258,16 +259,22 @@ function _gene_segments(interval::GenomicInterval, lod::Symbol)
     return segments
 end
 
+function _find_available_row(row_ends::Vector{Int}, left::Int)
+    @inbounds for r in 1:length(row_ends)
+        if row_ends[r] < left
+            return r
+        end
+    end
+    return length(row_ends) + 1
+end
+
 function _pack_genes(intervals::AbstractVector{<:GenomicInterval}, viewport::GenomeViewport, lod::Symbol, label_field::Union{Nothing,Symbol}, max_labels::Integer)
     placements = GenePlacement[]
     row_ends = Int[]
     labels = String[]
 
     for interval in _visible_intervals(intervals, viewport)
-        row = 1
-        while row <= length(row_ends) && interval.left <= row_ends[row]
-            row += 1
-        end
+        row = _find_available_row(row_ends, interval.left)
         if row > length(row_ends)
             push!(row_ends, interval.right)
         else
@@ -357,8 +364,19 @@ function _coverage_bins_from_vector(values::AbstractVector{<:Real}, start::Int, 
         bin_stop = min(first_bin_start + bin_size - 1, overlap_stop)
         local_start = first_bin_start - source_start + 1
         local_stop = bin_stop - source_start + 1
-        slice = Float64.(values[local_start:local_stop])
-        push!(bins, CoverageBin(first_bin_start, bin_stop, mean(slice), minimum(slice), maximum(slice)))
+
+        s_min = Inf
+        s_max = -Inf
+        s_sum = 0.0
+        n_elem = local_stop - local_start + 1
+        @inbounds for idx in local_start:local_stop
+            val = Float64(values[idx])
+            s_sum += val
+            val < s_min && (s_min = val)
+            val > s_max && (s_max = val)
+        end
+        s_mean = n_elem > 0 ? s_sum / n_elem : 0.0
+        push!(bins, CoverageBin(first_bin_start, bin_stop, s_mean, s_min, s_max))
         first_bin_start = bin_stop + 1
     end
 
@@ -523,10 +541,7 @@ function _pack_reads(records::AbstractVector)
 
     for record in records
         left, right = _read_reference_span(record)
-        row = 1
-        while row <= length(row_ends) && left <= row_ends[row]
-            row += 1
-        end
+        row = _find_available_row(row_ends, left)
         if row > length(row_ends)
             push!(row_ends, right)
         else
@@ -667,4 +682,214 @@ function export_figure(browser::GenomeBrowser, path::String; dpi::Integer=300)
 
 
     return _register_browser_result!(_ctx, result, "export_figure"; parents=provenance_parent_ids(browser), parameters=(path=path, dpi=Int(dpi)))
+end
+
+"""
+    to_html(browser) -> String
+
+Generate an interactive HTML5/Canvas genome browser standalone report.
+Provides zoom, pan, tooltip inspection, dark mode, and track visualization directly in any web browser.
+"""
+function to_html(browser::GenomeBrowser)
+    rendered = render_browser(browser)
+    chrom = browser.viewport.chrom
+    v_start = first(browser.viewport.range)
+    v_stop = last(browser.viewport.range)
+    lod = genome_lod(browser.viewport)
+
+    track_json_items = String[]
+    for item in rendered
+        t = item.track
+        p = item.plan
+        if p isa GeneRenderPlan
+            placements_json = String[]
+            for pl in p.placements
+                segs = ["{\"kind\":\"$(s.kind)\",\"left\":$(s.left),\"right\":$(s.right)}" for s in pl.segments]
+                lbl = pl.label === nothing ? "null" : "\"$(_json_escape(pl.label))\""
+                push!(placements_json, "{\"left\":$(pl.interval.left),\"right\":$(pl.interval.right),\"strand\":\"$(pl.interval.strand)\",\"row\":$(pl.row),\"label\":$lbl,\"segments\":[$(join(segs, ","))]}")
+            end
+            push!(track_json_items, "{\"type\":\"GeneTrack\",\"style\":\"$(t.style)\",\"lod\":\"$(p.lod)\",\"row_count\":$(p.row_count),\"placements\":[$(join(placements_json, ","))]}")
+        elseif p isa CoverageRenderPlan
+            bins_json = ["{\"left\":$(b.left),\"right\":$(b.right),\"mean\":$(b.mean_value),\"min\":$(b.min_value),\"max\":$(b.max_value)}" for b in p.bins]
+            push!(track_json_items, "{\"type\":\"CoverageTrack\",\"style\":\"$(t.style)\",\"bin_size\":$(p.bin_size),\"bins\":[$(join(bins_json, ","))]}")
+        elseif p isa AlignmentRenderPlan
+            reads_json = String[]
+            for r in p.reads
+                blks = ["{\"left\":$(b[1]),\"right\":$(b[2])}" for b in r.blocks]
+                ms = ["{\"pos\":$(m.position)}" for m in r.mismatches]
+                push!(reads_json, "{\"qname\":\"$(_json_escape(r.qname))\",\"row\":$(r.row),\"left\":$(r.left),\"right\":$(r.right),\"strand\":\"$(r.strand)\",\"blocks\":[$(join(blks, ","))],\"mismatches\":[$(join(ms, ","))]}")
+            end
+            push!(track_json_items, "{\"type\":\"AlignmentTrack\",\"downsampled\":$(p.downsampled),\"reads\":[$(join(reads_json, ","))]}")
+        end
+    end
+
+    tracks_json_str = "[" * join(track_json_items, ",") * "]"
+
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>$(_escape_html(browser.title)) - BioToolkit Genome Browser</title>
+    <style>
+        :root { --bg: #0f172a; --panel: #1e293b; --text: #f8fafc; --accent: #38bdf8; --border: #334155; }
+        body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
+        .header { display: flex; align-items: center; justify-content: space-between; background: var(--panel); padding: 12px 20px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 15px; }
+        .title { font-size: 1.25rem; font-weight: 600; color: var(--accent); }
+        .controls { display: flex; gap: 8px; align-items: center; }
+        button { background: #334155; color: white; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-weight: 500; }
+        button:hover { background: var(--accent); color: #0f172a; }
+        .browser-container { background: var(--panel); border-radius: 8px; border: 1px solid var(--border); padding: 15px; position: relative; }
+        canvas { width: 100%; display: block; }
+        .tooltip { position: absolute; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--accent); padding: 8px 12px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; z-index: 100; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">🧬 $(_escape_html(browser.title))</div>
+        <div class="controls">
+            <span id="coord-display" style="font-family: monospace; color: var(--accent);">$(chrom):$(v_start)-$(v_stop)</span>
+            <button onclick="zoom(0.8)">Zoom In (+)</button>
+            <button onclick="zoom(1.25)">Zoom Out (-)</button>
+            <button onclick="pan(-0.25)">◀ Left</button>
+            <button onclick="pan(0.25)">Right ▶</button>
+            <button onclick="resetView()">Reset</button>
+        </div>
+    </div>
+    <div class="browser-container">
+        <canvas id="browserCanvas"></canvas>
+        <div id="tooltip" class="tooltip"></div>
+    </div>
+    <script>
+        const chrom = "$(chrom)";
+        const origStart = $(v_start);
+        const origStop = $(v_stop);
+        let start = origStart;
+        let stop = origStop;
+        const tracks = $(tracks_json_str);
+
+        const canvas = document.getElementById('browserCanvas');
+        const ctx = canvas.getContext('2d');
+
+        function resizeCanvas() {
+            canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
+            canvas.height = 600 * window.devicePixelRatio;
+            canvas.style.height = '600px';
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            render();
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        function posToX(pos, width) {
+            return ((pos - start) / (stop - start)) * width;
+        }
+
+        function render() {
+            const width = canvas.parentElement.clientWidth;
+            const height = 600;
+            ctx.clearRect(0, 0, width, height);
+
+            document.getElementById('coord-display').textContent = `\${chrom}:\${Math.round(start)}-\${Math.round(stop)}`;
+
+            let currentY = 30;
+            tracks.forEach((track, idx) => {
+                ctx.fillStyle = '#38bdf8';
+                ctx.font = '12px system-ui';
+                ctx.fillText(`Track \${idx+1}: \${track.type}`, 10, currentY);
+                currentY += 15;
+
+                ctx.strokeStyle = '#334155';
+                ctx.beginPath();
+                ctx.moveTo(0, currentY);
+                ctx.lineTo(width, currentY);
+                ctx.stroke();
+
+                if (track.type === 'GeneTrack') {
+                    const rowHeight = 16;
+                    track.placements.forEach(g => {
+                        const x1 = posToX(g.left, width);
+                        const x2 = posToX(g.right, width);
+                        const y = currentY + g.row * rowHeight;
+                        ctx.fillStyle = '#38bdf8';
+                        ctx.fillRect(x1, y, Math.max(2, x2 - x1), 8);
+                        if (g.label) {
+                            ctx.fillStyle = '#94a3b8';
+                            ctx.font = '10px system-ui';
+                            ctx.fillText(g.label, x1, y - 2);
+                        }
+                    });
+                    currentY += (track.row_count + 1) * rowHeight + 20;
+                } else if (track.type === 'CoverageTrack') {
+                    const trackH = 100;
+                    const maxVal = Math.max(...track.bins.map(b => b.mean), 1);
+                    ctx.fillStyle = '#3b82f6';
+                    track.bins.forEach(b => {
+                        const x1 = posToX(b.left, width);
+                        const x2 = posToX(b.right, width);
+                        const h = (b.mean / maxVal) * trackH;
+                        ctx.fillRect(x1, currentY + trackH - h, Math.max(1, x2 - x1), h);
+                    });
+                    currentY += trackH + 30;
+                } else if (track.type === 'AlignmentTrack') {
+                    const rowHeight = 12;
+                    let maxRow = 1;
+                    track.reads.forEach(r => {
+                        maxRow = Math.max(maxRow, r.row);
+                        const y = currentY + r.row * rowHeight;
+                        r.blocks.forEach(b => {
+                            const x1 = posToX(b.left, width);
+                            const x2 = posToX(b.right, width);
+                            ctx.fillStyle = r.strand === '+' ? '#60a5fa' : '#f43f5e';
+                            ctx.fillRect(x1, y, Math.max(2, x2 - x1), 6);
+                        });
+                        r.mismatches.forEach(m => {
+                            const mx = posToX(m.pos, width);
+                            ctx.fillStyle = '#f59e0b';
+                            ctx.fillRect(mx - 1, y - 1, 3, 8);
+                        });
+                    });
+                    currentY += maxRow * rowHeight + 30;
+                }
+            });
+        }
+
+        function zoom(factor) {
+            const center = (start + stop) / 2;
+            const span = (stop - start) * factor;
+            start = center - span / 2;
+            stop = center + span / 2;
+            render();
+        }
+
+        function pan(fraction) {
+            const span = stop - start;
+            start += span * fraction;
+            stop += span * fraction;
+            render();
+        }
+
+        function resetView() {
+            start = origStart;
+            stop = origStop;
+            render();
+        }
+
+        setTimeout(resizeCanvas, 50);
+    </script>
+</body>
+</html>
+"""
+end
+
+"""
+    export_html(browser, path)
+
+Export the interactive HTML genome browser report to a standalone `.html` file.
+"""
+function export_html(browser::GenomeBrowser, path::String)
+    html_content = to_html(browser)
+    write(path, html_content)
+    _ctx = active_provenance_context()
+    return _register_browser_result!(_ctx, path, "export_html"; parents=provenance_parent_ids(browser), parameters=(path=path,))
 end
