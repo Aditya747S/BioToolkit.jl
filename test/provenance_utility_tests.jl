@@ -2,6 +2,9 @@ using Test
 using DataFrames
 using Tables
 using Graphs
+using BioToolkit
+
+_node_by_operation(ctx, op) = first([node for node in values(ctx.nodes) if node.operation == op])
 
 @testset "Provenance utilities" begin
     @testset "Protein" begin
@@ -268,5 +271,86 @@ using Graphs
         tree_prov = BioToolkit.metadata_provenance(tree.metadata)
         @test tree_prov !== nothing
         @test tree_prov.source == "bootstrap_consensus_tree"
+    end
+
+    @testset "Engine Hardening and HTML Visualizer" begin
+        # 1. Fast path active_provenance_context when disabled
+        BioToolkit.disable_provenance!()
+        @test BioToolkit.active_provenance_context() === nothing
+        
+        # Enable provenance temporarily
+        BioToolkit.enable_provenance!()
+        @test BioToolkit.active_provenance_context() !== nothing
+        # Ensure provenance is re-enabled for remaining tests
+        BioToolkit.enable_provenance!()
+
+        # 2. Provenance Context & Memoized Depth
+        ctx = BioToolkit.ProvenanceContext(; max_depth=10)
+        n1 = BioToolkit.register_provenance!(ctx, "node1", "op1")
+        n2 = BioToolkit.register_provenance!(ctx, "node2", "op2"; parents=["node1"])
+        n3 = BioToolkit.register_provenance!(ctx, "node3", "op3"; parents=["node2"])
+        
+        @test length(ctx.nodes) == 3
+        @test BioToolkit._provenance_node_depth(ctx, n1) == 1
+        @test BioToolkit._provenance_node_depth(ctx, n2) == 2
+        @test BioToolkit._provenance_node_depth(ctx, n3) == 3
+
+        # 3. Placeholder pruning
+        placeholder = BioToolkit.ProvenanceNode("p1", "auto_op", Dict("__placeholder__" => true), String[], "2026-01-01T00:00:00Z")
+        BioToolkit.register_provenance!(ctx, placeholder)
+        @test haskey(ctx.nodes, "p1")
+        @test "p1" in ctx.placeholder_ids
+
+        real_node = BioToolkit.ProvenanceNode("r1", "auto_op", Dict("param" => 42), String["node3"], "2026-01-01T00:01:00Z")
+        BioToolkit.register_provenance!(ctx, real_node)
+        @test !haskey(ctx.nodes, "p1")
+        @test !("p1" in ctx.placeholder_ids)
+        @test haskey(ctx.nodes, "r1")
+
+        # 4. Direct Buffer Array Hashing
+        arr_dense = Float64[1.0, 2.0, 3.0, 4.0]
+        mat_dense = rand(Float64, 10, 10)
+        @test length(BioToolkit.provenance_structural_hash(arr_dense)) == 64
+        @test length(BioToolkit.provenance_content_hash(mat_dense)) == 64
+        @test BioToolkit.provenance_content_hash(arr_dense) == BioToolkit.provenance_content_hash(Float64[1.0, 2.0, 3.0, 4.0])
+
+        # 5. Type-stable with_provenance
+        distances = [0.0 1.0; 1.0 0.0]
+        pcoa_res = BioToolkit.pcoa(distances; dimensions=2)
+        new_pcoa = BioToolkit.with_provenance(pcoa_res, "new_pcoa", "Microbiome/pcoa"; parameters=(dim=2,))
+        @test new_pcoa.provenance.label == "new_pcoa"
+        @test typeof(new_pcoa) === typeof(pcoa_res)
+
+        # 6. JSON import with activity/entity union recovery
+        json_data = """
+        {
+          "schema_version": "1.0.0",
+          "activity": {
+            "act1": { "prov:label": "isolated_activity", "prov:startedAtTime": "2026-08-10T12:00:00Z" }
+          },
+          "wasDerivedFrom": {}
+        }
+        """
+        imported_ctx = BioToolkit.import_provenance_json(json_data)
+        @test haskey(imported_ctx.nodes, "act1")
+        @test imported_ctx.nodes["act1"].operation == "isolated_activity"
+
+        # 7. HTML Visualization
+        html_out = BioToolkit.provenance_to_html(ctx; title="Test Visualizer", standalone=true)
+        @test occursin("<!DOCTYPE html>", html_out)
+        @test occursin("bioprov-container", html_out)
+        @test occursin("Test Visualizer", html_out)
+        @test occursin("Vis.Network", html_out) || occursin("vis.DataSet", html_out)
+
+        tmp_html = joinpath(mktempdir(), "prov_report.html")
+        BioToolkit.export_provenance_html(ctx, tmp_html)
+        @test isfile(tmp_html)
+        @test filesize(tmp_html) > 500
+
+        # MIME text/html show overload
+        io = IOBuffer()
+        show(io, MIME"text/html"(), ctx)
+        rendered_html = String(take!(io))
+        @test occursin("bioprov-container", rendered_html)
     end
 end

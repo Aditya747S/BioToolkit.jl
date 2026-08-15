@@ -290,3 +290,96 @@ end
     @test !isempty(filtered_rows)
     @test all(ismissing(contrast_tab[row, :padj]) for row in filtered_rows)
 end
+
+@testset "DifferentialExpression HTML visualizers" begin
+    cm = _build_synthetic_count_matrix()
+    design = [:Control, :Control, :Treat, :Treat]
+    results = BioToolkit.differential_expression(cm, design)
+    df_results = DataFrame(results)
+
+    # Volcano Plot
+    html_volcano = BioToolkit.volcano_to_html(results; title="Synthetic Volcano")
+    @test contains(html_volcano, "Synthetic Volcano")
+    @test contains(html_volcano, "plotly-2.27.0.min.js")
+    @test contains(html_volcano, "volcano-plot")
+
+    tmp_volcano = joinpath(tempdir(), "test_volcano.html")
+    BioToolkit.export_volcano_html(tmp_volcano, df_results)
+    @test isfile(tmp_volcano)
+    @test filesize(tmp_volcano) > 0
+    rm(tmp_volcano, force=true)
+
+    # MA Plot
+    html_ma = BioToolkit.ma_plot_to_html(df_results; title="Synthetic MA Plot")
+    @test contains(html_ma, "Synthetic MA Plot")
+    @test contains(html_ma, "log10(Base Mean)")
+
+    tmp_ma = joinpath(tempdir(), "test_ma.html")
+    BioToolkit.export_ma_plot_html(tmp_ma, results)
+    @test isfile(tmp_ma)
+    @test filesize(tmp_ma) > 0
+    rm(tmp_ma, force=true)
+
+    # Dispersion Plot
+    dds = BioToolkit.DESeqDataSet(cm, DataFrame(condition=design), design)
+    dds.size_factors = ones(4)
+    dds.gene_wise_dispersions = fill(0.1, 51)
+    dds.dispersion_fit = fill(0.08, 51)
+    dds.dispersions = fill(0.09, 51)
+
+    html_disp = BioToolkit.dispersion_plot_to_html(dds; title="Synthetic Dispersion")
+    @test contains(html_disp, "Synthetic Dispersion")
+    @test contains(html_disp, "Gene-wise (MLE)")
+
+    tmp_disp = joinpath(tempdir(), "test_dispersion.html")
+    BioToolkit.export_dispersion_plot_html(tmp_disp, dds)
+    @test isfile(tmp_disp)
+    @test filesize(tmp_disp) > 0
+    rm(tmp_disp, force=true)
+
+    # Heatmap
+    html_heat = BioToolkit.de_heatmap_to_html(cm, results; top_n=10, title="Top Genes Heatmap")
+    @test contains(html_heat, "Top Genes Heatmap")
+    @test contains(html_heat, "heatmap")
+
+    tmp_heat = joinpath(tempdir(), "test_heatmap.html")
+    BioToolkit.export_de_heatmap_html(tmp_heat, cm, df_results; top_n=5)
+    @test isfile(tmp_heat)
+    @test filesize(tmp_heat) > 0
+    rm(tmp_heat, force=true)
+end
+
+@testset "Advanced DifferentialExpression workflows" begin
+    # Mixed model
+    cm = _build_synthetic_count_matrix()
+    fixed = [:Control, :Control, :Treat, :Treat]
+    random = [1, 2, 1, 2]
+    mm_res = BioToolkit.DifferentialExpression.dge_mixedmodel(cm, fixed, random)
+    @test length(mm_res) == length(cm.gene_ids)
+    @test all(r -> isfinite(r.pvalue), mm_res[2:end])
+
+    # Power analysis
+    pa = BioToolkit.DifferentialExpression.power_analysis(; n_genes=50, n_samples_per_group=3, n_sim=2)
+    @test haskey(pa, :power)
+    @test haskey(pa, :fdr)
+    @test 0.0 <= pa.power <= 1.0
+
+    # Bootstrap LFC
+    boot_df = BioToolkit.DifferentialExpression.bootstrap_lfc(cm, fixed; n_boot=10, seed=42)
+    @test size(boot_df, 1) == length(cm.gene_ids)
+    @test :log2FC in propertynames(boot_df)
+    @test :CI_lo in propertynames(boot_df)
+
+    # Concordance analysis
+    res1 = BioToolkit.differential_expression(cm, fixed)
+    res2 = BioToolkit.differential_expression(cm, fixed)
+    conc = BioToolkit.DifferentialExpression.concordance_analysis([res1, res2]; gene_universe=cm.gene_ids)
+    @test conc.pairwise_overlap[1, 2] == conc.pairwise_overlap[1, 1]
+    @test conc.jaccard_index[1, 2] ≈ 1.0
+
+    # MAST Hurdle Test
+    hurdle_res = BioToolkit.DifferentialExpression.mast_hurdle_test(cm, fixed; min_cells=1)
+    @test length(hurdle_res) == length(cm.gene_ids)
+    @test isfinite(hurdle_res[1].pvalue_hurdle)
+end
+

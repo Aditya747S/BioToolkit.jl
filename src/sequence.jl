@@ -482,6 +482,8 @@ function gc_content(sequence::BioSequence{A}) where {A <: BioAlphabet}
             total += 1
         elseif byte == UInt8('A') || byte == UInt8('a') || byte == UInt8('T') || byte == UInt8('t') || byte == UInt8('U') || byte == UInt8('u')
             total += 1
+        elseif byte == UInt8('-') || byte == UInt8('.')
+            continue
         elseif !_IUPAC_DNA_VALID[Int(byte) + 1]
             throw(ArgumentError("unsupported base '$(Char(byte))' in gc_content"))
         end
@@ -491,6 +493,26 @@ function gc_content(sequence::BioSequence{A}) where {A <: BioAlphabet}
     gc_val = gc / total
     _ctx = active_provenance_context()
     return _register_sequence_result!(_ctx, gc_val, "gc_content"; parameters=(n_bases=total, gc_fraction=gc_val))
+end
+
+function gc_content(sequence::BioSequence{DNAAlphabet, BitPackedVector{2}})
+    n = length(sequence)
+    n == 0 && return 0.0
+    v = sequence.data
+    full_chunks = n >>> 5
+    gc = 0
+    @inbounds for i in 1:full_chunks
+        gc += count_ones(v.chunks[i] & 0x5555555555555555)
+    end
+    rem = n & 31
+    if rem > 0
+        last_chunk = v.chunks[end]
+        mask = (UInt64(1) << (rem * 2)) - 1
+        gc += count_ones((last_chunk & mask) & 0x5555555555555555)
+    end
+    gc_val = gc / n
+    _ctx = active_provenance_context()
+    return _register_sequence_result!(_ctx, gc_val, "gc_content"; parameters=(n_bases=n, gc_fraction=gc_val))
 end
 
 gc_content(sequence::AbstractString) = gc_content(_sequence_to_dna(sequence))
@@ -529,8 +551,8 @@ function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=
             t += 1
         elseif ch == UInt8('u')
             u += 1
-        elseif ch == UInt8('n')
-            # Ambiguous bases are ignored in the wallace/basic estimate.
+        elseif ch == UInt8('n') || ch == UInt8('-') || ch == UInt8('.')
+            # Ambiguous bases and gaps are ignored in the wallace/basic estimate.
         else
             throw(ArgumentError("unsupported base '$(Char(byte))' in melting_temp"))
         end
@@ -579,6 +601,9 @@ function _dna_molecular_weight_single(sequence::BioSequence{A}) where {A <: BioA
     residue_count = 0
 
     @inbounds for byte in sequence.data
+        if byte == UInt8('-') || byte == UInt8('.')
+            continue
+        end
         mass = _DNA_MW_RESIDUE[Int(byte) + 1]
         mass == 0.0 && throw(ArgumentError("unsupported base '$(Char(byte))' in dna_molecular_weight"))
         residue_mass += mass
@@ -759,37 +784,61 @@ cai(sequence::BioSequence{DNAAlphabet}; reference, kwargs...) = codon_adaptation
 cai(sequence::AbstractString; reference, kwargs...) = codon_adaptation_index(sequence; reference=reference, kwargs...)
 
 """
-    translate_dna(sequence; stop_at_stop=false)
+    translate_dna!(buffer, bytes; table=1, stop_at_stop=false)
 
-Translate a DNA/RNA coding sequence into a single-letter amino acid string
-using the standard genetic code (NCBI translation table 1).
-using ..BioToolkit: ProvenanceParams, ThreadSafeProvenanceContext, new_provenance_id
-
-The input length must be a multiple of 3.  Stop codons (TAA, TAG, TGA)
-produce `'*'`.  When `stop_at_stop=true`, translation terminates at the
-first stop codon; otherwise stop codons are omitted from the output.
-
-Accepts typed `BioSequence{DNAAlphabet}` inputs and returns
-`BioSequence{AminoAcidAlphabet}`.
+Translate nucleotide bytes into a preallocated amino-acid buffer.
 """
-function translate_dna(sequence::BioSequence{DNAAlphabet}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8}; table::Int=1, stop_at_stop::Bool=false)
+    last = length(bytes)
+    last % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(last)"))
+    length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
+    code_table = _DNA_CODE
+    codon_table = _ncbi_trans_table_array(table)
+
+    index = 1
+    out_index = 1
+
+    @inbounds while index + 2 <= last
+        code1 = code_table[Int(bytes[index]) + 1]
+        code2 = code_table[Int(bytes[index + 1]) + 1]
+        code3 = code_table[Int(bytes[index + 2]) + 1]
+
+        amino_acid = (code1 > 3 || code2 > 3 || code3 > 3) ? UInt8('X') : codon_table[((Int(code1) << 4) | (Int(code2) << 2) | Int(code3)) + 1]
+        if stop_at_stop && amino_acid == UInt8('*')
+            break
+        elseif amino_acid != UInt8('*') || !stop_at_stop
+            buffer[out_index] = amino_acid
+            out_index += 1
+        end
+        index += 3
+    end
+
+    return out_index - 1
+end
+
+"""
+    translate_dna(sequence; table=1, stop_at_stop=false)
+
+Translate DNA sequence using NCBI translation table `table` (defaults to 1, Standard Code).
+"""
+function translate_dna(sequence::BioSequence{DNAAlphabet}; table::Int=1, stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     length_sequence = length(sequence)
     length_sequence % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(length_sequence)"))
     buffer = Vector{UInt8}(undef, length_sequence ÷ 3)
-    written = translate_dna!(buffer, sequence.data; stop_at_stop=stop_at_stop)
+    written = translate_dna!(buffer, sequence.data; table=table, stop_at_stop=stop_at_stop)
     resize!(buffer, written)
     _ctx = active_provenance_context()
     return provenance_result!(_ctx, AASeq(buffer; validate=false), "translate_dna")
 end
 
 """
-    _translate_dna_bytes!(buffer, source, last; stop_at_stop=false)
+    _translate_dna_bytes!(buffer, source, last; table=1, stop_at_stop=false)
 
 Translate encoded DNA bytes into an amino-acid byte buffer.
 """
-@inline function _translate_dna_bytes!(buffer::Vector{UInt8}, source, last::Int; stop_at_stop::Bool=false)
+@inline function _translate_dna_bytes!(buffer::Vector{UInt8}, source, last::Int; table::Int=1, stop_at_stop::Bool=false)
     code_table = _DNA_CODE
-    codon_table = _CODON_TABLE
+    codon_table = _ncbi_trans_table_array(table)
 
     index = 1
     out_index = 1
@@ -815,112 +864,148 @@ Translate encoded DNA bytes into an amino-acid byte buffer.
 end
 
 """
-    translate_dna(bytes; stop_at_stop=false)
+    translate_dna(bytes; table=1, stop_at_stop=false)
 
 Translate a nucleotide byte vector into an amino-acid string.
 """
-function translate_dna(bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false)
+function translate_dna(bytes::AbstractVector{UInt8}; table::Int=1, stop_at_stop::Bool=false)
     last = length(bytes)
     last % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(last)"))
     buffer = Vector{UInt8}(undef, last ÷ 3)
-    written = translate_dna!(buffer, bytes; stop_at_stop=stop_at_stop)
+    written = translate_dna!(buffer, bytes; table=table, stop_at_stop=stop_at_stop)
     resize!(buffer, written)
     _ctx = active_provenance_context()
     return provenance_result!(_ctx, unsafe_string(pointer(buffer), written), "translate_dna")
 end
 
-translate_dna(sequence::AbstractString; stop_at_stop::Bool=false) = translate_dna(codeunits(String(sequence)); stop_at_stop=stop_at_stop)
+translate_dna(sequence::AbstractString; table::Int=1, stop_at_stop::Bool=false) = translate_dna(codeunits(String(sequence)); table=table, stop_at_stop=stop_at_stop)
 
 """
-    translate_dna!(buffer, bytes; stop_at_stop=false)
+    complement!(seq::BioSequence)
 
-Translate nucleotide bytes into a preallocated amino-acid buffer.
+In-place complement of a sequence.
 """
-function translate_dna!(buffer::Vector{UInt8}, bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false)
-    last = length(bytes)
-    last % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(last)"))
-    length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
-    code_table = _DNA_CODE
-    codon_table = _CODON_TABLE
+function complement!(seq::BioSequence{A, Vector{UInt8}}) where {A <: BioAlphabet}
+    d = seq.data
+    @inbounds for i in 1:length(d)
+        d[i] = _DNA_COMPLEMENT[Int(d[i]) + 1]
+    end
+    return seq
+end
 
-    index = 1
-    out_index = 1
+@inline function _reverse_2bit_64(x::UInt64)
+    x = ((x & 0x3333333333333333) << 2) | ((x >> 2) & 0x3333333333333333)
+    x = ((x & 0x0F0F0F0F0F0F0F0F) << 4) | ((x >> 4) & 0x0F0F0F0F0F0F0F0F)
+    x = ((x & 0x00FF00FF00FF00FF) << 8) | ((x >> 8) & 0x00FF00FF00FF00FF)
+    x = ((x & 0x0000FFFF0000FFFF) << 16) | ((x >> 16) & 0x0000FFFF0000FFFF)
+    return (x << 32) | (x >> 32)
+end
 
-    @inbounds while index + 2 <= last
-        code1 = code_table[Int(bytes[index]) + 1]
-        code2 = code_table[Int(bytes[index + 1]) + 1]
-        code3 = code_table[Int(bytes[index + 2]) + 1]
+"""
+    complement!(seq::PackedDNASeq)
 
-        amino_acid = (code1 > 3 || code2 > 3 || code3 > 3) ? UInt8('X') : codon_table[((Int(code1) << 4) | (Int(code2) << 2) | Int(code3)) + 1]
-        if stop_at_stop && amino_acid == UInt8('*')
-            break
-        elseif amino_acid != UInt8('*')
-            buffer[out_index] = amino_acid
-            out_index += 1
+Bit-parallel 32-bases-per-cycle in-place complement.
+"""
+function complement!(seq::BioSequence{DNAAlphabet, BitPackedVector{2}})
+    chunks = seq.data.chunks
+    @inbounds for i in 1:length(chunks)
+        chunks[i] = ~chunks[i]
+    end
+    return seq
+end
+
+"""
+    reverse_complement!(seq::BioSequence)
+
+In-place reverse complement of a sequence.
+"""
+function reverse_complement!(seq::BioSequence{A, Vector{UInt8}}) where {A <: BioAlphabet}
+    complement!(seq)
+    reverse!(seq.data)
+    return seq
+end
+
+function reverse_complement!(seq::BioSequence{DNAAlphabet, BitPackedVector{2}})
+    len = seq.data.len
+    len == 0 && return seq
+    nchunks = length(seq.data.chunks)
+    new_chunks = Vector{UInt64}(undef, nchunks)
+    rem = len & 31
+    shift = rem == 0 ? 0 : 2 * (32 - rem)
+    
+    # Reverse bit-parallel complement chunks
+    for i in 1:nchunks
+        rev_c = _reverse_2bit_64(~seq.data.chunks[nchunks - i + 1])
+        new_chunks[i] = rev_c
+    end
+    
+    if shift > 0
+        # Align bits to low end if the last chunk wasn't full
+        carry = UInt64(0)
+        for i in 1:nchunks
+            val = new_chunks[i]
+            new_chunks[i] = (val >> shift) | carry
+            carry = val << (64 - shift)
         end
-        index += 3
     end
-
-    _ctx = active_provenance_context()
-    return provenance_result!(_ctx, out_index - 1, "translate_dna!")
+    
+    copyto!(seq.data.chunks, new_chunks)
+    return seq
 end
 
 """
-    translate_dna!(buffer, bytes; stop_at_stop=false)
+    ungap!(seq::BioSequence)
 
-Translate nucleotide bytes into a preallocated amino-acid buffer.
+In-place removal of gap characters ('-' and '.') from sequence.
 """
-function translate_dna!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    last = length(bytes)
-    last % 3 == 0 || throw(ArgumentError("DNA sequence length must be a multiple of 3 for translate_dna; got $(last)"))
-    length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
-    code_table = _DNA_CODE
-    codon_table = _CODON_TABLE
-
-    index = 1
-    out_index = 1
-
-    # When stop_at_stop=true, halt at the first stop codon without emitting it.
-    # When stop_at_stop=false, skip stop codons and continue translating.
-    @inbounds while index + 2 <= last
-        code1 = code_table[Int(bytes[index]) + 1]
-        code2 = code_table[Int(bytes[index + 1]) + 1]
-        code3 = code_table[Int(bytes[index + 2]) + 1]
-
-        amino_acid = (code1 > 3 || code2 > 3 || code3 > 3) ? UInt8('X') : codon_table[((Int(code1) << 4) | (Int(code2) << 2) | Int(code3)) + 1]
-        if stop_at_stop && amino_acid == UInt8('*')
-            break
-        elseif amino_acid != UInt8('*')
-            buffer[out_index] = amino_acid
-            out_index += 1
-        end
-
-        index += 3
-    end
-
-    _ctx = active_provenance_context()
-    return provenance_result!(_ctx, out_index - 1, "translate_dna!")
+function ungap!(seq::BioSequence{A}) where {A <: BioAlphabet}
+    filter!(b -> b != UInt8('-') && b != UInt8('.'), seq.data)
+    return seq
 end
 
 """
-    translate_dna!(buffer, bytes; stop_at_stop=false)
+    canonical!(seq::BioSequence)
 
-Translate nucleotide bytes into a preallocated amino-acid buffer.
+In-place conversion to canonical (lexicographically smallest of sequence and its reverse complement).
 """
-function translate_dna!(buffer::Vector{UInt8}, bytes::Vector{UInt8}; stop_at_stop::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    last = length(bytes)
-    length(buffer) >= last ÷ 3 || throw(ArgumentError("buffer is too small"))
-    GC.@preserve bytes begin
-
-        return _translate_dna_bytes!(buffer, pointer(bytes), last; stop_at_stop=stop_at_stop)
+function canonical!(seq::BioSequence{A}) where {A <: BioAlphabet}
+    rc = reverse_complement(seq)
+    if rc < seq
+        seq.data .= rc.data
     end
+    return seq
 end
+
+
+
+
 
 """
     hamming_distance(left, right; use_cuda=false)
 
 Compute the Hamming distance between two nucleotide byte vectors.
 """
+function hamming_distance(left::BitPackedVector{2}, right::BitPackedVector{2}; use_cuda::Bool=false)
+    left.len == right.len || throw(ArgumentError("sequences must have the same length"))
+    dist = 0
+    full_chunks = left.len >>> 5
+    @inbounds for i in 1:full_chunks
+        diff = left.chunks[i] ⊻ right.chunks[i]
+        if diff != 0
+            mismatches = (diff & 0x5555555555555555) | ((diff >> 1) & 0x5555555555555555)
+            dist += count_ones(mismatches)
+        end
+    end
+    rem = left.len & 31
+    if rem > 0
+        @inbounds for i in (full_chunks * 32 + 1):left.len
+            left[i] != right[i] && (dist += 1)
+        end
+    end
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, dist, "hamming_distance")
+end
+
 function hamming_distance(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}; use_cuda::Bool=false)
     if use_cuda
         _ensure_cuda_sequence!()
@@ -951,10 +1036,10 @@ function hamming_distance(left::AbstractVector{UInt8}, right::AbstractVector{UIn
             l = unsafe_load(left_words,  word_index)
             r = unsafe_load(right_words, word_index)
             xor_word = l ⊻ r
-            # SWAR: detect ZERO bytes in xor_word (zero = matching bytes)
-            # then subtract from 8 to get MISMATCH count
-            zero_mask = (xor_word - 0x0101010101010101) & ~xor_word & 0x8080808080808080
-            distance += 8 - count_ones(zero_mask)
+            
+            # Standard SWAR non-zero byte detection (mismatch count)
+            mismatch_mask = (((xor_word & 0x7F7F7F7F7F7F7F7F) + 0x7F7F7F7F7F7F7F7F) | xor_word) & 0x8080808080808080
+            distance += count_ones(mismatch_mask)
         end
 
         @inbounds for index in tail_start:left_length
@@ -988,14 +1073,21 @@ function find_orfs(sequence::BioSequence{DNAAlphabet}; min_aa::Integer=0)
         complete_length == 0 && continue
         frame_bytes = bytes[frame:frame + complete_length - 1]
 
-        protein = AASeq(translate_dna(frame_bytes; stop_at_stop=false); validate=false)
-        if length(protein) >= min_aa
-            push!(proteins, protein)
+        # Translate and split by stop codons
+        protein_str = String(translate_dna(frame_bytes; stop_at_stop=false))
+        for orf in split(protein_str, '*')
+            if length(orf) >= min_aa
+                push!(proteins, AASeq(orf; validate=false))
+            end
         end
 
-        reverse_protein = AASeq(translate_dna(reverse_complement(frame_bytes); stop_at_stop=false); validate=false)
-        if length(reverse_protein) >= min_aa
-            push!(proteins, reverse_protein)
+        # Reverse complement frame
+        rc_frame_bytes = reverse_complement(frame_bytes)
+        rc_protein_str = String(translate_dna(rc_frame_bytes; stop_at_stop=false))
+        for orf in split(rc_protein_str, '*')
+            if length(orf) >= min_aa
+                push!(proteins, AASeq(orf; validate=false))
+            end
         end
     end
 
@@ -1081,12 +1173,37 @@ Decode a compact DNA k-mer key into its string form.
     return String(bytes)
 end
 
-"""
-    _kmer_frequency_unambiguous_dna(sequence, k)
+function _kmer_frequency_unambiguous_dna(sequence::BioSequence{DNAAlphabet, BitPackedVector{2}}, k::Integer)
+    len = sequence.data.len
+    len < k && return Dict{String,Int}()
+    
+    mask = (UInt64(1) << (2 * k)) - 1
+    counts = Dict{UInt64,Int}()
+    
+    current_key = UInt64(0)
+    @inbounds for i in 1:k
+        code = UInt64(_DNA_CODE[Int(sequence.data[i]) + 1])
+        code > 3 && return nothing
+        current_key = (current_key << 2) | code
+    end
+    counts[current_key] = 1
+    
+    @inbounds for i in (k + 1):len
+        code = UInt64(_DNA_CODE[Int(sequence.data[i]) + 1])
+        code > 3 && return nothing
+        current_key = ((current_key << 2) & mask) | code
+        counts[current_key] = get(counts, current_key, 0) + 1
+    end
+    
+    result = Dict{String,Int}()
+    sizehint!(result, length(counts))
+    for (key, count) in counts
+        result[_decode_dna_kmer_key(key, k)] = count
+    end
+    return result
+end
 
-Count k-mers for an unambiguous DNA sequence.
-"""
-function _kmer_frequency_unambiguous_dna(sequence::BioSequence{DNAAlphabet}, k::Integer)
+function _kmer_frequency_unambiguous_dna(sequence::BioSequence{DNAAlphabet, Vector{UInt8}}, k::Integer)
     length_sequence = length(sequence)
     length_sequence < k && return Dict{String,Int}()
 
@@ -1490,7 +1607,7 @@ score_grna_efficiency(guide::AbstractString; pam::AbstractString="NGG") =
 Compute cumulative GC skew for a sequence.
 """
 function gc_skew(sequence::BioSequence{A}) where {A <: BioAlphabet}
-    bytes = sequence.data
+    bytes = Vector{UInt8}(sequence.data)
     len = length(bytes)
     skew_values = Vector{Int}(undef, len)
     current = 0
@@ -1549,12 +1666,12 @@ Returns a Matrix{Int8} where 1 = match, 0 = mismatch.
 Rows correspond to seq1, columns to seq2.
 """
 function dotmatrix(seq1::BioSequence{A}, seq2::BioSequence{A}; use_cuda::Bool=false) where {A <: BioAlphabet}
+    seq1_bytes = Vector{UInt8}(seq1.data)
+    seq2_bytes = Vector{UInt8}(seq2.data)
     if use_cuda
-        seq1_bytes = Vector{UInt8}(seq1.data)
-        seq2_bytes = Vector{UInt8}(seq2.data)
         return dotmatrix(seq1_bytes, seq2_bytes; use_cuda=true)
     end
-    return dotmatrix(seq1.data, seq2.data)
+    return dotmatrix(seq1_bytes, seq2_bytes)
 end
 
 """
@@ -1591,15 +1708,6 @@ function dotmatrix(seq1::AbstractString, seq2::AbstractString; use_cuda::Bool=fa
     return provenance_result!(_ctx, dotmatrix(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); use_cuda=use_cuda), "dotmatrix")
 end
 
-# ==============================================================================
-# Missing Bioconductor-equivalent features
-#
-# The following functions mirror capabilities from R/Bioconductor's Biostrings,
-# IRanges, and GenomicRanges packages that were absent from BioToolkit.
-# ==============================================================================
-
-# ---- dinucleotide_frequency (Biostrings::dinucleotideFrequency) ---------------
-
 """
     dinucleotide_frequency(sequence)
 
@@ -1610,7 +1718,7 @@ Equivalent to R/Bioconductor's `Biostrings::dinucleotideFrequency`.
 """
 function dinucleotide_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
     counts = Dict{String,Int}()
-    bytes = sequence.data
+    bytes = Vector{UInt8}(sequence.data)
     len = length(bytes)
     len < 2 && return counts
 
@@ -1634,7 +1742,7 @@ Equivalent to R/Bioconductor's `Biostrings::trinucleotideFrequency`.
 """
 function trinucleotide_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
     counts = Dict{String,Int}()
-    bytes = sequence.data
+    bytes = Vector{UInt8}(sequence.data)
     len = length(bytes)
     len < 3 && return counts
 
@@ -1661,7 +1769,7 @@ Equivalent to R/Bioconductor's `Biostrings::letterFrequency`.
 """
 function letter_frequency(sequence::BioSequence{A}) where {A <: BioAlphabet}
     counts = Dict{Char,Int}()
-    @inbounds for byte in sequence.data
+    @inbounds for byte in Vector{UInt8}(sequence.data)
         ch = Char(byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte))
         counts[ch] = get(counts, ch, 0) + 1
     end
@@ -1688,7 +1796,7 @@ function sequence_complexity(sequence::BioSequence{A}; k::Int=3) where {A <: Bio
     len < k && return 0.0
 
     observed = Set{UInt64}()
-    bytes = sequence.data
+    bytes = Vector{UInt8}(sequence.data)
 
     @inbounds for i in 1:(len - k + 1)
         h = UInt64(0)
@@ -1766,7 +1874,7 @@ function sliding_window_gc_content(sequence::BioSequence{DNAAlphabet}; window::I
     starts = Int[]
     stops = Int[]
     gc_content = Float64[]
-    bytes = sequence.data
+    bytes = Vector{UInt8}(sequence.data)
 
     @inbounds for start_pos in 1:step:(len - window + 1)
         stop_pos = start_pos + window - 1
@@ -1787,4 +1895,229 @@ function sliding_window_gc_content(sequence::BioSequence{DNAAlphabet}; window::I
 end
 
 sliding_window_gc_content(sequence::AbstractString; window::Int=100, step::Int=1) = sliding_window_gc_content(DNASeq(sequence; validate=false); window=window, step=step)
+
+# ==============================================================================
+# NCBI Genetic Translation Tables Suite (Tables 1 to 33)
+# ==============================================================================
+
+const _NCBI_TABLE_OVERRIDES = Dict{Int, Vector{Tuple{String, Char}}}(
+    1  => Tuple{String, Char}[], # Standard
+    2  => [("AGA", '*'), ("AGG", '*'), ("ATA", 'M'), ("TGA", 'W')], # Vertebrate Mitochondrial
+    3  => [("ATA", 'M'), ("TGA", 'W'), ("CTA", 'T'), ("CTC", 'T'), ("CTG", 'T'), ("CTT", 'T')], # Yeast Mitochondrial
+    4  => [("TGA", 'W')], # Mold/Protozoan Mitochondrial
+    5  => [("AGA", 'S'), ("AGG", 'S'), ("ATA", 'M'), ("TGA", 'W')], # Invertebrate Mitochondrial
+    6  => [("TAA", 'Q'), ("TAG", 'Q')], # Ciliate
+    9  => [("AAA", 'N'), ("AGA", 'S'), ("AGG", 'S'), ("TGA", 'W')], # Echinoderm/Flatworm Mitochondrial
+    10 => [("TGA", 'C')], # Euplotid Nuclear
+    12 => [("CTG", 'S')], # Alternative Yeast Nuclear
+    13 => [("AGA", 'G'), ("AGG", 'G'), ("ATA", 'M'), ("TGA", 'W')], # Ascidian Mitochondrial
+    14 => [("AAA", 'N'), ("AGA", 'S'), ("AGG", 'S'), ("TAA", 'Y'), ("TGA", 'W')], # Alternative Flatworm Mito
+    16 => [("TAG", 'L')], # Chlorophycean Mito
+    21 => [("AAA", 'N'), ("AGA", 'S'), ("AGG", 'S'), ("ATA", 'M'), ("TGA", 'W')], # Trematode Mito
+    22 => [("TCA", '*'), ("TAG", 'L')], # Scenedesmus Mito
+    23 => [("TTA", '*')], # Thraustochytrium Mito
+    24 => [("AGA", 'S'), ("AGG", 'K'), ("TGA", 'W')], # Rhabdopleuridae Mito
+    25 => [("TGA", 'G')], # Candidate Division SR1
+    26 => [("CTG", 'A')], # Pachysolen tannophilus
+    33 => [("AGA", 'S'), ("AGG", 'K'), ("TGA", 'W')] # Cephalodiscidae Mito
+)
+
+function _ncbi_trans_table_array(table_id::Int=1)
+    base_table = copy(_CODON_TABLE)
+    overrides = get(_NCBI_TABLE_OVERRIDES, table_id, Tuple{String, Char}[])
+    for (codon, aa) in overrides
+        b1 = UInt8(codon[1])
+        b2 = UInt8(codon[2])
+        b3 = UInt8(codon[3])
+        code1 = Int(_DNA_CODE[Int(b1) + 1])
+        code2 = Int(_DNA_CODE[Int(b2) + 1])
+        code3 = Int(_DNA_CODE[Int(b3) + 1])
+        codon_index = ((code1 << 4) | (code2 << 2) | code3) + 1
+        base_table[codon_index] = UInt8(aa)
+    end
+    return base_table
+end
+
+"""
+    ncbi_trans_table(table_id=1) -> Dict{String, Char}
+
+Return a dictionary mapping 3-letter DNA codons to single-letter amino acid codes
+for the specified NCBI translation table ID (e.g. 1=Standard, 2=Vertebrate Mito,
+5=Invertebrate Mito, 6=Ciliate, 12=Alt Yeast Nuclear).
+"""
+function ncbi_trans_table(table_id::Int=1)
+    table_arr = _ncbi_trans_table_array(table_id)
+    result = Dict{String, Char}()
+    for idx in 1:64
+        codon = _CODON_TRIPLETS[idx]
+        aa = Char(table_arr[idx])
+        result[codon] = aa
+    end
+    return result
+end
+
+# ==============================================================================
+# In-place Transformations & Sequence Utilities
+# ==============================================================================
+
+"""
+    complement!(buffer, sequence) -> buffer
+
+Compute the complement of `sequence` in-place into `buffer`.
+"""
+function complement!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8})
+    len = length(bytes)
+    length(buffer) >= len || throw(ArgumentError("buffer is too small"))
+    @inbounds for i in 1:len
+        buffer[i] = _DNA_COMPLEMENT[Int(bytes[i]) + 1]
+    end
+    return buffer
+end
+
+function complement(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    buf = Vector{UInt8}(undef, length(sequence))
+    complement!(buf, sequence.data)
+    return BioSequence{A}(buf; validate=false)
+end
+
+complement(sequence::AbstractString) = String(complement(DNASeq(sequence; validate=false)))
+
+"""
+    canonical(sequence)
+
+Return the canonical (lexicographically smaller) representation between a sequence
+and its reverse complement.
+"""
+Base.isless(s1::BioSequence{A}, s2::BioSequence{A}) where {A <: BioAlphabet} = String(s1) < String(s2)
+
+function canonical(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    rc = reverse_complement(sequence)
+    return sequence < rc ? sequence : rc
+end
+
+canonical(sequence::AbstractString) = String(canonical(DNASeq(sequence; validate=false)))
+
+"""
+    canonical!(buffer, sequence)
+
+Write the canonical sequence into `buffer`.
+"""
+function canonical!(buffer::AbstractVector{UInt8}, sequence::BioSequence{A}) where {A <: BioAlphabet}
+    can = canonical(sequence)
+    copyto!(buffer, can.data)
+    return buffer
+end
+
+"""
+    ungap(sequence)
+
+Remove gap characters (`-` and `.`) from a sequence.
+"""
+function ungap(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    clean = filter(b -> b != UInt8('-') && b != UInt8('.'), sequence.data)
+    return BioSequence{A}(clean; validate=false)
+end
+
+ungap(sequence::AbstractString) = String(ungap(DNASeq(sequence; validate=false)))
+
+"""
+    ungap!(buffer, sequence)
+
+Remove gaps in-place, writing result into `buffer` and returning the number of written bases.
+"""
+function ungap!(buffer::AbstractVector{UInt8}, bytes::AbstractVector{UInt8})
+    written = 0
+    @inbounds for b in bytes
+        if b != UInt8('-') && b != UInt8('.')
+            written += 1
+            buffer[written] = b
+        end
+    end
+    return written
+end
+
+# ==============================================================================
+# Biological Sequence Predicates
+# ==============================================================================
+
+"""
+    ispalindromic(sequence) -> Bool
+
+Return `true` if `sequence` is equal to its reverse complement.
+"""
+function ispalindromic(sequence::BioSequence{A}) where {A <: BioAlphabet}
+    return sequence == reverse_complement(sequence)
+end
+
+ispalindromic(sequence::AbstractString) = ispalindromic(DNASeq(sequence; validate=false))
+
+@inline _uppercase_byte(b::UInt8) = (b >= UInt8('a') && b <= UInt8('z')) ? b - 0x20 : b
+
+"""
+    ispurine(base) -> Bool
+
+Return `true` if `base` is a purine nucleotide (A, G, or R).
+"""
+function ispurine(base::UInt8)
+    b = _uppercase_byte(base)
+    return b == UInt8('A') || b == UInt8('G') || b == UInt8('R')
+end
+
+ispurine(base::Char) = ispurine(UInt8(base))
+
+"""
+    ispyrimidine(base) -> Bool
+
+Return `true` if `base` is a pyrimidine nucleotide (C, T, U, or Y).
+"""
+function ispyrimidine(base::UInt8)
+    b = _uppercase_byte(base)
+    return b == UInt8('C') || b == UInt8('T') || b == UInt8('U') || b == UInt8('Y')
+end
+
+ispyrimidine(base::Char) = ispyrimidine(UInt8(base))
+
+"""
+    iscompatible(base1, base2) -> Bool
+
+Return `true` if two IUPAC nucleotide bases are compatible (share at least one possible base).
+"""
+function iscompatible(b1::UInt8, b2::UInt8)
+    b1_upper = _uppercase_byte(b1)
+    b2_upper = _uppercase_byte(b2)
+    b1_upper == b2_upper && return true
+    (b1_upper == UInt8('N') || b2_upper == UInt8('N')) && return true
+    
+    # Simple Purine/Pyrimidine checks
+    if b1_upper == UInt8('R')
+        return b2_upper in (UInt8('A'), UInt8('G'), UInt8('R'), UInt8('W'), UInt8('S'), UInt8('K'), UInt8('M'), UInt8('D'), UInt8('V'))
+    elseif b2_upper == UInt8('R')
+        return b1_upper in (UInt8('A'), UInt8('G'), UInt8('R'), UInt8('W'), UInt8('S'), UInt8('K'), UInt8('M'), UInt8('D'), UInt8('V'))
+    elseif b1_upper == UInt8('Y')
+        return b2_upper in (UInt8('C'), UInt8('T'), UInt8('U'), UInt8('Y'), UInt8('W'), UInt8('S'), UInt8('K'), UInt8('M'), UInt8('B'), UInt8('H'))
+    elseif b2_upper == UInt8('Y')
+        return b1_upper in (UInt8('C'), UInt8('T'), UInt8('U'), UInt8('Y'), UInt8('W'), UInt8('S'), UInt8('K'), UInt8('M'), UInt8('B'), UInt8('H'))
+    end
+    
+    return false
+end
+
+iscompatible(b1::Char, b2::Char) = iscompatible(UInt8(b1), UInt8(b2))
+
+# ==============================================================================
+# Sequence String Literals
+# ==============================================================================
+
+macro dna_str(str)
+    return DNASeq(str)
+end
+
+macro rna_str(str)
+    return RNASeq(str)
+end
+
+macro aa_str(str)
+    return AASeq(str)
+end
+
 

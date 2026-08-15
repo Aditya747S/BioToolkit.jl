@@ -555,15 +555,11 @@ function nearest(query::GenomicInterval, subject::IntervalCollection; select::Sy
         end
     end
 
-    # Binary search on sorted starts for right-side nearest
-    right_idx = searchsortedfirst(subject.starts, query.right + 1, first(range), last(range), Base.Order.Forward)
-    # Binary search on sorted starts for left-side candidates
-    left_idx = right_idx - 1
-
     best_interval = nothing
     best_dist = typemax(Int)
 
-    # Check candidate to the right (start > query.right)
+    # Candidate 1: Right-side candidate (first interval starting after query.right)
+    right_idx = searchsortedfirst(subject.starts, query.right + 1, first(range), last(range), Base.Order.Forward)
     if right_idx <= last(range)
         d = subject.starts[right_idx] - query.right - 1
         if d < best_dist
@@ -572,22 +568,17 @@ function nearest(query::GenomicInterval, subject::IntervalCollection; select::Sy
         end
     end
 
-    # Check candidates to the left (need to find the one with largest end)
-    # Scan a small window leftward from the insertion point
-    scan_left = left_idx
-    while scan_left >= first(range)
-        interval = subject.intervals[scan_left]
-        d = _distance(query, interval)
-        d < 0 && (scan_left -= 1; continue)
-        if d < best_dist
-            best_dist = d
-            best_interval = interval
+    # Candidate 2: Left-side candidate (interval ending before query.left with largest end)
+    end_indices = get(subject.chrom_end_indices, query.chrom, nothing)
+    if end_indices !== nothing
+        left_idx = _find_last_end_lt(subject.ends, end_indices, query.left)
+        if left_idx !== nothing
+            d = query.left - subject.ends[left_idx] - 1
+            if d <= best_dist
+                best_dist = d
+                best_interval = subject.intervals[left_idx]
+            end
         end
-        # If the start is far enough left that no remaining interval can be closer
-        if query.left - interval.left > best_dist
-            break
-        end
-        scan_left -= 1
     end
 
     best_interval === nothing && return nothing

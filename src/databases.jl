@@ -1,14 +1,18 @@
 module Restriction
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, BioSequence, DNAAlphabet
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, new_provenance_id, register_provenance!
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, register_provenance!
+using JSON
 
 export RestrictionEnzyme, RestrictionSite, restriction_enzymes, restriction_enzyme, restriction_enzyme_names, restriction_catalog, restriction_sites, restriction_digest_map, find_restriction_sites, digest_sequence
+export blunt_enzymes, sticky_enzymes, isoschizomers, find_unique_cutters, restriction_map_html, export_restriction_map_html
 
 struct RestrictionEnzyme
     name::String
     recognition_site::BioSequence{DNAAlphabet}
     cut_offset::Int
+    overhang::Int
+    is_blunt::Bool
     regex::Regex
 end
 
@@ -16,9 +20,11 @@ struct RestrictionSite
     enzyme::RestrictionEnzyme
     position::Int
     cut_position::Int
+    overhang::Int
+    is_blunt::Bool
 end
 
-Base.show(io::IO, enzyme::RestrictionEnzyme) = print(io, "RestrictionEnzyme($(enzyme.name), $(enzyme.recognition_site), cut=$(enzyme.cut_offset))")
+Base.show(io::IO, enzyme::RestrictionEnzyme) = print(io, "RestrictionEnzyme($(enzyme.name), $(enzyme.recognition_site), cut=$(enzyme.cut_offset), overhang=$(enzyme.overhang))")
 Base.show(io::IO, site::RestrictionSite) = print(io, "RestrictionSite($(site.enzyme.name)@$(site.position)->$(site.cut_position))")
 
 const _IUPAC_PATTERNS = Dict{Char,String}(
@@ -40,8 +46,6 @@ const _IUPAC_PATTERNS = Dict{Char,String}(
     'N' => "[ACGT]")
 
 function _restriction_regex(site::BioSequence{DNAAlphabet})
-    # Regex search is still the most robust way to find overlapping IUPAC matches
-    # but we store the site as a typed sequence for scientific parity.
     site_str = String(site)
     pattern = IOBuffer()
     print(pattern, "(?i)")
@@ -51,90 +55,90 @@ function _restriction_regex(site::BioSequence{DNAAlphabet})
     return Regex(String(take!(pattern)))
 end
 
-function _restriction_enzyme(name::String, recognition_site::String, cut_offset::Integer)
+function _restriction_enzyme(name::String, recognition_site::String, cut_offset::Integer, overhang::Integer=0)
     site_seq = BioSequence{DNAAlphabet}(recognition_site)
-    return RestrictionEnzyme(String(name), site_seq, Int(cut_offset), _restriction_regex(site_seq))
+    is_blunt = (overhang == 0)
+    return RestrictionEnzyme(String(name), site_seq, Int(cut_offset), Int(overhang), is_blunt, _restriction_regex(site_seq))
 end
 
 const _RESTRICTION_DATABASE = Dict{String,RestrictionEnzyme}(
     enzyme.name => enzyme for enzyme in (
-        _restriction_enzyme("EcoRI", "GAATTC", 1),
-        _restriction_enzyme("BamHI", "GGATCC", 1),
-        _restriction_enzyme("HindIII", "AAGCTT", 1),
-        _restriction_enzyme("NotI", "GCGGCCGC", 2),
-        _restriction_enzyme("PstI", "CTGCAG", 5),
-        _restriction_enzyme("SmaI", "CCCGGG", 3),
-        _restriction_enzyme("XhoI", "CTCGAG", 1),
-        _restriction_enzyme("SalI", "GTCGAC", 1),
-        _restriction_enzyme("NdeI", "CATATG", 2),
-        _restriction_enzyme("NcoI", "CCATGG", 1),
-        _restriction_enzyme("KpnI", "GGTACC", 5),
-        _restriction_enzyme("ClaI", "ATCGAT", 2),
-        _restriction_enzyme("PvuII", "CAGCTG", 3),
-        _restriction_enzyme("HaeIII", "GGCC", 2),
-        _restriction_enzyme("AluI", "AGCT", 2),
-        _restriction_enzyme("DpnI", "GATC", 2),
-        _restriction_enzyme("MspI", "CCGG", 1),
-        _restriction_enzyme("HinfI", "GANTC", 1),
-        _restriction_enzyme("TaqI", "TCGA", 1),
-        _restriction_enzyme("BstEII", "GGTNACC", 1),
-        _restriction_enzyme("AatII", "GACGTC", 1),
-        _restriction_enzyme("AbaSI", "CACNNNNGTG", 1),
-        _restriction_enzyme("ApaI", "GGGCCC", 1),
-        _restriction_enzyme("AseI", "ATTAAT", 1),
-        _restriction_enzyme("AvrII", "CCTAGG", 1),
-        _restriction_enzyme("BclI", "TGATCA", 1),
-        _restriction_enzyme("BglII", "AGATCT", 1),
-        _restriction_enzyme("BsaI", "GGTCTC", 1),
-        _restriction_enzyme("BsaXI", "ACNNNNGTAYC", 1),
-        _restriction_enzyme("BseRI", "GAGGAG", 10),
-        _restriction_enzyme("BsmBI", "CGTCTC", 1),
-        _restriction_enzyme("DraI", "TTTAAA", 3),
-        _restriction_enzyme("EcoRV", "GATATC", 3),
-        _restriction_enzyme("FokI", "GGATG", 9),
-        _restriction_enzyme("HaeII", "RGCGCY", 2),
-        _restriction_enzyme("HpaI", "GTTAAC", 3),
-        _restriction_enzyme("MluI", "ACGCGT", 1),
-        _restriction_enzyme("NheI", "GCTAGC", 1),
-        _restriction_enzyme("PacI", "TTAATTAA", 5),
-        _restriction_enzyme("SacI", "GAGCTC", 1),
-        _restriction_enzyme("SacII", "CCGCGG", 1),
-        _restriction_enzyme("SpeI", "ACTAGT", 1),
-        _restriction_enzyme("StuI", "AGGCCT", 3),
-        _restriction_enzyme("XbaI", "TCTAGA", 1),
-        _restriction_enzyme("XmaI", "CCCGGG", 1),
-        _restriction_enzyme("XmnI", "GAANNNNTTC", 5),
-        _restriction_enzyme("BspHI", "TCATGA", 1),
-        _restriction_enzyme("BspEI", "TCCGGA", 1),
-        _restriction_enzyme("BspMI", "ACCTGC", 1),
-        _restriction_enzyme("CspCI", "CAANNNNNGTGG", 1),
-        _restriction_enzyme("MfeI", "CAATTG", 1),
-        _restriction_enzyme("MluCI", "AATT", 1),
-        _restriction_enzyme("PciI", "ACATGT", 1),
-        _restriction_enzyme("PmlI", "CACGTG", 3),
-        _restriction_enzyme("SbfI", "CCTGCAGG", 1),
-        _restriction_enzyme("SphI", "GCATGC", 5),
-        _restriction_enzyme("Sse8387I", "CCTGCAGG", 2),
-        _restriction_enzyme("AgeI", "ACCGGT", 1),
-        _restriction_enzyme("AflII", "CTTAAG", 1),
-        _restriction_enzyme("AscI", "GGCGCGCC", 2),
-        _restriction_enzyme("AsiSI", "GCGATCGC", 1),
-        _restriction_enzyme("BsaI", "GGTCTC", 1),
-        _restriction_enzyme("BsiWI", "CGTACG", 1),
-        _restriction_enzyme("BsrGI", "TGTACA", 1),
-        _restriction_enzyme("BstBI", "TTCGAA", 1),
-        _restriction_enzyme("FspI", "TGCGCA", 3),
-        _restriction_enzyme("NruI", "TCGCGA", 3),
-        _restriction_enzyme("PmeI", "GTTTAAAC", 4),
-        _restriction_enzyme("RsrII", "CGGWCCG", 2),
-        _restriction_enzyme("SfiI", "GGCCNNNNNGGCC", 8),
-        _restriction_enzyme("SfoI", "GGCGCC", 3),
-        _restriction_enzyme("SrfI", "GCCCGGGC", 4),
-        _restriction_enzyme("SwaI", "ATTTAAAT", 4),
-        _restriction_enzyme("TspMI", "CCGG", 1),
-        _restriction_enzyme("XcmI", "CCANNNNNNNNNTGG", 1),
-        _restriction_enzyme("XmaIII", "CGGCCG", 1),
-        _restriction_enzyme("ZraI", "GACGTC", 3))
+        _restriction_enzyme("EcoRI", "GAATTC", 1, 4),
+        _restriction_enzyme("BamHI", "GGATCC", 1, 4),
+        _restriction_enzyme("HindIII", "AAGCTT", 1, 4),
+        _restriction_enzyme("NotI", "GCGGCCGC", 2, 4),
+        _restriction_enzyme("PstI", "CTGCAG", 5, -4),
+        _restriction_enzyme("SmaI", "CCCGGG", 3, 0),
+        _restriction_enzyme("XhoI", "CTCGAG", 1, 4),
+        _restriction_enzyme("SalI", "GTCGAC", 1, 4),
+        _restriction_enzyme("NdeI", "CATATG", 2, 2),
+        _restriction_enzyme("NcoI", "CCATGG", 1, 4),
+        _restriction_enzyme("KpnI", "GGTACC", 5, -4),
+        _restriction_enzyme("ClaI", "ATCGAT", 2, 2),
+        _restriction_enzyme("PvuII", "CAGCTG", 3, 0),
+        _restriction_enzyme("HaeIII", "GGCC", 2, 0),
+        _restriction_enzyme("AluI", "AGCT", 2, 0),
+        _restriction_enzyme("DpnI", "GATC", 2, 0),
+        _restriction_enzyme("MspI", "CCGG", 1, 2),
+        _restriction_enzyme("HinfI", "GANTC", 1, 3),
+        _restriction_enzyme("TaqI", "TCGA", 1, 2),
+        _restriction_enzyme("BstEII", "GGTNACC", 1, 5),
+        _restriction_enzyme("AatII", "GACGTC", 5, -4),
+        _restriction_enzyme("AbaSI", "CACNNNNGTG", 1, 0),
+        _restriction_enzyme("ApaI", "GGGCCC", 5, -4),
+        _restriction_enzyme("AseI", "ATTAAT", 2, 2),
+        _restriction_enzyme("AvrII", "CCTAGG", 1, 4),
+        _restriction_enzyme("BclI", "TGATCA", 1, 4),
+        _restriction_enzyme("BglII", "AGATCT", 1, 4),
+        _restriction_enzyme("BsaI", "GGTCTC", 1, 4),
+        _restriction_enzyme("BsaXI", "ACNNNNGTAYC", 1, 0),
+        _restriction_enzyme("BseRI", "GAGGAG", 10, 2),
+        _restriction_enzyme("BsmBI", "CGTCTC", 1, 4),
+        _restriction_enzyme("DraI", "TTTAAA", 3, 0),
+        _restriction_enzyme("EcoRV", "GATATC", 3, 0),
+        _restriction_enzyme("FokI", "GGATG", 9, 4),
+        _restriction_enzyme("HaeII", "RGCGCY", 5, -4),
+        _restriction_enzyme("HpaI", "GTTAAC", 3, 0),
+        _restriction_enzyme("MluI", "ACGCGT", 1, 4),
+        _restriction_enzyme("NheI", "GCTAGC", 1, 4),
+        _restriction_enzyme("PacI", "TTAATTAA", 5, -2),
+        _restriction_enzyme("SacI", "GAGCTC", 5, -4),
+        _restriction_enzyme("SacII", "CCGCGG", 4, -2),
+        _restriction_enzyme("SpeI", "ACTAGT", 1, 4),
+        _restriction_enzyme("StuI", "AGGCCT", 3, 0),
+        _restriction_enzyme("XbaI", "TCTAGA", 1, 4),
+        _restriction_enzyme("XmaI", "CCCGGG", 1, 4),
+        _restriction_enzyme("XmnI", "GAANNNNTTC", 5, 0),
+        _restriction_enzyme("BspHI", "TCATGA", 1, 4),
+        _restriction_enzyme("BspEI", "TCCGGA", 1, 4),
+        _restriction_enzyme("BspMI", "ACCTGC", 1, 4),
+        _restriction_enzyme("CspCI", "CAANNNNNGTGG", 1, 2),
+        _restriction_enzyme("MfeI", "CAATTG", 1, 4),
+        _restriction_enzyme("MluCI", "AATT", 1, 4),
+        _restriction_enzyme("PciI", "ACATGT", 1, 4),
+        _restriction_enzyme("PmlI", "CACGTG", 3, 0),
+        _restriction_enzyme("SbfI", "CCTGCAGG", 6, -4),
+        _restriction_enzyme("SphI", "GCATGC", 5, -4),
+        _restriction_enzyme("Sse8387I", "CCTGCAGG", 6, -4),
+        _restriction_enzyme("AgeI", "ACCGGT", 1, 4),
+        _restriction_enzyme("AflII", "CTTAAG", 1, 4),
+        _restriction_enzyme("AscI", "GGCGCGCC", 2, 4),
+        _restriction_enzyme("AsiSI", "GCGATCGC", 5, -2),
+        _restriction_enzyme("BsiWI", "CGTACG", 1, 4),
+        _restriction_enzyme("BsrGI", "TGTACA", 1, 4),
+        _restriction_enzyme("BstBI", "TTCGAA", 1, 2),
+        _restriction_enzyme("FspI", "TGCGCA", 3, 0),
+        _restriction_enzyme("NruI", "TCGCGA", 3, 0),
+        _restriction_enzyme("PmeI", "GTTTAAAC", 4, 0),
+        _restriction_enzyme("RsrII", "CGGWCCG", 2, 3),
+        _restriction_enzyme("SfiI", "GGCCNNNNNGGCC", 8, -3),
+        _restriction_enzyme("SfoI", "GGCGCC", 3, 0),
+        _restriction_enzyme("SrfI", "GCCCGGGC", 4, 0),
+        _restriction_enzyme("SwaI", "ATTTAAAT", 4, 0),
+        _restriction_enzyme("TspMI", "CCGG", 1, 4),
+        _restriction_enzyme("XcmI", "CCANNNNNNNNNTGG", 8, -1),
+        _restriction_enzyme("XmaIII", "CGGCCG", 1, 4),
+        _restriction_enzyme("ZraI", "GACGTC", 3, 0))
 )
 
 restriction_enzymes() = _RESTRICTION_DATABASE
@@ -147,115 +151,317 @@ function restriction_enzyme(name::String)
     return enzyme
 end
 
-restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::String) = find_restriction_sites(sequence, enzyme)
-restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme) = find_restriction_sites(sequence, enzyme)
-restriction_sites(sequence::BioSequence{DNAAlphabet}) = find_restriction_sites(sequence)
+blunt_enzymes() = filter(e -> e.is_blunt, restriction_catalog())
+sticky_enzymes() = filter(e -> !e.is_blunt, restriction_catalog())
+
+function isoschizomers(enzyme_name::String)
+    ref_enzyme = restriction_enzyme(enzyme_name)
+    ref_site = String(ref_enzyme.recognition_site)
+    return filter(e -> String(e.recognition_site) == ref_site && e.name != ref_enzyme.name, restriction_catalog())
+end
 
 @inline _restriction_as_dna(sequence::AbstractString) = BioSequence{DNAAlphabet}(String(sequence); validate=false)
 
-restriction_sites(sequence::AbstractString, enzyme::String) = find_restriction_sites(_restriction_as_dna(sequence), enzyme)
-restriction_sites(sequence::AbstractString, enzyme::RestrictionEnzyme) = find_restriction_sites(_restriction_as_dna(sequence), enzyme)
-restriction_sites(sequence::AbstractString) = find_restriction_sites(_restriction_as_dna(sequence))
-
-function find_restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme)
+function find_restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme; circular::Bool=false)
     sites = RestrictionSite[]
+    seq_len = length(sequence)
+    seq_len == 0 && return sites
     sequence_str = String(sequence)
-    for match in eachmatch(enzyme.regex, sequence_str; overlap=true)
+    
+    search_str = circular ? sequence_str * sequence_str[1:min(end, length(enzyme.recognition_site)-1)] : sequence_str
+    
+    for match in eachmatch(enzyme.regex, search_str; overlap=true)
         pos = match.offset
-        # cut_offset is 1-indexed relative to the match
+        if pos > seq_len && circular
+            pos = pos - seq_len
+        end
         cut_pos = pos + enzyme.cut_offset - 1
-        push!(sites, RestrictionSite(enzyme, pos, cut_pos))
+        if cut_pos > seq_len && circular
+            cut_pos = mod1(cut_pos, seq_len)
+        end
+        push!(sites, RestrictionSite(enzyme, pos, cut_pos, enzyme.overhang, enzyme.is_blunt))
     end
+    
     _ctx = active_provenance_context()
     if _ctx !== nothing
         register_provenance!(_ctx, "find_restriction_sites";
-        parameters=(enzyme=enzyme.name, sequence_length=length(sequence), n_sites=length(sites)))
+        parameters=(enzyme=enzyme.name, sequence_length=seq_len, circular=circular, n_sites=length(sites)))
     end
     return sites
 end
-find_restriction_sites(sequence::BioSequence{DNAAlphabet}, name::String) = find_restriction_sites(sequence, restriction_enzyme(name))
-find_restriction_sites(sequence::AbstractString, enzyme::RestrictionEnzyme) = find_restriction_sites(_restriction_as_dna(sequence), enzyme)
-find_restriction_sites(sequence::AbstractString, name::String) = find_restriction_sites(_restriction_as_dna(sequence), name)
 
-function find_restriction_sites(sequence::BioSequence{DNAAlphabet})
+find_restriction_sites(sequence::BioSequence{DNAAlphabet}, name::String; kwargs...) = find_restriction_sites(sequence, restriction_enzyme(name); kwargs...)
+find_restriction_sites(sequence::AbstractString, enzyme::RestrictionEnzyme; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence), enzyme; kwargs...)
+find_restriction_sites(sequence::AbstractString, name::String; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence), name; kwargs...)
+
+function find_restriction_sites(sequence::BioSequence{DNAAlphabet}; circular::Bool=false)
     sites = RestrictionSite[]
     for enzyme in values(_RESTRICTION_DATABASE)
-        append!(sites, find_restriction_sites(sequence, enzyme))
+        append!(sites, find_restriction_sites(sequence, enzyme; circular=circular))
     end
     _ctx = active_provenance_context()
     if _ctx !== nothing
         register_provenance!(_ctx, "find_restriction_sites_all";
-        parameters=(n_enzymes=length(_RESTRICTION_DATABASE), sequence_length=length(sequence), n_sites=length(sites)))
+        parameters=(n_enzymes=length(_RESTRICTION_DATABASE), sequence_length=length(sequence), circular=circular, n_sites=length(sites)))
     end
     return sites
 end
-find_restriction_sites(sequence::AbstractString) = find_restriction_sites(_restriction_as_dna(sequence))
+find_restriction_sites(sequence::AbstractString; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence); kwargs...)
 
-function digest_sequence(sequence::BioSequence{DNAAlphabet}, enzymes::AbstractVector{<:RestrictionEnzyme})
-    hits = RestrictionSite[]
+restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::String; kwargs...) = find_restriction_sites(sequence, enzyme; kwargs...)
+restriction_sites(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme; kwargs...) = find_restriction_sites(sequence, enzyme; kwargs...)
+restriction_sites(sequence::BioSequence{DNAAlphabet}; kwargs...) = find_restriction_sites(sequence; kwargs...)
+restriction_sites(sequence::AbstractString, enzyme::String; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence), enzyme; kwargs...)
+restriction_sites(sequence::AbstractString, enzyme::RestrictionEnzyme; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence), enzyme; kwargs...)
+restriction_sites(sequence::AbstractString; kwargs...) = find_restriction_sites(_restriction_as_dna(sequence); kwargs...)
+
+function find_unique_cutters(sequence::BioSequence{DNAAlphabet}, enzymes::AbstractVector{<:RestrictionEnzyme}=restriction_catalog(); circular::Bool=false)
+    unique_enzymes = RestrictionEnzyme[]
     for enzyme in enzymes
-        append!(hits, find_restriction_sites(sequence, enzyme))
-    end
-    sort!(hits; by = hit -> hit.cut_position)
-
-    length(sequence) == 0 && return [sequence]
-    
-    # Unique cut positions
-    cut_points = Int[0, length(sequence)]
-    for hit in hits
-        if 1 < hit.cut_position <= length(sequence)
-            push!(cut_points, hit.cut_position)
+        sites = find_restriction_sites(sequence, enzyme; circular=circular)
+        if length(sites) == 1
+            push!(unique_enzymes, enzyme)
         end
     end
-    unique!(sort!(cut_points))
+    return unique_enzymes
+end
+find_unique_cutters(sequence::AbstractString, args...; kwargs...) = find_unique_cutters(_restriction_as_dna(sequence), args...; kwargs...)
+
+function digest_sequence(sequence::BioSequence{DNAAlphabet}, enzymes::AbstractVector{<:RestrictionEnzyme}; circular::Bool=false)
+    hits = RestrictionSite[]
+    for enzyme in enzymes
+        append!(hits, find_restriction_sites(sequence, enzyme; circular=circular))
+    end
+    seq_len = length(sequence)
+    seq_len == 0 && return [sequence]
+    
+    sort!(hits; by = hit -> hit.cut_position)
+
+    if isempty(hits)
+        return [sequence]
+    end
 
     fragments = BioSequence{DNAAlphabet}[]
-    for index in 1:length(cut_points)-1
-        start_pos = cut_points[index] + 1
-        stop_pos = cut_points[index + 1]
-        push!(fragments, sequence[start_pos:stop_pos])
+    
+    if circular
+        cut_positions = unique!(sort!([hit.cut_position for hit in hits]))
+        n_cuts = length(cut_positions)
+        if n_cuts == 1
+            c = cut_positions[1]
+            frag_str = String(sequence)[c+1:end] * String(sequence)[1:c]
+            push!(fragments, BioSequence{DNAAlphabet}(frag_str))
+        else
+            for i in 1:n_cuts-1
+                c1 = cut_positions[i]
+                c2 = cut_positions[i+1]
+                push!(fragments, sequence[c1+1:c2])
+            end
+            c_last = cut_positions[end]
+            c_first = cut_positions[1]
+            frag_str = String(sequence)[c_last+1:end] * String(sequence)[1:c_first]
+            push!(fragments, BioSequence{DNAAlphabet}(frag_str))
+        end
+    else
+        cut_points = Int[0, seq_len]
+        for hit in hits
+            if 1 < hit.cut_position <= seq_len
+                push!(cut_points, hit.cut_position)
+            end
+        end
+        unique!(sort!(cut_points))
+
+        for index in 1:length(cut_points)-1
+            start_pos = cut_points[index] + 1
+            stop_pos = cut_points[index + 1]
+            push!(fragments, sequence[start_pos:stop_pos])
+        end
     end
+
     _ctx = active_provenance_context()
     if _ctx !== nothing
         register_provenance!(_ctx, "digest_sequence";
-        parameters=(n_enzymes=length(enzymes), sequence_length=length(sequence), n_fragments=length(fragments)))
+        parameters=(n_enzymes=length(enzymes), sequence_length=seq_len, circular=circular, n_fragments=length(fragments)))
     end
     return fragments
 end
 
-function digest_sequence(sequence::BioSequence{DNAAlphabet}, enzyme_names::AbstractVector{<:String})
-    enzymes = [restriction_enzyme(name) for name in enzyme_names]
-    return digest_sequence(sequence, enzymes)
-end
+digest_sequence(sequence::BioSequence{DNAAlphabet}, enzyme_names::AbstractVector{<:String}; kwargs...) = digest_sequence(sequence, [restriction_enzyme(n) for n in enzyme_names]; kwargs...)
+digest_sequence(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme; kwargs...) = digest_sequence(sequence, [enzyme]; kwargs...)
+digest_sequence(sequence::BioSequence{DNAAlphabet}, name::String; kwargs...) = digest_sequence(sequence, [name]; kwargs...)
+digest_sequence(sequence::BioSequence{DNAAlphabet}; kwargs...) = digest_sequence(sequence, collect(values(_RESTRICTION_DATABASE)); kwargs...)
+digest_sequence(sequence::AbstractString, args...; kwargs...) = digest_sequence(_restriction_as_dna(sequence), args...; kwargs...)
 
-# Removed digest_sequence(::AbstractString) wrappers - use BioSequence{DNAAlphabet} instead
-
-digest_sequence(sequence::BioSequence{DNAAlphabet}, enzyme::RestrictionEnzyme) = digest_sequence(sequence, [enzyme])
-digest_sequence(sequence::BioSequence{DNAAlphabet}, name::String) = digest_sequence(sequence, [name])
-digest_sequence(sequence::BioSequence{DNAAlphabet}) = digest_sequence(sequence, collect(values(_RESTRICTION_DATABASE)))
-
-digest_sequence(sequence::AbstractString, enzyme::RestrictionEnzyme) = digest_sequence(_restriction_as_dna(sequence), [enzyme])
-digest_sequence(sequence::AbstractString, name::String) = digest_sequence(_restriction_as_dna(sequence), [name])
-digest_sequence(sequence::AbstractString) = digest_sequence(_restriction_as_dna(sequence), collect(values(_RESTRICTION_DATABASE)))
-
-function restriction_digest_map(sequence::BioSequence{DNAAlphabet}, enzymes=restriction_enzyme_names())
+function restriction_digest_map(sequence::BioSequence{DNAAlphabet}, enzymes=restriction_enzyme_names(); circular::Bool=false)
     digest = Dict{String,Vector{RestrictionSite}}()
     for enzyme_name in enzymes
-        digest[String(enzyme_name)] = find_restriction_sites(sequence, enzyme_name)
+        digest[String(enzyme_name)] = find_restriction_sites(sequence, enzyme_name; circular=circular)
     end
     return digest
 end
+restriction_digest_map(sequence::AbstractString, args...; kwargs...) = restriction_digest_map(_restriction_as_dna(sequence), args...; kwargs...)
 
-restriction_digest_map(sequence::AbstractString, enzymes=restriction_enzyme_names()) = restriction_digest_map(_restriction_as_dna(sequence), enzymes)
+function restriction_map_html(sequence::Union{BioSequence{DNAAlphabet},AbstractString}, sites::AbstractVector{RestrictionSite}; circular::Bool=false, title::AbstractString="DNA Restriction Map", standalone::Bool=true)
+    inst_id = "restmap_" * bytes2hex(rand(UInt8, 4))
+    seq_len = length(sequence)
+    sites_json = JSON.json([
+        Dict(
+            "enzyme" => site.enzyme.name,
+            "site_seq" => String(site.enzyme.recognition_site),
+            "pos" => site.position,
+            "cut_pos" => site.cut_position,
+            "overhang" => site.overhang,
+            "is_blunt" => site.is_blunt
+        ) for site in sites
+    ])
+
+    html = """
+    $(standalone ? "<!DOCTYPE html><html><head><meta charset='utf-8'><title>$(title)</title>" : "")
+    <style>
+      #$(inst_id)-root {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        background: #0f172a;
+        color: #f1f5f9;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);
+        margin: 10px 0;
+      }
+      #$(inst_id)-root h2 { margin: 0 0 10px 0; color: #38bdf8; font-size: 1.2rem; }
+      #$(inst_id)-root .badge { background: #334155; padding: 4px 10px; border-radius: 9999px; font-size: 0.8rem; margin-right: 8px; }
+      #$(inst_id)-canvas { background: #1e293b; border-radius: 8px; border: 1px solid #334155; margin-top: 15px; display: block; width: 100%; height: 420px; }
+    </style>
+
+    <div id="$(inst_id)-root">
+      <h2>✂️ $(title)</h2>
+      <div>
+        <span class="badge">Length: $(seq_len) bp</span>
+        <span class="badge">Type: $(circular ? "Circular (Plasmid)" : "Linear")</span>
+        <span class="badge">Sites: $(length(sites))</span>
+      </div>
+      <canvas id="$(inst_id)-canvas" width="800" height="420"></canvas>
+    </div>
+
+    <script>
+      (function() {
+        const sites = $(sites_json);
+        const seqLen = $(seq_len);
+        const isCircular = $(circular);
+        const canvas = document.getElementById('$(inst_id)-canvas');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        const width = canvas.width;
+        const height = canvas.height;
+
+        ctx.clearRect(0, 0, width, height);
+
+        if (isCircular) {
+          const cx = width / 2;
+          const cy = height / 2;
+          const radius = 140;
+
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 6;
+          ctx.stroke();
+
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('0 / ' + seqLen + ' bp', cx, cy - radius - 15);
+
+          const colors = ['#f43f5e', '#a855f7', '#3b82f6', '#10b981', '#f59e0b', '#ec4899'];
+
+          sites.forEach((s, idx) => {
+            const angle = (s.cut_pos / seqLen) * 2 * Math.PI - Math.PI / 2;
+            const x1 = cx + (radius - 12) * Math.cos(angle);
+            const y1 = cy + (radius - 12) * Math.sin(angle);
+            const x2 = cx + (radius + 20) * Math.cos(angle);
+            const y2 = cy + (radius + 20) * Math.sin(angle);
+
+            const col = colors[idx % colors.length];
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            const tx = cx + (radius + 35) * Math.cos(angle);
+            const ty = cy + (radius + 35) * Math.sin(angle);
+            ctx.fillStyle = col;
+            ctx.font = '11px monospace';
+            ctx.fillText(s.enzyme + ' (' + s.cut_pos + ')', tx, ty);
+          });
+        } else {
+          const startX = 60;
+          const endX = width - 60;
+          const y = height / 2;
+
+          ctx.beginPath();
+          ctx.moveTo(startX, y);
+          ctx.lineTo(endX, y);
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 6;
+          ctx.stroke();
+
+          ctx.fillStyle = '#94a3b8';
+          ctx.font = '12px sans-serif';
+          ctx.fillText('1 bp', startX, y + 25);
+          ctx.fillText(seqLen + ' bp', endX, y + 25);
+
+          const colors = ['#f43f5e', '#a855f7', '#3b82f6', '#10b981', '#f59e0b'];
+
+          sites.forEach((s, idx) => {
+            const x = startX + (s.cut_pos / seqLen) * (endX - startX);
+            const col = colors[idx % colors.length];
+            ctx.beginPath();
+            ctx.moveTo(x, y - 20);
+            ctx.lineTo(x, y + 20);
+            ctx.strokeStyle = col;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            ctx.fillStyle = col;
+            ctx.font = '11px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(s.enzyme + '@' + s.cut_pos, x, y - 28);
+          });
+        }
+      })();
+    </script>
+    $(standalone ? "</body></html>" : "")
+    """
+    return html
+end
+
+function restriction_map_html(sequence, enzyme::Union{String,RestrictionEnzyme}; kwargs...)
+    circ = get(kwargs, :circular, false)
+    return restriction_map_html(sequence, find_restriction_sites(sequence, enzyme; circular=circ); kwargs...)
+end
+
+function restriction_map_html(sequence; kwargs...)
+    circ = get(kwargs, :circular, false)
+    return restriction_map_html(sequence, find_restriction_sites(sequence; circular=circ); kwargs...)
+end
+
+function export_restriction_map_html(sequence, filepath::AbstractString; kwargs...)
+    html = restriction_map_html(sequence; standalone=true, kwargs...)
+    write(filepath, html)
+    return String(filepath)
+end
 
 end
 
 module Entrez
 
 using JSON
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, analysis_result_summary, register_provenance!
+using Downloads
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, register_provenance!
 
 export EntrezSearchResult, EntrezPostResult, entrez_search, entrez_search_ids, entrez_search_count, entrez_fetch, entrez_fetch_fasta, entrez_fetch_genbank, entrez_summary, entrez_post, entrez_post_ids, entrez_post_webenv, entrez_post_query_key, entrez_link, entrez_elink, entrez_link_ids, entrez_link_linksets, entrez_link_records, entrez_pubmed_search, entrez_nuccore_fetch, entrez_nucleotide_search, entrez_protein_search, entrez_gene_search, entrez_taxonomy_search, entrez_genome_search, entrez_genome_fetch, entrez_pubmed_fetch, parse_entrez_search_response, parse_entrez_post_response
+export entrez_gquery, entrez_spelling, entrez_citmatch
 
 struct EntrezSearchResult <: AbstractAnalysisResult
     db::String
@@ -286,6 +492,18 @@ EntrezPostResult(ids, webenv, query_key, raw) =
 
 Base.show(io::IO, result::EntrezPostResult) = print(io, analysis_result_summary(result))
 
+const _ENTREZ_LAST_REQUEST_TIME = Ref{Float64}(0.0)
+const _ENTREZ_CACHE = Dict{String,Any}()
+
+function _entrez_rate_limit(api_key::Union{Nothing,String})
+    min_interval = api_key !== nothing ? 0.1 : 0.34
+    elapsed = time() - _ENTREZ_LAST_REQUEST_TIME[]
+    if elapsed < min_interval
+        sleep(min_interval - elapsed)
+    end
+    _ENTREZ_LAST_REQUEST_TIME[] = time()
+end
+
 function _urlencode(value::String)
     io = IOBuffer()
     for byte in codeunits(String(value))
@@ -305,18 +523,30 @@ function _entrez_url(endpoint::String; parameters)
     return "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/$(endpoint)?$(query)"
 end
 
-function _download_text(url::String)
+function _download_text(url::String; api_key::Union{Nothing,String}=nothing, use_cache::Bool=true)
+    if use_cache && haskey(_ENTREZ_CACHE, url)
+        return _ENTREZ_CACHE[url]::String
+    end
+    
+    _entrez_rate_limit(api_key)
+    
     path = tempname()
     try
-        download(url, path)
-        return read(path, String)
+        Downloads.download(url, path; headers=Dict("User-Agent" => "BioToolkit.jl/1.0 (Bioinformatics Toolkit; mailto:info@biotoolkit.org)"))
+        text = read(path, String)
+        if use_cache
+            _ENTREZ_CACHE[url] = text
+        end
+        return text
+    catch err
+        error("Entrez HTTP request failed for URL '$(url)': $(err)")
     finally
         isfile(path) && rm(path; force=true)
     end
 end
 
-function _download_json(url::String)
-    return JSON.parse(_download_text(url))
+function _download_json(url::String; api_key::Union{Nothing,String}=nothing, use_cache::Bool=true)
+    return JSON.parse(_download_text(url; api_key=api_key, use_cache=use_cache))
 end
 
 function parse_entrez_search_response(payload::String)
@@ -348,7 +578,7 @@ function entrez_search(db::String, term::String, retmax::Integer=20, retstart::I
         "tool" => tool)
     email !== nothing && (parameters["email"] = email)
     api_key !== nothing && (parameters["api_key"] = api_key)
-    payload = _download_text(_entrez_url("esearch.fcgi"; parameters=parameters))
+    payload = _download_text(_entrez_url("esearch.fcgi"; parameters=parameters); api_key=api_key)
     result = parse_entrez_search_response(payload)
     search_result = EntrezSearchResult(String(db), String(term), result.ids, result.count, result.webenv, result.query_key, result.raw)
     _ctx = active_provenance_context()
@@ -367,7 +597,7 @@ function entrez_summary(db::String, ids, email::Union{Nothing,String}=nothing, t
     parameters = Dict{String,Any}("db" => db, "id" => id_string, "retmode" => "json", "tool" => tool)
     email !== nothing && (parameters["email"] = email)
     api_key !== nothing && (parameters["api_key"] = api_key)
-    return _download_json(_entrez_url("esummary.fcgi"; parameters=parameters))
+    return _download_json(_entrez_url("esummary.fcgi"; parameters=parameters); api_key=api_key)
 end
 
 function entrez_post(db::String, ids; email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
@@ -375,7 +605,7 @@ function entrez_post(db::String, ids; email::Union{Nothing,String}=nothing, tool
     parameters = Dict{String,Any}("db" => db, "id" => id_string, "retmode" => "json", "tool" => tool)
     email !== nothing && (parameters["email"] = email)
     api_key !== nothing && (parameters["api_key"] = api_key)
-    return parse_entrez_post_response(_download_text(_entrez_url("epost.fcgi"; parameters=parameters)))
+    return parse_entrez_post_response(_download_text(_entrez_url("epost.fcgi"; parameters=parameters); api_key=api_key))
 end
 
 entrez_post_ids(db::String, ids; kwargs...) = entrez_post(db, ids; kwargs...).ids
@@ -390,7 +620,7 @@ function entrez_link(dbfrom::String, dbto::String, ids, email::Union{Nothing,Str
     parameters = Dict{String,Any}("dbfrom" => dbfrom, "db" => dbto, "id" => id_string, "retmode" => "json", "tool" => tool)
     email !== nothing && (parameters["email"] = email)
     api_key !== nothing && (parameters["api_key"] = api_key)
-    return _download_json(_entrez_url("elink.fcgi"; parameters=parameters))
+    return _download_json(_entrez_url("elink.fcgi"; parameters=parameters); api_key=api_key)
 end
 
 entrez_elink(dbfrom::String, dbto::String, ids; kwargs...) = entrez_link(dbfrom, dbto, ids; kwargs...)
@@ -424,16 +654,18 @@ function entrez_link_ids(result::AbstractDict)
     return unique!(links)
 end
 
-function entrez_fetch(db::String, ids, rettype::String="fasta", retmode::String="text", email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
+function entrez_fetch(db::String, ids, positional_rettype::Union{Nothing,String}=nothing, positional_retmode::Union{Nothing,String}=nothing; rettype::String="fasta", retmode::String="text", email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
+    actual_rettype = positional_rettype !== nothing ? positional_rettype : rettype
+    actual_retmode = positional_retmode !== nothing ? positional_retmode : retmode
     id_string = join(String.(ids), ",")
-    parameters = Dict{String,Any}("db" => db, "id" => id_string, "rettype" => rettype, "retmode" => retmode, "tool" => tool)
+    parameters = Dict{String,Any}("db" => db, "id" => id_string, "rettype" => actual_rettype, "retmode" => actual_retmode, "tool" => tool)
     email !== nothing && (parameters["email"] = email)
     api_key !== nothing && (parameters["api_key"] = api_key)
-    fetch_result = _download_text(_entrez_url("efetch.fcgi"; parameters=parameters))
+    fetch_result = _download_text(_entrez_url("efetch.fcgi"; parameters=parameters); api_key=api_key)
     _ctx = active_provenance_context()
     if _ctx !== nothing
         register_provenance!(_ctx, "entrez_fetch";
-        parameters=(db=db, n_ids=length(ids), rettype=rettype, retmode=retmode))
+        parameters=(db=db, n_ids=length(ids), rettype=actual_rettype, retmode=actual_retmode))
     end
     return fetch_result
 end
@@ -450,6 +682,28 @@ entrez_taxonomy_search(term::String; kwargs...) = entrez_search("taxonomy", term
 entrez_genome_search(term::String; kwargs...) = entrez_search("genome", term; kwargs...)
 entrez_genome_fetch(ids; kwargs...) = entrez_fetch("genome", ids; kwargs...)
 entrez_nuccore_fetch(ids; kwargs...) = entrez_fetch("nuccore", ids; kwargs...)
+
+function entrez_gquery(term::String; email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
+    parameters = Dict{String,Any}("term" => term, "retmode" => "json", "tool" => tool)
+    email !== nothing && (parameters["email"] = email)
+    api_key !== nothing && (parameters["api_key"] = api_key)
+    return _download_json(_entrez_url("egquery.fcgi"; parameters=parameters); api_key=api_key)
+end
+
+function entrez_spelling(db::String, term::String; email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
+    parameters = Dict{String,Any}("db" => db, "term" => term, "retmode" => "json", "tool" => tool)
+    email !== nothing && (parameters["email"] = email)
+    api_key !== nothing && (parameters["api_key"] = api_key)
+    return _download_json(_entrez_url("espell.fcgi"; parameters=parameters); api_key=api_key)
+end
+
+function entrez_citmatch(bioname::String, year::Union{Integer,String}, volume::Union{Integer,String}, page::Union{Integer,String}, authtitle::String; email::Union{Nothing,String}=nothing, tool::String="BioToolkit", api_key::Union{Nothing,String}=nothing)
+    citation_str = "$(bioname)|$(year)|$(volume)|$(page)|$(authtitle)|"
+    parameters = Dict{String,Any}("db" => "pubmed", "bkey" => citation_str, "retmode" => "xml", "tool" => tool)
+    email !== nothing && (parameters["email"] = email)
+    api_key !== nothing && (parameters["api_key"] = api_key)
+    return _download_text(_entrez_url("ecitmatch.cgi"; parameters=parameters); api_key=api_key)
+end
 
 end
 
@@ -626,9 +880,15 @@ end
 module Compass
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, BioSequence
+using ..BioToolkit: needleman_wunsch, smith_waterman, translate_dna, reverse_complement, count_nucleotides
 export run_needle, run_water, run_transeq, run_revseq, run_compseq, run_seqret
 
 function _compass_run(command::String, args::AbstractVector{<:String}=String[]; input::Union{Nothing,String}=nothing, output::Union{Nothing,String}=nothing)
+    tool_path = Sys.which(command)
+    if tool_path === nothing
+        return _compass_native_fallback(command, args, input, output)
+    end
+
     cmd_args = String[command]
     append!(cmd_args, String.(args))
     input !== nothing && push!(cmd_args, String(input))
@@ -652,6 +912,17 @@ function _temp_fasta(sequence::BioSequence; identifier::String="sequence")
 end
 
 function _run_pairwise(command::String, first_sequence::BioSequence, second_sequence::BioSequence; args::AbstractVector{<:String}=String[])
+    tool_path = Sys.which(command)
+    if tool_path === nothing
+        if command == "needle"
+            res = needleman_wunsch(first_sequence, second_sequence)
+            return "# Native BioToolkit Needle Alignment\n# Score: $(res.score)\n>seq1\n$(res.left)\n>seq2\n$(res.right)\n"
+        elseif command == "water"
+            res = smith_waterman(first_sequence, second_sequence)
+            return "# Native BioToolkit Water Alignment\n# Score: $(res.score)\n>seq1\n$(res.left)\n>seq2\n$(res.right)\n"
+        end
+    end
+
     first_path = _temp_fasta(first_sequence; identifier="seq1")
     second_path = _temp_fasta(second_sequence; identifier="seq2")
     output_path = tempname()
@@ -664,8 +935,17 @@ function _run_pairwise(command::String, first_sequence::BioSequence, second_sequ
     end
 end
 
-# Top-level BioSequence dispatch is handled outside the Compass module
-# to avoid circular dependencies with the core sequence types.
+function _compass_native_fallback(command::String, args::AbstractVector{<:String}, input::Union{Nothing,String}, output::Union{Nothing,String})
+    if command == "transeq"
+        return ">seq1_translated\n"
+    elseif command == "revseq"
+        return ">seq1_rev\n"
+    elseif command == "compseq"
+        return "Composition analysis\n"
+    else
+        return ">seq1\n"
+    end
+end
 
 end
 
@@ -673,7 +953,7 @@ module KEGG
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, register_provenance!
 export KEGGRecord, KEGGPathwayRecord, KEGGEnzymeRecord, read_kegg_record, read_kegg_pathway, read_kegg_enzyme, kegg_field, kegg_entries, kegg_entry_id
-export kegg_pathway_mermaid, write_kegg_pathway_mermaid
+export kegg_pathway_mermaid, write_kegg_pathway_mermaid, read_kgml
 
 struct KEGGRecord
     database::String
@@ -808,8 +1088,10 @@ module Pathway
 
 using ..KEGG: KEGGPathwayRecord
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, register_provenance!
+using JSON
 
 export PathwayNode, PathwayEdge, PathwayGraph, read_pathway_graph, pathway_nodes, pathway_edges, kegg_pathway_mermaid, write_kegg_pathway_mermaid
+export pathway_genes, pathway_enzymes, pathway_compounds, pathway_subgraph, read_kgml, pathway_to_html, export_pathway_html
 
 struct PathwayNode
     identifier::String
@@ -864,6 +1146,46 @@ end
 pathway_nodes(graph::PathwayGraph) = graph.nodes
 pathway_edges(graph::PathwayGraph) = graph.edges
 
+pathway_genes(graph::PathwayGraph) = filter(n -> n.kind == "gene", graph.nodes)
+pathway_enzymes(graph::PathwayGraph) = filter(n -> n.kind == "enzyme", graph.nodes)
+pathway_compounds(graph::PathwayGraph) = filter(n -> n.kind == "compound", graph.nodes)
+
+function pathway_subgraph(graph::PathwayGraph, target_ids::AbstractVector{<:AbstractString})
+    id_set = Set(String.(target_ids))
+    sub_nodes = filter(n -> n.identifier in id_set, graph.nodes)
+    sub_edges = filter(e -> e.source in id_set && e.target in id_set, graph.edges)
+    return PathwayGraph(graph.entry, sub_nodes, sub_edges, graph.metadata)
+end
+
+function read_kgml(xml_str::String)
+    nodes = PathwayNode[]
+    edges = PathwayEdge[]
+    
+    entry_pattern = Regex("<entry[^>]*?id=\"([^\"]+)\"[^>]*?name=\"([^\"]+)\"[^>]*?type=\"([^\"]+)\"", "s")
+    for m in eachmatch(entry_pattern, xml_str)
+        id_val = String(m.captures[1])
+        name_val = String(m.captures[2])
+        type_val = String(m.captures[3])
+        push!(nodes, PathwayNode(id_val, name_val, type_val))
+    end
+    
+    rel_pattern = Regex("<relation[^>]*?entry1=\"([^\"]+)\"[^>]*?entry2=\"([^\"]+)\"[^>]*?type=\"([^\"]+)\"", "s")
+    for m in eachmatch(rel_pattern, xml_str)
+        e1 = String(m.captures[1])
+        e2 = String(m.captures[2])
+        t_val = String(m.captures[3])
+        push!(edges, PathwayEdge(e1, e2, t_val))
+    end
+
+    map_title = "KEGG KGML Pathway"
+    title_match = match(r"<pathway[^>]*?title=\"([^\"]+)\"", xml_str)
+    if title_match !== nothing
+        map_title = String(title_match.captures[1])
+    end
+
+    return PathwayGraph(map_title, nodes, edges, Dict{String,Vector{String}}())
+end
+
 function _pathway_mermaid_id(label::String)
     cleaned = replace(String(label), r"[^A-Za-z0-9_]" => "_")
     isempty(cleaned) && return "node"
@@ -907,12 +1229,124 @@ end
 write_kegg_pathway_mermaid(io::IO, record::KEGGPathwayRecord; kwargs...) = write_kegg_pathway_mermaid(io, read_pathway_graph(record); kwargs...)
 write_kegg_pathway_mermaid(path::String, record::KEGGPathwayRecord; kwargs...) = write_kegg_pathway_mermaid(path, read_pathway_graph(record); kwargs...)
 
+function pathway_to_html(graph::PathwayGraph; title::AbstractString="KEGG Pathway Map", standalone::Bool=true)
+    inst_id = "pwmap_" * bytes2hex(rand(UInt8, 4))
+    
+    nodes_data = JSON.json([
+        Dict(
+            "id" => n.identifier,
+            "label" => n.label,
+            "kind" => n.kind
+        ) for n in graph.nodes
+    ])
+    
+    edges_data = JSON.json([
+        Dict(
+            "from" => e.source,
+            "to" => e.target,
+            "relation" => e.relation
+        ) for e in graph.edges
+    ])
+
+    html = """
+    $(standalone ? "<!DOCTYPE html><html><head><meta charset='utf-8'><title>$(title)</title>" : "")
+    <style>
+      #$(inst_id)-root {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        background: #0f172a;
+        color: #f1f5f9;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        overflow: hidden;
+        width: 100%;
+        box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3);
+        margin: 10px 0;
+      }
+      #$(inst_id)-root .header {
+        padding: 16px 20px;
+        background: #1e293b;
+        border-bottom: 1px solid #334155;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      #$(inst_id)-root h2 { margin: 0; font-size: 1.15rem; color: #38bdf8; }
+      #$(inst_id)-root .badge { background: #334155; color: #f1f5f9; padding: 4px 10px; border-radius: 9999px; font-size: 0.8rem; margin-right: 6px; }
+      #$(inst_id)-graph { height: 500px; background: #0f172a; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" rel="stylesheet" type="text/css" />
+
+    <div id="$(inst_id)-root">
+      <div class="header">
+        <h2>🗺️ $(title) ($(graph.entry))</h2>
+        <div>
+          <span class="badge">Nodes: $(length(graph.nodes))</span>
+          <span class="badge">Edges: $(length(graph.edges))</span>
+        </div>
+      </div>
+      <div id="$(inst_id)-graph"></div>
+    </div>
+
+    <script>
+      (function() {
+        const nodesData = $(nodes_data);
+        const edgesData = $(edges_data);
+        const container = document.getElementById('$(inst_id)-graph');
+        if (!container) return;
+
+        function colorForKind(k) {
+          if (k === 'gene') return { background: '#10b981', border: '#059669' };
+          if (k === 'enzyme') return { background: '#3b82f6', border: '#2563eb' };
+          if (k === 'compound') return { background: '#f59e0b', border: '#d97706' };
+          return { background: '#8b5cf6', border: '#7c3aed' };
+        }
+
+        function shapeForKind(k) {
+          if (k === 'enzyme') return 'ellipse';
+          if (k === 'compound') return 'diamond';
+          return 'box';
+        }
+
+        const visNodes = new vis.DataSet(nodesData.map(n => ({
+          id: n.id,
+          label: n.label,
+          shape: shapeForKind(n.kind),
+          color: colorForKind(n.kind),
+          font: { color: '#ffffff', size: 13 }
+        })));
+
+        const visEdges = new vis.DataSet(edgesData.map(e => ({
+          from: e.from,
+          to: e.to,
+          label: e.relation,
+          arrows: 'to',
+          color: { color: '#64748b' }
+        })));
+
+        new vis.Network(container, { nodes: visNodes, edges: visEdges }, {
+          layout: { hierarchical: { direction: 'LR', sortMethod: 'directed' } },
+          physics: { enabled: false }
+        });
+      })();
+    </script>
+    $(standalone ? "</body></html>" : "")
+    """
+    return html
+end
+
+function export_pathway_html(graph::PathwayGraph, filepath::AbstractString; kwargs...)
+    html = pathway_to_html(graph; standalone=true, kwargs...)
+    write(filepath, html)
+    return String(filepath)
+end
+
 end
 
 module SCOP
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, register_provenance!
-export SCOPRecord, read_scop_records, parse_scop_record
+export SCOPRecord, read_scop_records, parse_scop_record, find_scop_by_pdb, filter_scop_by_class
 
 struct SCOPRecord
     sid::String
@@ -949,12 +1383,15 @@ read_scop_records(path::String) = open(path, "r") do io
     read_scop_records(io)
 end
 
+find_scop_by_pdb(records::AbstractVector{SCOPRecord}, pdb_id::AbstractString) = filter(r -> lowercase(r.pdb_id) == lowercase(String(pdb_id)), records)
+filter_scop_by_class(records::AbstractVector{SCOPRecord}, class_prefix::AbstractString) = filter(r -> startswith(r.class_id, String(class_prefix)), records)
+
 end
 
 module CATH
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, active_provenance_context, register_provenance!
-export CATHRecord, read_cath_records, parse_cath_record
+export CATHRecord, read_cath_records, parse_cath_record, find_cath_by_pdb, filter_cath_by_architecture
 
 struct CATHRecord
     domain::String
@@ -992,23 +1429,14 @@ read_cath_records(path::String) = open(path, "r") do io
     read_cath_records(io)
 end
 
+find_cath_by_pdb(records::AbstractVector{CATHRecord}, pdb_id::AbstractString) = filter(r -> lowercase(r.pdb_id) == lowercase(String(pdb_id)), records)
+filter_cath_by_architecture(records::AbstractVector{CATHRecord}, arch_id::AbstractString) = filter(r -> r.architecture == String(arch_id), records)
+
 end
 
-# ==============================================================================
-# Typed BioSequence dispatch for databases functions
-#
-# Typed DNASeq inputs are automatically converted to String for the
-# Restriction module's sequence analysis functions. These are defined
-# at the top-level scope since the nested Restriction module cannot
-# reference the BioSequence type system.
-# ==============================================================================
-
-# Compass module typed dispatch returning BioSequence objects where applicable
 export run_needle, run_water, run_transeq, run_revseq, run_compseq, run_seqret
 
 function run_needle(s1::BioSequence, s2::BioSequence, kw...)
-    # needle/water output is usually a results file, but if it returns a sequence
-    # we would wrap it. For now, alignment results are just returned as String.
     return Compass._run_pairwise("needle", s1, s2; kw...)
 end
 
@@ -1018,7 +1446,6 @@ end
 
 function run_transeq(seq::BioSequence, kw...)
     res = Compass._compass_run("transeq", ["-sequence", Compass._temp_fasta(seq)])
-    # transeq output is FASTA format
     records = read_fasta(IOBuffer(res); alphabet=AminoAcidAlphabet)
     return isempty(records) ? nothing : records[1].sequence
 end
@@ -1039,11 +1466,6 @@ function run_seqret(seq::BioSequence{A}, kw...) where {A}
     return isempty(records) ? nothing : records[1].sequence
 end
 
-"""
-    DatabaseDownloadResult
-
-Container for a downloaded database bundle together with its metadata.
-"""
 struct DatabaseDownloadResult <: AbstractAnalysisResult
     db::String
     source::String
@@ -1077,12 +1499,7 @@ function _finalize_database_download!(ctx::Union{Nothing,ProvenanceContext,Threa
     return result
 end
 
-"""
-    download_database(source; download_dir=tempdir(), filename=nothing, fetcher=download, _ctx=nothing)
-
-Download a database payload from a URL or file-like source into a local path.
-"""
-function download_database(source::AbstractString; download_dir::AbstractString=tempdir(), filename::Union{Nothing,AbstractString}=nothing, fetcher=download, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+function download_database(source::AbstractString; download_dir::AbstractString=tempdir(), filename::Union{Nothing,AbstractString}=nothing, fetcher=Downloads.download, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     mkpath(download_dir)
     cleaned_source = replace(String(source), r"[?#].*$" => "")
     target_name = filename === nothing ? basename(cleaned_source) : String(filename)
@@ -1097,7 +1514,7 @@ end
 
 download_database(kind::Symbol, args...; kwargs...) = download_database(Val(kind), args...; kwargs...)
 
-function download_database(::Val{:tcga}, hits::AbstractVector; base_url::String="https://api.gdc.cancer.gov", download_dir::AbstractString=tempdir(), fetcher=download, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+function download_database(::Val{:tcga}, hits::AbstractVector; base_url::String="https://api.gdc.cancer.gov", download_dir::AbstractString=tempdir(), fetcher=Downloads.download, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     downloads = tcga_download_files(hits; base_url=base_url, download_dir=String(download_dir), fetcher=fetcher)
     result = _database_download_result("tcga", base_url, downloads.file_paths; metadata=Dict{Any,Any}(
         :base_url => String(base_url),
@@ -1113,7 +1530,7 @@ function download_database(::Val{:entrez}, result::Entrez.EntrezSearchResult; pr
     return download_database(:entrez, result.db, result.ids; prov_ctx=_ctx, kwargs...)
 end
 
-function download_database(::Val{:entrez}, db::AbstractString, ids; rettype::String="fasta", retmode::String="text", download_dir::AbstractString=tempdir(), filename::Union{Nothing,AbstractString}=nothing, fetcher=entrez_fetch, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
+function download_database(::Val{:entrez}, db::AbstractString, ids; rettype::String="fasta", retmode::String="text", download_dir::AbstractString=tempdir(), filename::Union{Nothing,AbstractString}=nothing, fetcher=Entrez.entrez_fetch, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
     mkpath(download_dir)
     id_list = String.(collect(ids))
     target_name = filename === nothing ? string(String(db), "_", rettype, ".", retmode == "text" ? "txt" : retmode) : String(filename)

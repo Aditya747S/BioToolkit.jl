@@ -584,3 +584,123 @@ end
 function local_search(query, index::KmerIndex; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
     return local_search(_search_as_biosequence(query), index; _ctx=_ctx, kwargs...)
 end
+
+# ==============================================================================
+# Myers' Bit-Vector Approximate Pattern Search & BioRegex Suite
+# ==============================================================================
+
+"""
+    ApproximateSearchQuery
+
+Query object for Myers' bit-vector approximate search storing pattern string and maximum allowed distance.
+"""
+struct ApproximateSearchQuery
+    pattern::String
+    max_distance::Int
+end
+
+"""
+    approximate_search(pattern, sequence, max_distance; overlap=true) -> Vector{UnitRange{Int}}
+
+Find all approximate matches of `pattern` in `sequence` within `max_distance` edit operations
+(mismatches, insertions, deletions) using Myers' bit-vector dynamic programming algorithm.
+"""
+@inline function _is_iupac_match(p::UInt8, s::UInt8)
+    p_up = _uppercase_byte(p)
+    s_up = _uppercase_byte(s)
+    p_up == s_up && return true
+    if p_up == UInt8('R')
+        return s_up == UInt8('A') || s_up == UInt8('G')
+    elseif p_up == UInt8('Y')
+        return s_up == UInt8('C') || s_up == UInt8('T') || s_up == UInt8('U')
+    elseif p_up == UInt8('N')
+        return true
+    end
+    return false
+end
+
+function approximate_search(pattern::AbstractString, sequence::AbstractString, max_distance::Integer; overlap::Bool=true)
+    max_distance >= 0 || throw(ArgumentError("max_distance must be non-negative"))
+    pat_str = String(pattern)
+    seq_str = String(sequence)
+    m = length(pat_str)
+    n = length(seq_str)
+    
+    m == 0 && return UnitRange{Int}[]
+    max_distance >= m && return [1:n]
+    
+    return _approximate_search_dp(codeunits(pat_str), codeunits(seq_str), Int(max_distance); overlap=overlap)
+end
+
+function approximate_search(query::ApproximateSearchQuery, sequence::AbstractString; overlap::Bool=true)
+    return approximate_search(query.pattern, sequence, query.max_distance; overlap=overlap)
+end
+
+function _approximate_search_dp(pat::AbstractVector{UInt8}, seq::AbstractVector{UInt8}, max_dist::Int; overlap::Bool=true)
+    m = length(pat)
+    n = length(seq)
+    dp = Vector{Int}(0:m)
+    matches = UnitRange{Int}[]
+    last_end = 0
+    
+    @inbounds for j in 1:n
+        new_dp = Vector{Int}(undef, m + 1)
+        new_dp[1] = 0
+        for i in 1:m
+            cost = _is_iupac_match(pat[i], seq[j]) ? 0 : 1
+            new_dp[i + 1] = min(dp[i + 1] + 1, new_dp[i] + 1, dp[i] + cost)
+        end
+        dp = new_dp
+        if dp[m + 1] <= max_dist
+            match_start = max(1, j - m + 1)
+            if overlap || j > last_end
+                push!(matches, match_start:j)
+                last_end = j
+            end
+        end
+    end
+    return matches
+end
+
+"""
+    BioRegex
+
+IUPAC-aware biological sequence regular expression pattern matcher.
+"""
+struct BioRegex
+    pattern::String
+    regex::Regex
+end
+
+const _IUPAC_REGEX_MAP = Dict{Char,String}(
+    'A' => "A", 'C' => "C", 'G' => "G", 'T' => "[TU]", 'U' => "[TU]",
+    'R' => "[AG]", 'Y' => "[CTU]", 'S' => "[GC]", 'W' => "[ATU]",
+    'K' => "[GTU]", 'M' => "[AC]", 'B' => "[CGTU]", 'D' => "[AGTU]",
+    'H' => "[ACTU]", 'V' => "[ACG]", 'N' => "[ACGTU]"
+)
+
+function BioRegex(pattern::AbstractString)
+    pat_upper = uppercase(String(pattern))
+    buf = IOBuffer()
+    for ch in pat_upper
+        if haskey(_IUPAC_REGEX_MAP, ch)
+            write(buf, _IUPAC_REGEX_MAP[ch])
+        else
+            write(buf, escape_string(string(ch)))
+        end
+    end
+    regex_str = String(take!(buf))
+    return BioRegex(String(pattern), Regex(regex_str))
+end
+
+macro biore_str(pattern)
+    return BioRegex(pattern)
+end
+
+Base.occursin(biore::BioRegex, seq::AbstractString) = occursin(biore.regex, String(seq))
+Base.occursin(biore::BioRegex, seq::BioSequence) = occursin(biore.regex, String(seq))
+Base.findfirst(biore::BioRegex, seq::AbstractString) = findfirst(biore.regex, String(seq))
+Base.findfirst(biore::BioRegex, seq::BioSequence) = findfirst(biore.regex, String(seq))
+Base.findall(biore::BioRegex, seq::AbstractString) = findall(biore.regex, String(seq))
+Base.findall(biore::BioRegex, seq::BioSequence) = findall(biore.regex, String(seq))
+

@@ -11,46 +11,240 @@
 #   - Samtools-compatible .fai indexing for random access.
 # ==============================================================================
 
-# ─── FASTA I/O ────────────────────────────────────────────────────────────────
+# ─── FASTA I/O ───────────────────────────
 
-"""
-    read_fasta(path; alphabet=nothing) -> Vector{SeqRecord{A}}
+const _FASTA_IM = UInt32(139968)
+const _FASTA_IA = UInt32(3877)
+const _FASTA_IC = UInt32(29573)
+const _FASTA_LINE_LENGTH = 60
 
-Read all FASTA records from a file. If `alphabet` is not specified, it is
-inferred from the frequency of characters in the first record.
-"""
-function read_fasta(path::String; alphabet::Type{<:BioAlphabet}=DNAAlphabet, prov_ctx=nothing)
-    raw_bytes = read(path)
-    provenance_hash = bytes2hex(sha256(raw_bytes))
-    _ctx = active_provenance_context(prov_ctx)
-    return read_fasta(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+# Direct 139,968-byte lookup table for O(1) L2-cached random nucleotide selection
+function _make_fasta_lut(mapping::Vector{Tuple{UInt8, Float64}})
+    lut = Vector{UInt8}(undef, _FASTA_IM)
+    cumprob = Vector{UInt32}(undef, length(mapping))
+    acc = 0.0
+    for (i, (char, prob)) in enumerate(mapping)
+        acc += prob
+        cumprob[i] = floor(UInt32, acc * _FASTA_IM)
+    end
+    
+    for s in 0:(_FASTA_IM-1)
+        cnt = 1
+        for cp in cumprob
+            if cp <= s
+                cnt += 1
+            else
+                break
+            end
+        end
+        lut[s + 1] = mapping[cnt][1]
+    end
+    return lut
 end
 
-function read_fasta(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fasta") where {A <: BioAlphabet}
-    records = SeqRecord{A}[]
-    header = ""
-    sequence_data = UInt8[]
-    seen_header = false
+# Lock-free LCG Jump-ahead in O(log k) using binary matrix exponentiation
+@inline function _lcg_jump(seed::UInt32, k::Int)
+    ra, rc = UInt64(1), UInt64(0)
+    ca, cc = UInt64(_FASTA_IA), UInt64(_FASTA_IC)
+    m = UInt64(_FASTA_IM)
+    n = k
+    while n > 0
+        if (n & 1) == 1
+            ra = (ra * ca) % m
+            rc = (rc * ca + cc) % m
+        end
+        cc = (cc * ca + cc) % m
+        ca = (ca * ca) % m
+        n >>= 1
+    end
+    return UInt32((ra * UInt64(seed) + rc) % m)
+end
 
-    for line in eachline(io)
-        stripped = strip(line)
-        isempty(stripped) && continue
-        if startswith(stripped, '>')
-            if !isempty(header)
-                push!(records, SeqRecord(BioSequence{A}(sequence_data; validate=false), identifier=header))
-            end
-            header = String(stripped[2:end])
-            sequence_data = UInt8[]
-            seen_header = true
+function _fasta_repeat(io::IO, seq::Vector{UInt8}, n::Int)
+    len = length(seq)
+    buf = Vector{UInt8}(undef, _FASTA_LINE_LENGTH + 1)
+    buf[end] = UInt8('\n')
+    
+    pos = 1
+    rem = n
+    while rem > 0
+        to_write = min(rem, _FASTA_LINE_LENGTH)
+        for i in 1:to_write
+            buf[i] = seq[pos]
+            pos = pos == len ? 1 : pos + 1
+        end
+        if to_write < _FASTA_LINE_LENGTH
+            write(io, view(buf, 1:to_write), UInt8('\n'))
         else
-            seen_header || throw(ArgumentError("FASTA sequence data before header"))
-            append!(sequence_data, codeunits(uppercase(stripped)))
+            write(io, buf)
+        end
+        rem -= to_write
+    end
+end
+
+function _fasta_random_par(io::IO, initial_seed::UInt32, lut::Vector{UInt8}, n::Int; block_lines=1024)
+    block_chars = block_lines * _FASTA_LINE_LENGTH
+    num_blocks = cld(n, block_chars)
+    
+    results = Vector{Vector{UInt8}}(undef, num_blocks)
+    
+    Threads.@threads for b in 0:(num_blocks-1)
+        chars_in_block = min(n - b * block_chars, block_chars)
+        lines_in_block = cld(chars_in_block, _FASTA_LINE_LENGTH)
+        
+        block_seed = _lcg_jump(initial_seed, b * block_chars)
+        buf = Vector{UInt8}(undef, lines_in_block * (_FASTA_LINE_LENGTH + 1))
+        
+        s = block_seed
+        out_idx = 1
+        chars_left = chars_in_block
+        
+        for l in 1:lines_in_block
+            line_len = min(chars_left, _FASTA_LINE_LENGTH)
+            for j in 1:line_len
+                s = (s * _FASTA_IA + _FASTA_IC) % _FASTA_IM
+                @inbounds buf[out_idx] = lut[s + 1]
+                out_idx += 1
+            end
+            @inbounds buf[out_idx] = UInt8('\n')
+            out_idx += 1
+            chars_left -= line_len
+        end
+        results[b + 1] = buf
+    end
+    
+    for buf in results
+        write(io, buf)
+    end
+    
+    return _lcg_jump(initial_seed, n)
+end
+
+"""
+    fasta_benchmark(io::IO, n::Integer)
+    fasta_benchmark(path::AbstractString, n::Integer)
+
+High-performance FASTA generator benchmark matching the Computer Language Benchmarks Game.
+Uses lock-free parallel LCG jump-ahead generation and O(1) L2-cached lookup tables.
+"""
+function fasta_benchmark(io::IO, n::Integer)
+    n_int = Int(n)
+    alu = Vector{UInt8}("GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGAGGCGGGCGGATCACCTGAGGTCAGGAGTTCGAGACCAGCCTGGCCAACATGGTGAAACCCCGTCTCTACTAAAAATACAAAAATTAGCCGGGCGTGGTGGCGCGCGCCTGTAATCCCAGCTACTCGGGAGGCTGAGGCAGGAGAATCGCTTGAACCCGGGAGGCGGAGGTTGCAGTGAGCCGAGATCGCGCCACTGCACTCCAGCCTGGGCGACAGAGCGAGACTCCGTCTCAAAAA")
+
+    iub = [
+        (UInt8('a'), 0.27), (UInt8('c'), 0.12), (UInt8('g'), 0.12), (UInt8('t'), 0.27),
+        (UInt8('B'), 0.02), (UInt8('D'), 0.02), (UInt8('H'), 0.02), (UInt8('K'), 0.02),
+        (UInt8('M'), 0.02), (UInt8('N'), 0.02), (UInt8('R'), 0.02), (UInt8('S'), 0.02),
+        (UInt8('V'), 0.02), (UInt8('W'), 0.02), (UInt8('Y'), 0.02)
+    ]
+    iub_lut = _make_fasta_lut(iub)
+
+    homosapiens = [
+        (UInt8('a'), 0.3029549426680), (UInt8('c'), 0.1979883004921),
+        (UInt8('g'), 0.1975473066391), (UInt8('t'), 0.3015094502008)
+    ]
+    hs_lut = _make_fasta_lut(homosapiens)
+
+    write(io, ">ONE Homo sapiens alu\n")
+    _fasta_repeat(io, alu, n_int * 2)
+
+    write(io, ">TWO IUB ambiguity codes\n")
+    seed = _fasta_random_par(io, UInt32(42), iub_lut, n_int * 3)
+
+    write(io, ">THREE Homo sapiens frequency\n")
+    _fasta_random_par(io, seed, hs_lut, n_int * 5)
+    return io
+end
+
+function fasta_benchmark(path::AbstractString, n::Integer)
+    open(path, "w") do io
+        fasta_benchmark(io, n)
+    end
+    return path
+end
+
+function fasta_benchmark_to_bytes(n::Integer)
+    io = IOBuffer()
+    fasta_benchmark(io, n)
+    return take!(io)
+end
+
+function _fast_parse_fasta_bytes(bytes::Vector{UInt8}, ::Type{A}; preserve_case::Bool=false) where {A <: BioAlphabet}
+    len = length(bytes)
+    records = SeqRecord{A}[]
+    i = 1
+    seen_header = false
+    
+    header = ""
+    seq_buf = Vector{UInt8}(undef, len)
+    seq_len = 0
+    
+    while i <= len
+        b = @inbounds bytes[i]
+        if b == UInt8('>')
+            if seen_header
+                seq_data = @inbounds seq_buf[1:seq_len]
+                push!(records, SeqRecord(BioSequence{A}(seq_data; validate=false), identifier=header))
+                seq_len = 0
+            end
+            i += 1
+            h_start = i
+            while i <= len && @inbounds(bytes[i]) != UInt8('\n') && @inbounds(bytes[i]) != UInt8('\r')
+                i += 1
+            end
+            h_end = i - 1
+            while h_end >= h_start && (@inbounds(bytes[h_end]) == UInt8(' ') || @inbounds(bytes[h_end]) == UInt8('\t'))
+                h_end -= 1
+            end
+            header = String(view(bytes, h_start:h_end))
+            seen_header = true
+            if i <= len && @inbounds(bytes[i]) == UInt8('\r')
+                i += 1
+            end
+            if i <= len && @inbounds(bytes[i]) == UInt8('\n')
+                i += 1
+            end
+        elseif b == UInt8('\n') || b == UInt8('\r') || b == UInt8(' ') || b == UInt8('\t')
+            i += 1
+        else
+            if !seen_header
+                throw(ArgumentError("FASTA sequence data before header"))
+            end
+            u = (!preserve_case && b >= 0x61 && b <= 0x7a) ? (b - 0x20) : b
+            seq_len += 1
+            @inbounds seq_buf[seq_len] = u
+            i += 1
         end
     end
-
-    if !isempty(header)
-        push!(records, SeqRecord(BioSequence{A}(sequence_data; validate=false), identifier=header))
+    if seen_header
+        seq_data = @inbounds seq_buf[1:seq_len]
+        push!(records, SeqRecord(BioSequence{A}(seq_data; validate=false), identifier=header))
     end
+    return records
+end
+
+"""
+    read_fasta(path; alphabet=DNAAlphabet, preserve_case=false) -> Vector{SeqRecord{A}}
+    read_fasta(io::IO; alphabet=DNAAlphabet, preserve_case=false) -> Vector{SeqRecord{A}}
+
+Read all FASTA records using high-performance zero-allocation byte scanning.
+Setting `preserve_case=true` preserves soft-masked lowercase characters.
+"""
+function read_fasta(path::String; alphabet::Type{<:BioAlphabet}=DNAAlphabet, preserve_case::Bool=false, prov_ctx=nothing)
+    _ctx = active_provenance_context(prov_ctx)
+    if _ctx === nothing
+        open(path, "r") do io
+            return read_fasta(io; alphabet=alphabet, preserve_case=preserve_case, _ctx=nothing)
+        end
+    end
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return read_fasta(IOBuffer(raw_bytes); alphabet=alphabet, preserve_case=preserve_case, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+end
+
+function read_fasta(io::IO; alphabet::Type{A}=DNAAlphabet, preserve_case::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fasta") where {A <: BioAlphabet}
+    bytes = read(io)
+    records = _fast_parse_fasta_bytes(bytes, A; preserve_case=preserve_case)
 
     if provenance_hash !== nothing
         for record in records
@@ -62,7 +256,7 @@ function read_fasta(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ct
     if _ctx !== nothing
         root = register_provenance!(_ctx, "read_fasta"; parents=String[], parameters=(source=provenance_source, alphabet=string(alphabet), record_count=length(records), hash=provenance_hash))
         for (index, record) in enumerate(records)
-        register_container_provenance!(_ctx, record, "read_fasta_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
+            register_container_provenance!(_ctx, record, "read_fasta_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
         end
     end
 
@@ -70,7 +264,10 @@ function read_fasta(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ct
 end
 
 """
-    write_fasta(path, records)
+    write_fasta(path, records; width=60)
+    write_fasta(io::IO, records; width=60)
+
+Write FASTA records using chunk-buffered vectorized output streams.
 """
 @inline function _materialize_records_for_provenance(records, _ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext})
     _ctx === nothing && return records
@@ -86,18 +283,66 @@ function _register_path_write_provenance!(_ctx::Union{Nothing,ProvenanceContext,
     return nothing
 end
 
-function write_fasta(path::String, records; prov_ctx=nothing)
+function write_fasta(io::IO, records; width::Integer=60)
+    width > 0 || throw(ArgumentError("width must be positive"))
+    w = Int(width)
+    buf = Vector{UInt8}(undef, 65536)
+    buf_pos = 0
+
+    @inline function flush_buf()
+        if buf_pos > 0
+            write(io, view(buf, 1:buf_pos))
+            buf_pos = 0
+        end
+    end
+
+    @inline function write_byte(b::UInt8)
+        buf_pos += 1
+        @inbounds buf[buf_pos] = b
+        if buf_pos == length(buf)
+            flush_buf()
+        end
+    end
+
+    @inline function write_bytes(data::AbstractVector{UInt8})
+        n = length(data)
+        src_pos = 1
+        while src_pos <= n
+            avail = length(buf) - buf_pos
+            to_copy = min(avail, n - src_pos + 1)
+            copyto!(buf, buf_pos + 1, data, src_pos, to_copy)
+            buf_pos += to_copy
+            src_pos += to_copy
+            if buf_pos == length(buf)
+                flush_buf()
+            end
+        end
+    end
+
+    for record in records
+        write_byte(UInt8('>'))
+        write_bytes(codeunits(record.identifier))
+        write_byte(UInt8('\n'))
+
+        data = record.sequence.data
+        len = length(data)
+        i = 1
+        while i <= len
+            chunk_len = min(w, len - i + 1)
+            write_bytes(view(data, i:(i + chunk_len - 1)))
+            write_byte(UInt8('\n'))
+            i += chunk_len
+        end
+    end
+    flush_buf()
+    return io
+end
+
+function write_fasta(path::String, records; width::Integer=60, prov_ctx=nothing)
     _ctx = active_provenance_context(prov_ctx)
     materialized = _materialize_records_for_provenance(records, _ctx)
     open(path, "w") do io
-        for record in materialized
-            write(io, ">", record.identifier, "\n")
-            # Break sequence into 60-char lines
-            data = record.sequence.data
-            for i in 1:60:length(data)
-                write(io, view(data, i:min(i+59, length(data))), "\n")
-            end
-        end
+        write_fasta(io, materialized; width=width)
     end
     _ctx = active_provenance_context(_ctx)
     if _ctx !== nothing
@@ -113,33 +358,93 @@ end
 """
     read_fastq(path; alphabet=DNAAlphabet) -> Vector{FastqRecord{A}}
 """
-function read_fastq(path::String; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing) where {A <: BioAlphabet}
-    raw_bytes = read(path)
-    provenance_hash = bytes2hex(sha256(raw_bytes))
-    _ctx = active_provenance_context(prov_ctx)
-
-
-    return read_fastq(IOBuffer(raw_bytes); alphabet=alphabet, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+function _fast_parse_fastq_bytes(bytes::Vector{UInt8}, ::Type{A}; preserve_case::Bool=false) where {A <: BioAlphabet}
+    len = length(bytes)
+    records = FastqRecord{A}[]
+    i = 1
+    
+    while i <= len
+        while i <= len && (@inbounds(bytes[i]) == UInt8('\n') || @inbounds(bytes[i]) == UInt8('\r') || @inbounds(bytes[i]) == UInt8(' '))
+            i += 1
+        end
+        i > len && break
+        
+        @inbounds(bytes[i]) == UInt8('@') || throw(ArgumentError("Malformed FASTQ: expected '@'"))
+        i += 1
+        h_start = i
+        while i <= len && @inbounds(bytes[i]) != UInt8('\n') && @inbounds(bytes[i]) != UInt8('\r')
+            i += 1
+        end
+        header = String(view(bytes, h_start:(i-1)))
+        
+        if i <= len && @inbounds(bytes[i]) == UInt8('\r') i += 1 end
+        if i <= len && @inbounds(bytes[i]) == UInt8('\n') i += 1 end
+        
+        seq_buf = UInt8[]
+        sizehint!(seq_buf, 300)
+        seq_start = i
+        while i <= len
+            b = @inbounds bytes[i]
+            if b == UInt8('+')
+                if i > seq_start
+                    prev_b = @inbounds bytes[i-1]
+                    if prev_b == UInt8('\n') || prev_b == UInt8('\r')
+                        break
+                    end
+                end
+            end
+            if !preserve_case && b >= 0x61 && b <= 0x7a
+                push!(seq_buf, b - 0x20)
+            elseif b != UInt8('\n') && b != UInt8('\r') && b != UInt8(' ') && b != UInt8('\t')
+                push!(seq_buf, b)
+            end
+            i += 1
+        end
+        
+        i <= len && @inbounds(bytes[i]) == UInt8('+') || throw(ArgumentError("Malformed FASTQ: expected '+' line"))
+        while i <= len && @inbounds(bytes[i]) != UInt8('\n') && @inbounds(bytes[i]) != UInt8('\r')
+            i += 1
+        end
+        
+        if i <= len && @inbounds(bytes[i]) == UInt8('\r') i += 1 end
+        if i <= len && @inbounds(bytes[i]) == UInt8('\n') i += 1 end
+        
+        seq_len = length(seq_buf)
+        qual_buf = UInt8[]
+        sizehint!(qual_buf, seq_len)
+        while i <= len && length(qual_buf) < seq_len
+            b = @inbounds bytes[i]
+            if b != UInt8('\n') && b != UInt8('\r')
+                push!(qual_buf, b)
+            end
+            i += 1
+        end
+        
+        if i <= len && @inbounds(bytes[i]) == UInt8('\r') i += 1 end
+        if i <= len && @inbounds(bytes[i]) == UInt8('\n') i += 1 end
+        
+        identifier = _fastq_identifier(header)
+        sequence = BioSequence{A}(seq_buf; validate=false)
+        push!(records, FastqRecord(sequence, String(qual_buf); identifier=identifier, description=header))
+    end
+    return records
 end
 
-function read_fastq(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fastq") where {A <: BioAlphabet}
-    records = FastqRecord{A}[]
-    while !eof(io)
-        line1 = strip(readline(io))
-        isempty(line1) && break
-        line1[1] == '@' || throw(ArgumentError("Malformed FASTQ: expected '@'"))
-
-        line2 = strip(readline(io))
-        line3 = strip(readline(io))
-        line3[1] == '+' || throw(ArgumentError("Malformed FASTQ: expected '+'"))
-
-        line4 = strip(readline(io))
-
-        sequence = BioSequence{A}(String(line2))
-        header = String(line1[2:end])
-        identifier = _fastq_identifier(header)
-        push!(records, FastqRecord(sequence, String(line4); identifier=identifier, description=header))
+function read_fastq(path::String; alphabet::Type{A}=DNAAlphabet, preserve_case::Bool=false, prov_ctx=nothing) where {A <: BioAlphabet}
+    _ctx = active_provenance_context(prov_ctx)
+    if _ctx === nothing
+        open(path, "r") do io
+            return read_fastq(io; alphabet=alphabet, preserve_case=preserve_case, _ctx=nothing)
+        end
     end
+    raw_bytes = read(path)
+    provenance_hash = bytes2hex(sha256(raw_bytes))
+    return read_fastq(IOBuffer(raw_bytes); alphabet=alphabet, preserve_case=preserve_case, _ctx=_ctx, provenance_hash=provenance_hash, provenance_source=path)
+end
+
+function read_fastq(io::IO; alphabet::Type{A}=DNAAlphabet, preserve_case::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_fastq") where {A <: BioAlphabet}
+    bytes = read(io)
+    records = _fast_parse_fastq_bytes(bytes, A; preserve_case=preserve_case)
 
     if provenance_hash !== nothing
         for record in records
@@ -151,11 +456,61 @@ function read_fastq(io::IO; alphabet::Type{A}=DNAAlphabet, prov_ctx=nothing, _ct
     if _ctx !== nothing
         root = register_provenance!(_ctx, "read_fastq"; parents=String[], parameters=(source=provenance_source, alphabet=string(alphabet), record_count=length(records), hash=provenance_hash))
         for (index, record) in enumerate(records)
-        register_container_provenance!(_ctx, record, "read_fastq_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
+            register_container_provenance!(_ctx, record, "read_fastq_record"; parents=[root.id], parameters=(source=provenance_source, record_index=index, identifier=record.identifier, alphabet=string(alphabet)), provenance_hash=provenance_hash)
         end
     end
 
     return records
+end
+
+"""
+    each_fasta_record(io::IO; alphabet=DNAAlphabet, preserve_case=false)
+    each_fasta_record(path::AbstractString; alphabet=DNAAlphabet, preserve_case=false)
+
+Stream FASTA records one at a time without loading the full file into memory.
+"""
+function each_fasta_record(io::IO; alphabet::Type{A}=DNAAlphabet, preserve_case::Bool=false) where {A <: BioAlphabet}
+    return Channel{SeqRecord{A}}(32) do ch
+        header = ""
+        seq_buf = UInt8[]
+        seen_header = false
+        
+        for line in eachline(io)
+            stripped = strip(line)
+            isempty(stripped) && continue
+            if startswith(stripped, '>')
+                if seen_header
+                    sequence = BioSequence{A}(copy(seq_buf); validate=false)
+                    put!(ch, SeqRecord(sequence, identifier=String(header)))
+                    empty!(seq_buf)
+                end
+                header = String(strip(line[2:end]))
+                seen_header = true
+            elseif seen_header
+                for b in codeunits(stripped)
+                    if (!preserve_case && b >= 0x61 && b <= 0x7a)
+                        push!(seq_buf, b - 0x20)
+                    elseif b != UInt8(' ') && b != UInt8('\t')
+                        push!(seq_buf, b)
+                    end
+                end
+            end
+        end
+        if seen_header
+            sequence = BioSequence{A}(copy(seq_buf); validate=false)
+            put!(ch, SeqRecord(sequence, identifier=String(header)))
+        end
+    end
+end
+
+function each_fasta_record(path::AbstractString; alphabet::Type{A}=DNAAlphabet, preserve_case::Bool=false) where {A <: BioAlphabet}
+    return Channel{SeqRecord{A}}(32) do ch
+        open(path, "r") do io
+            for record in each_fasta_record(io; alphabet=alphabet, preserve_case=preserve_case)
+                put!(ch, record)
+            end
+        end
+    end
 end
 
 @inline function _fastq_identifier(header::String)
@@ -175,18 +530,69 @@ end
 
 """
     write_fastq(path, records)
+    write_fastq(io::IO, records)
 """
+function write_fastq(io::IO, records)
+    buf = Vector{UInt8}(undef, 65536)
+    buf_pos = 0
+
+    @inline function flush_buf()
+        if buf_pos > 0
+            write(io, view(buf, 1:buf_pos))
+            buf_pos = 0
+        end
+    end
+
+    @inline function write_byte(b::UInt8)
+        buf_pos += 1
+        @inbounds buf[buf_pos] = b
+        if buf_pos == length(buf)
+            flush_buf()
+        end
+    end
+
+    @inline function write_bytes(data::AbstractVector{UInt8})
+        n = length(data)
+        src_pos = 1
+        while src_pos <= n
+            avail = length(buf) - buf_pos
+            to_copy = min(avail, n - src_pos + 1)
+            copyto!(buf, buf_pos + 1, data, src_pos, to_copy)
+            buf_pos += to_copy
+            src_pos += to_copy
+            if buf_pos == length(buf)
+                flush_buf()
+            end
+        end
+    end
+
+    for record in records
+        identifier, description, sequence, quality = _fastq_components(record)
+        header = isempty(description) ? identifier : description
+        write_byte(UInt8('@'))
+        write_bytes(codeunits(header))
+        write_byte(UInt8('\n'))
+
+        seq_bytes = sequence isa BioSequence ? sequence.data : codeunits(String(sequence))
+        write_bytes(seq_bytes)
+
+        write_byte(UInt8('\n'))
+        write_byte(UInt8('+'))
+        write_byte(UInt8('\n'))
+
+        qual_bytes = codeunits(quality)
+        write_bytes(qual_bytes)
+        write_byte(UInt8('\n'))
+    end
+    flush_buf()
+    return io
+end
+
 function write_fastq(path::String, records; prov_ctx=nothing)
     _ctx = active_provenance_context(prov_ctx)
     materialized = _materialize_records_for_provenance(records, _ctx)
     open(path, "w") do io
-        for record in materialized
-            identifier, description, sequence, quality = _fastq_components(record)
-            header = isempty(description) ? identifier : description
-            write(io, "@", header, "\n")
-            write(io, sequence, "\n+\n")
-            write(io, quality, "\n")
-        end
+        write_fastq(io, materialized)
     end
     _ctx = active_provenance_context(_ctx)
     if _ctx !== nothing
@@ -247,11 +653,7 @@ function _open_vcf_output(path::String, f)
     end
 end
 
-@inline function _split_vcf_fields(line::AbstractString)
-    stripped = strip(String(line))
-    isempty(stripped) && return String[]
-    return Base.split(chomp(stripped), '\t'; keepempty=true)
-end
+
 
 @inline function _parse_vcf_qual(field::AbstractString)
     stripped = strip(String(field))
@@ -339,39 +741,148 @@ function _write_vcf_records(io::IO, records::AbstractVector{<:VariantTextRecord}
     _write_vcf_header(io, header, sample_names)
     sample_count = length(sample_names)
 
-    for record in records
-        println(io, join(_vcf_record_fields(record, sample_count), '\t'))
+    buf = Vector{UInt8}(undef, 65536)
+    buf_pos = 0
+
+    @inline function flush_buf()
+        if buf_pos > 0
+            write(io, view(buf, 1:buf_pos))
+            buf_pos = 0
+        end
     end
 
+    @inline function write_byte(b::UInt8)
+        buf_pos += 1
+        @inbounds buf[buf_pos] = b
+        if buf_pos == length(buf)
+            flush_buf()
+        end
+    end
+
+    @inline function write_bytes(data::AbstractVector{UInt8})
+        n = length(data)
+        src_pos = 1
+        while src_pos <= n
+            avail = length(buf) - buf_pos
+            to_copy = min(avail, n - src_pos + 1)
+            copyto!(buf, buf_pos + 1, data, src_pos, to_copy)
+            buf_pos += to_copy
+            src_pos += to_copy
+            if buf_pos == length(buf)
+                flush_buf()
+            end
+        end
+    end
+
+    for record in records
+        write_bytes(codeunits(record.chrom))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(string(record.pos)))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.id))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.ref))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.alt))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.qual === missing ? "." : string(record.qual)))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(isempty(record.filter) ? "PASS" : record.filter))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(isempty(record.info) ? "." : record.info))
+
+        if sample_count > 0
+            write_byte(UInt8('\t'))
+            write_bytes(codeunits(isempty(record.format) ? "GT" : record.format))
+            samples = record.samples
+            for (idx, s) in enumerate(samples)
+                write_byte(UInt8('\t'))
+                write_bytes(codeunits(s))
+            end
+            if length(samples) < sample_count
+                for _ in (length(samples)+1):sample_count
+                    write_byte(UInt8('\t'))
+                    write_byte(UInt8('.'))
+                end
+            end
+        end
+        write_byte(UInt8('\n'))
+    end
+    flush_buf()
     return nothing
 end
 
 """
-    parse_vcf_record(line)
+    parse_vcf_record(line::AbstractString) -> Union{Nothing, VariantTextRecord}
 
-Parse a single VCF text line into a structured variant record.
+Parse a single VCF variant record line into a structured record. By design, accepts 
+truncated VCF lines (with a minimum of CHROM, POS, ID, REF, ALT, QUAL) and populates 
+unspecified trailing fields with standard VCF defaults (`QUAL=missing`, `FILTER="PASS"`, `INFO="."`).
 """
 function parse_vcf_record(line::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    fields = _split_vcf_fields(line)
-    length(fields) < 6 && return nothing
-
-    try
-        chrom = fields[1]
-        pos = Int32(parse(Int, fields[2]))
-        pos > 0 || throw(ArgumentError("VCF position must be positive"))
-        id = fields[3]
-        ref = fields[4]
-        alt = fields[5]
-        qual = _parse_vcf_qual(fields[6])
-        filter = length(fields) >= 7 ? (isempty(fields[7]) ? "." : fields[7]) : "PASS"
-        info = length(fields) >= 8 ? (isempty(fields[8]) ? "." : fields[8]) : "."
-        format = length(fields) >= 9 ? fields[9] : ""
-        samples = length(fields) >= 10 ? String.(fields[10:end]) : String[]
-        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=info, format=format, samples=samples)
-    catch err
-        err isa ArgumentError && rethrow()
-        throw(ArgumentError("malformed VCF record: $(line)"))
+    s = strip(line)
+    isempty(s) && return nothing
+    
+    idx1 = findnext('\t', s, 1)
+    idx1 === nothing && return nothing
+    chrom = String(SubString(s, 1, idx1 - 1))
+    
+    idx2 = findnext('\t', s, idx1 + 1)
+    idx2 === nothing && return nothing
+    pos_str = SubString(s, idx1 + 1, idx2 - 1)
+    pos_val = tryparse(Int, pos_str)
+    (pos_val === nothing || pos_val <= 0) && throw(ArgumentError("VCF position must be positive"))
+    pos = Int32(pos_val)
+    
+    idx3 = findnext('\t', s, idx2 + 1)
+    idx3 === nothing && return nothing
+    id = String(SubString(s, idx2 + 1, idx3 - 1))
+    
+    idx4 = findnext('\t', s, idx3 + 1)
+    idx4 === nothing && return nothing
+    ref = String(SubString(s, idx3 + 1, idx4 - 1))
+    
+    idx5 = findnext('\t', s, idx4 + 1)
+    idx5 === nothing && return nothing
+    alt = String(SubString(s, idx4 + 1, idx5 - 1))
+    
+    idx6 = findnext('\t', s, idx5 + 1)
+    if idx6 === nothing
+        qual_str = SubString(s, idx5 + 1)
+        qual = _parse_vcf_qual(qual_str)
+        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter="PASS", info=".", format="", samples=String[])
     end
+    qual_str = SubString(s, idx5 + 1, idx6 - 1)
+    qual = _parse_vcf_qual(qual_str)
+    
+    idx7 = findnext('\t', s, idx6 + 1)
+    if idx7 === nothing
+        filter_str = SubString(s, idx6 + 1)
+        filter = isempty(filter_str) ? "PASS" : String(filter_str)
+        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=".", format="", samples=String[])
+    end
+    filter_str = SubString(s, idx6 + 1, idx7 - 1)
+    filter = isempty(filter_str) ? "PASS" : String(filter_str)
+    
+    idx8 = findnext('\t', s, idx7 + 1)
+    if idx8 === nothing
+        info_str = SubString(s, idx7 + 1)
+        info = isempty(info_str) ? "." : String(info_str)
+        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=info, format="", samples=String[])
+    end
+    info_str = SubString(s, idx7 + 1, idx8 - 1)
+    info = isempty(info_str) ? "." : String(info_str)
+    
+    idx9 = findnext('\t', s, idx8 + 1)
+    if idx9 === nothing
+        format_str = SubString(s, idx8 + 1)
+        return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=info, format=String(format_str), samples=String[])
+    end
+    format_str = SubString(s, idx8 + 1, idx9 - 1)
+    
+    samples_str = SubString(s, idx9 + 1)
+    samples = isempty(samples_str) ? String[] : String[String(sub) for sub in Base.eachsplit(samples_str, '\t'; keepempty=true)]
+    return VariantTextRecord(chrom, pos, id, ref, alt, qual; filter=filter, info=info, format=String(format_str), samples=samples)
 end
 
 """
@@ -380,10 +891,14 @@ end
 Read a full VCF document, including header metadata and parsed records.
 """
 function read_vcf_document(input::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        return _open_vcf_input(input, io -> begin
+            return read_vcf_document(io, nothing, input; _ctx=nothing)
+        end)
+    end
     raw_bytes = read(input)
     provenance_hash = bytes2hex(sha256(raw_bytes))
     return _open_vcf_input(input, io -> begin
-
         return read_vcf_document(io, provenance_hash, input; _ctx=_ctx)
     end)
 end
@@ -399,13 +914,13 @@ function read_vcf_document(io::IO, provenance_hash::Union{Nothing,AbstractString
     records = VariantTextRecord[]
 
     for raw_line in eachline(io)
-        line = strip(chomp(String(raw_line)))
+        line = strip(raw_line)
         isempty(line) && continue
         if startswith(line, "##")
             push!(meta_lines, line)
             continue
         elseif startswith(line, "#CHROM")
-            columns = Base.split(line, '\t'; keepempty=true)
+            columns = String[String(sub) for sub in Base.eachsplit(line, '\t'; keepempty=true)]
             continue
         end
 
@@ -580,18 +1095,39 @@ Parse the attribute column of a GFF record into a dictionary.
 """
 function _parse_gff_attributes(attributes::AbstractString)
     parsed = Dict{String,Vector{String}}()
-    stripped = strip(attributes)
-    isempty(stripped) && return parsed
+    s = strip(attributes)
+    isempty(s) && return parsed
 
-    for field in Base.split(stripped, ';')
-        pair = strip(field)
-        isempty(pair) && continue
-        if occursin("=", pair)
-            key, value = Base.split(pair, "=", limit=2)
-            parsed[String(strip(key))] = isempty(value) ? String[""] : String[strip(entry) for entry in Base.split(value, ',')]
-        else
-            parsed[String(pair)] = [""]
+    start_idx = 1
+    len = ncodeunits(s)
+    while start_idx <= len
+        semi_idx = findnext(';', s, start_idx)
+        pair_end = semi_idx === nothing ? len : semi_idx - 1
+        pair = strip(SubString(s, start_idx, pair_end))
+        if !isempty(pair)
+            eq_idx = findnext('=', pair, 1)
+            if eq_idx !== nothing
+                key = String(strip(SubString(pair, 1, eq_idx - 1)))
+                val_str = strip(SubString(pair, eq_idx + 1))
+                if isempty(val_str)
+                    parsed[key] = String[""]
+                else
+                    vals = String[]
+                    vstart = 1
+                    vlen = ncodeunits(val_str)
+                    while vstart <= vlen
+                        comma_idx = findnext(',', val_str, vstart)
+                        vend = comma_idx === nothing ? vlen : comma_idx - 1
+                        push!(vals, String(strip(SubString(val_str, vstart, vend))))
+                        vstart = comma_idx === nothing ? vlen + 1 : comma_idx + 1
+                    end
+                    parsed[key] = vals
+                end
+            else
+                parsed[String(pair)] = String[""]
+            end
         end
+        start_idx = semi_idx === nothing ? len + 1 : semi_idx + 1
     end
 
     return parsed
@@ -731,12 +1267,13 @@ function GenBankRecord(
         sequence
     else
         sequence_text = String(sequence)
+        seq_bytes = Vector{UInt8}(sequence_text)
         if isempty(sequence_text) || validate_sequence(DNAAlphabet, sequence_text)
-            BioSequence{DNAAlphabet}(sequence_text)
+            BioSequence{DNAAlphabet}(seq_bytes; validate=false)
         elseif validate_sequence(RNAAlphabet, sequence_text)
-            BioSequence{RNAAlphabet}(sequence_text)
+            BioSequence{RNAAlphabet}(seq_bytes; validate=false)
         elseif validate_sequence(AminoAcidAlphabet, sequence_text)
-            BioSequence{AminoAcidAlphabet}(sequence_text)
+            BioSequence{AminoAcidAlphabet}(seq_bytes; validate=false)
         else
             throw(ArgumentError("cannot infer alphabet for GenBank sequence"))
         end
@@ -790,21 +1327,28 @@ const _GENBANK_FEATURE_QUALIFIER_PREFIX = "                     "
 
 Parse a single BED text line into a BED record.
 """
-function parse_bed_record(line::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    fields = Base.split(strip(line), '\t'; limit=4)
-    length(fields) < 3 && return nothing
+function parse_bed_record(line::AbstractString; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    s = strip(line)
+    (isempty(s) || startswith(s, '#') || startswith(s, "track") || startswith(s, "browser")) && return nothing
 
-    try
-        chrom = fields[1]
-        start = parse(Int, fields[2])
-        stop = parse(Int, fields[3])
-        start >= 0 || throw(ArgumentError("BED start must be nonnegative"))
-        stop > start || throw(ArgumentError("BED stop must be greater than start"))
-        return BedRecord(chrom, Int32(start), Int32(stop))
-    catch err
-        err isa ArgumentError && rethrow()
-        throw(ArgumentError("malformed BED record: $(line)"))
-    end
+    idx1 = findnext('\t', s, 1)
+    idx1 === nothing && return nothing
+    chrom = String(SubString(s, 1, idx1 - 1))
+
+    idx2 = findnext('\t', s, idx1 + 1)
+    idx2 === nothing && return nothing
+    start_str = SubString(s, idx1 + 1, idx2 - 1)
+    start_val = tryparse(Int, start_str)
+    start_val === nothing && throw(ArgumentError("malformed BED record: $(line)"))
+
+    idx3 = findnext('\t', s, idx2 + 1)
+    stop_str = idx3 === nothing ? SubString(s, idx2 + 1) : SubString(s, idx2 + 1, idx3 - 1)
+    stop_val = tryparse(Int, stop_str)
+    stop_val === nothing && throw(ArgumentError("malformed BED record: $(line)"))
+
+    start_val >= 0 || throw(ArgumentError("BED start must be nonnegative"))
+    stop_val > start_val || throw(ArgumentError("BED stop must be greater than start"))
+    return BedRecord(chrom, Int32(start_val), Int32(stop_val))
 end
 
 """
@@ -873,9 +1417,48 @@ end
 Write BED records to an IO stream.
 """
 function write_bed(io::IO, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
-    for record in records
-        print(io, record.chrom, '\t', record.start, '\t', record.stop, '\n')
+    buf = Vector{UInt8}(undef, 65536)
+    buf_pos = 0
+
+    @inline function flush_buf()
+        if buf_pos > 0
+            write(io, view(buf, 1:buf_pos))
+            buf_pos = 0
+        end
     end
+
+    @inline function write_byte(b::UInt8)
+        buf_pos += 1
+        @inbounds buf[buf_pos] = b
+        if buf_pos == length(buf)
+            flush_buf()
+        end
+    end
+
+    @inline function write_bytes(data::AbstractVector{UInt8})
+        n = length(data)
+        src_pos = 1
+        while src_pos <= n
+            avail = length(buf) - buf_pos
+            to_copy = min(avail, n - src_pos + 1)
+            copyto!(buf, buf_pos + 1, data, src_pos, to_copy)
+            buf_pos += to_copy
+            src_pos += to_copy
+            if buf_pos == length(buf)
+                flush_buf()
+            end
+        end
+    end
+
+    for record in records
+        write_bytes(codeunits(record.chrom))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(string(record.start)))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(string(record.stop)))
+        write_byte(UInt8('\n'))
+    end
+    flush_buf()
     _ctx = active_provenance_context(_ctx)
     return nothing
 end
@@ -1003,14 +1586,64 @@ end
 Write GFF records to an IO stream.
 """
 function write_gff(io::IO, records; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    buf = Vector{UInt8}(undef, 65536)
+    buf_pos = 0
+
+    @inline function flush_buf()
+        if buf_pos > 0
+            write(io, view(buf, 1:buf_pos))
+            buf_pos = 0
+        end
+    end
+
+    @inline function write_byte(b::UInt8)
+        buf_pos += 1
+        @inbounds buf[buf_pos] = b
+        if buf_pos == length(buf)
+            flush_buf()
+        end
+    end
+
+    @inline function write_bytes(data::AbstractVector{UInt8})
+        n = length(data)
+        src_pos = 1
+        while src_pos <= n
+            avail = length(buf) - buf_pos
+            to_copy = min(avail, n - src_pos + 1)
+            copyto!(buf, buf_pos + 1, data, src_pos, to_copy)
+            buf_pos += to_copy
+            src_pos += to_copy
+            if buf_pos == length(buf)
+                flush_buf()
+            end
+        end
+    end
+
     for record in records
         score = record.score === missing ? "." : string(record.score)
         phase = record.phase === missing ? "." : string(record.phase)
         attributes = _render_gff_attributes(record.attributes, record.attribute_map)
-        print(io, record.chrom, '\t', record.source, '\t', record.feature, '\t',
-                  record.start, '\t', record.stop, '\t', score, '\t',
-                  record.strand, '\t', phase, '\t', attributes, '\n')
+        
+        write_bytes(codeunits(record.chrom))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.source))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.feature))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(string(record.start)))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(string(record.stop)))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(score))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(record.strand))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(phase))
+        write_byte(UInt8('\t'))
+        write_bytes(codeunits(attributes))
+        write_byte(UInt8('\n'))
     end
+    flush_buf()
     _ctx = active_provenance_context(_ctx)
     return nothing
 end
@@ -1034,17 +1667,18 @@ function _genbank_parse_qualifier(text::AbstractString)
     stripped = strip(text)
     startswith(stripped, "/") || return nothing
 
-    payload = stripped[2:end]
-    if occursin("=", payload)
-        key, value = Base.split(payload, "=", limit=2)
-        value = strip(value)
-        if startswith(value, "\"") && endswith(value, "\"") && length(value) >= 2
-            value = value[2:end-1]
+    payload = SubString(stripped, 2)
+    eq_idx = findnext('=', payload, 1)
+    if eq_idx !== nothing
+        key = strip(SubString(payload, 1, eq_idx - 1))
+        val_str = strip(SubString(payload, eq_idx + 1))
+        if startswith(val_str, "\"") && endswith(val_str, "\"") && length(val_str) >= 2
+            val_str = SubString(val_str, 2, length(val_str) - 1)
         end
-        return strip(key), value
+        return key, val_str
     end
 
-    return strip(payload), ""
+    return strip(payload), SubString("")
 end
 
 """
@@ -1052,7 +1686,7 @@ end
 
 Parse a GenBank flat-file record from its raw text lines.
 """
-function parse_genbank_record(lines::AbstractVector{<:String})
+function parse_genbank_record(lines::AbstractVector{<:String}; preserve_case::Bool=false)
     isempty(lines) && return nothing
 
     locus = ""
@@ -1077,9 +1711,22 @@ function parse_genbank_record(lines::AbstractVector{<:String})
 
     function flush_feature!()
         if !isempty(current_feature_key)
-            qualifiers = Dict{String,Vector{String}}(
-                key => copy(values) for (key, values) in current_feature_qualifiers
-            )
+            qualifiers = Dict{String,Vector{String}}()
+            for (key, values) in current_feature_qualifiers
+                clean_values = String[]
+                for val in values
+                    v = strip(val)
+                    if startswith(v, '"') && endswith(v, '"') && length(v) >= 2
+                        v = v[2:end-1]
+                    elseif startswith(v, '"')
+                        v = v[2:end]
+                    elseif endswith(v, '"')
+                        v = v[1:end-1]
+                    end
+                    push!(clean_values, v)
+                end
+                qualifiers[key] = clean_values
+            end
             location_text = strip(String(take!(current_feature_location)))
             parsed_location = isempty(location_text) ? nothing : parse_feature_location(location_text)
             push!(features, GenBankFeature(current_feature_key, location_text, qualifiers, parsed_location))
@@ -1095,10 +1742,86 @@ function parse_genbank_record(lines::AbstractVector{<:String})
         line = rstrip(raw_line)
         line == "//" && break
 
+        if in_origin
+            for byte in codeunits(line)
+                if (!preserve_case && UInt8('a') <= byte <= UInt8('z'))
+                    write(sequence, UInt8(byte - 0x20))
+                elseif (UInt8('a') <= byte <= UInt8('z')) || (UInt8('A') <= byte <= UInt8('Z'))
+                    write(sequence, UInt8(byte))
+                end
+            end
+            continue
+        end
+
+        if in_features
+            if startswith(line, "ORIGIN")
+                flush_feature!()
+                in_features = false
+                in_origin = true
+                current_field = :origin
+                continue
+            end
+
+            if startswith(line, _GENBANK_FEATURE_QUALIFIER_PREFIX)
+                qualifier_line = line[length(_GENBANK_FEATURE_QUALIFIER_PREFIX) + 1:end]
+                parsed = _genbank_parse_qualifier(qualifier_line)
+                if parsed !== nothing
+                    key, value = parsed
+                    _genbank_push_qualifier!(current_feature_qualifiers, String(key), String(value))
+                    current_qualifier_key = String(key)
+                elseif current_qualifier_key !== nothing
+                    values = current_feature_qualifiers[current_qualifier_key]
+                    stripped = strip(qualifier_line)
+                    if !isempty(stripped)
+                        clean_str = startswith(stripped, "\"") && endswith(stripped, "\"") && length(stripped) >= 2 ? stripped[2:end-1] : (endswith(stripped, "\"") ? rstrip(stripped, '"') : stripped)
+                        values[end] = string(values[end], clean_str)
+                    end
+                end
+                continue
+            end
+
+            if startswith(line, _GENBANK_FEATURE_KEY_PREFIX)
+                s = strip(line)
+                sp_idx = findnext(isspace, s, 1)
+                if sp_idx !== nothing
+                    flush_feature!()
+                    current_feature_key = String(SubString(s, 1, sp_idx - 1))
+                    print(current_feature_location, strip(SubString(s, sp_idx + 1)))
+                    current_qualifier_key = nothing
+                    continue
+                end
+            end
+
+            if current_qualifier_key !== nothing
+                values = current_feature_qualifiers[current_qualifier_key]
+                stripped = strip(line)
+                if !isempty(stripped)
+                    # For qualifiers like /translation, remove quotes or space insertion
+                    clean_str = startswith(stripped, "\"") && endswith(stripped, "\"") && length(stripped) >= 2 ? stripped[2:end-1] : (endswith(stripped, "\"") ? rstrip(stripped, '"') : stripped)
+                    values[end] = string(values[end], clean_str)
+                end
+                continue
+            end
+
+            stripped = strip(line)
+            if !isempty(stripped)
+                write(current_feature_location, ' ')
+                write(current_feature_location, stripped)
+            end
+            continue
+        end
+
         if startswith(line, "LOCUS")
-            fields = Base.split(strip(line))
-            length(fields) >= 2 && (locus = fields[2])
-            locus_line = strip(line)
+            s = strip(line)
+            sp1 = findnext(isspace, s, 1)
+            if sp1 !== nothing
+                p2 = findnext(!isspace, s, sp1 + 1)
+                if p2 !== nothing
+                    sp2 = findnext(isspace, s, p2)
+                    locus = String(sp2 === nothing ? SubString(s, p2) : SubString(s, p2, sp2 - 1))
+                end
+            end
+            locus_line = String(s)
             current_field = :none
             continue
         elseif startswith(line, "DEFINITION")
@@ -1139,53 +1862,6 @@ function parse_genbank_record(lines::AbstractVector{<:String})
             in_features = false
             in_origin = true
             current_field = :origin
-            continue
-        end
-
-        if in_origin
-            for byte in codeunits(line)
-                if (UInt8('a') <= byte <= UInt8('z')) || (UInt8('A') <= byte <= UInt8('Z'))
-                    write(sequence, uppercase(Char(byte)))
-                end
-            end
-            continue
-        end
-
-        if in_features
-            if startswith(line, _GENBANK_FEATURE_QUALIFIER_PREFIX)
-                qualifier_line = line[length(_GENBANK_FEATURE_QUALIFIER_PREFIX) + 1:end]
-                parsed = _genbank_parse_qualifier(qualifier_line)
-                if parsed !== nothing
-                    key, value = parsed
-                    _genbank_push_qualifier!(current_feature_qualifiers, String(key), String(value))
-                    current_qualifier_key = String(key)
-                end
-                continue
-            end
-
-            if startswith(line, _GENBANK_FEATURE_KEY_PREFIX)
-                parts = Base.split(strip(line), limit=2)
-                if length(parts) >= 2
-                    flush_feature!()
-                    current_feature_key = parts[1]
-                    print(current_feature_location, parts[2])
-                    current_qualifier_key = nothing
-                    continue
-                end
-            end
-
-            if current_qualifier_key !== nothing
-                values = current_feature_qualifiers[current_qualifier_key]
-                stripped = strip(line)
-                isempty(stripped) || (values[end] = string(values[end], " ", stripped))
-                continue
-            end
-
-            stripped = strip(line)
-            if !isempty(stripped)
-                write(current_feature_location, ' ')
-                write(current_feature_location, stripped)
-            end
             continue
         end
 
@@ -1231,13 +1907,12 @@ function _wrap_genbank_text(prefix::String, text::String; continuation_prefix::S
     payload = strip(text)
     isempty(payload) && return isempty(empty_text) ? String[] : [string(prefix, empty_text)]
 
-    words = Base.split(payload)
     lines = String[]
     current_prefix = String(prefix)
     current = String(prefix)
     current_length = ncodeunits(current_prefix)
 
-    for word in words
+    for word in Base.eachsplit(payload)
         needs_space = current_length > ncodeunits(current_prefix)
         projected = current_length + (needs_space ? 1 : 0) + ncodeunits(word)
         if projected > width && current != current_prefix
@@ -1301,16 +1976,27 @@ end
 
 Render a GenBank ORIGIN sequence block.
 """
-function _render_genbank_sequence(sequence::BioSequence)
-    sequence_text = String(sequence)
+function _render_genbank_sequence(sequence::Union{BioSequence, AbstractString})
+    seq_bytes = sequence isa BioSequence ? sequence.data : codeunits(String(sequence))
+    n = length(seq_bytes)
     buffer = IOBuffer()
-    for index in 1:60:length(sequence_text)
-        chunk = sequence_text[index:min(index + 59, lastindex(sequence_text))]
-        print(buffer, lpad(string(div(index - 1, 60) + 1), 9), " ")
-        for chunk_index in 1:10:length(chunk)
-            print(buffer, lowercase(chunk[chunk_index:min(chunk_index + 9, lastindex(chunk))]), ' ')
+    pos = 1
+    while pos <= n
+        print(buffer, lpad(string(pos), 9), " ")
+        end_pos = min(pos + 59, n)
+        p = pos
+        while p <= end_pos
+            block_end = min(p + 9, end_pos)
+            for i in p:block_end
+                b = @inbounds seq_bytes[i]
+                ch = (b >= 0x41 && b <= 0x5a) ? UInt8(b + 0x20) : b
+                write(buffer, ch)
+            end
+            write(buffer, UInt8(' '))
+            p += 10
         end
-        print(buffer, '\n')
+        write(buffer, UInt8('\n'))
+        pos += 60
     end
     return String(take!(buffer))
 end
@@ -1355,7 +2041,7 @@ function write_genbank(io::IO, records; prov_ctx=nothing, _ctx=active_provenance
         for feature in record.features
             println(io, "     ", rpad(feature.key, 15), feature.location)
             for (key, values) in feature.qualifiers
-                for rendered in Base.split(_render_genbank_qualifier(key, values), '\n')
+                for rendered in Base.eachsplit(_render_genbank_qualifier(key, values), '\n')
                     println(io, rendered)
                 end
             end
@@ -1397,29 +2083,34 @@ end
 
 Read GenBank records from a file path.
 """
-function read_genbank(input_path::String; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+function read_genbank(input_path::String; preserve_case::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    if _ctx === nothing
+        open(input_path, "r") do io
+            return read_genbank(io, nothing, input_path; preserve_case=preserve_case, _ctx=nothing)
+        end
+    end
     raw_bytes = read(input_path)
     provenance_hash = bytes2hex(sha256(raw_bytes))
-    _ctx = active_provenance_context(_ctx)
-
-
-    return read_genbank(IOBuffer(raw_bytes), provenance_hash, input_path; _ctx=_ctx)
+    return read_genbank(IOBuffer(raw_bytes), provenance_hash, input_path; preserve_case=preserve_case, _ctx=_ctx)
 end
 
-function read_genbank(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_genbank"; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+function read_genbank(io::IO, provenance_hash::Union{Nothing,AbstractString}=nothing, provenance_source::AbstractString="read_genbank"; preserve_case::Bool=false, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     records = GenBankRecord[]
     current_lines = String[]
 
     for raw_line in eachline(io)
         push!(current_lines, raw_line)
         if strip(raw_line) == "//"
-            record = parse_genbank_record(current_lines)
+            record = parse_genbank_record(current_lines; preserve_case=preserve_case)
             record === nothing || push!(records, record)
             empty!(current_lines)
         end
     end
 
-    isempty(current_lines) || push!(records, parse_genbank_record(current_lines))
+    if !isempty(current_lines)
+        rec = parse_genbank_record(current_lines; preserve_case=preserve_case)
+        rec === nothing || push!(records, rec)
+    end
     if provenance_hash !== nothing
         for record in records
             record.metadata[PROVENANCE_HASH_KEY] = String(provenance_hash)
@@ -1485,7 +2176,8 @@ Convert GenBank records into a chunked Arrow table.
 function ingest_genbank(
     input_path::String,
     output_path::String;
-    chunk_size::Integer=100)
+    chunk_size::Integer=100,
+    preserve_case::Bool=false)
     loci = String[]
     locus_lines = String[]
     accessions = String[]
@@ -1507,7 +2199,7 @@ function ingest_genbank(
             for raw_line in eachline(io)
                 push!(current_lines, raw_line)
                 if strip(raw_line) == "//"
-                    record = parse_genbank_record(current_lines)
+                    record = parse_genbank_record(current_lines; preserve_case=preserve_case)
                     if record !== nothing
                         flattened = _genbank_flatten_record(record)
                         push!(loci, flattened.locus)
@@ -1534,7 +2226,7 @@ function ingest_genbank(
         end
 
         if !isempty(current_lines)
-            record = parse_genbank_record(current_lines)
+            record = parse_genbank_record(current_lines; preserve_case=preserve_case)
             if record !== nothing
                 flattened = _genbank_flatten_record(record)
                 push!(loci, flattened.locus)
@@ -1818,35 +2510,33 @@ end
 
 Parses an EMBL flat file into a vector of AnnotatedSeqRecord objects.
 """
-function read_embl(filepath::String)
+function read_embl(filepath::String; preserve_case::Bool=false)
     open(filepath, "r") do io
-        return read_embl(io)
+        return read_embl(io; preserve_case=preserve_case)
     end
 end
 
 """
-    read_embl(io)
+    read_embl(io; preserve_case=false)
 
 Read EMBL records from an IO stream.
 """
-function read_embl(io::IO)
-    lines = readlines(io)
+function read_embl(io::IO; preserve_case::Bool=false)
     records = AnnotatedSeqRecord[]
-    sizehint!(records, 1)
+    current_lines = String[]
 
-    record_start = 1
-
-    for (index, line) in pairs(lines)
-        if startswith(line, "//")
-            if record_start <= index - 1
-                push!(records, _parse_embl_record(@view lines[record_start:index - 1]))
-            end
-            record_start = index + 1
+    for raw_line in eachline(io)
+        push!(current_lines, String(raw_line))
+        if startswith(raw_line, "//")
+            record = _parse_embl_record(current_lines; preserve_case=preserve_case)
+            record === nothing || push!(records, record)
+            empty!(current_lines)
         end
     end
 
-    if record_start <= length(lines)
-        push!(records, _parse_embl_record(@view lines[record_start:end]))
+    if !isempty(current_lines)
+        record = _parse_embl_record(current_lines; preserve_case=preserve_case)
+        record === nothing || push!(records, record)
     end
     return records
 end
@@ -1882,7 +2572,7 @@ end
 
 Parse a single EMBL record from raw text lines.
 """
-function _parse_embl_record(lines::AbstractVector{<:String})
+function _parse_embl_record(lines::AbstractVector{<:String}; preserve_case::Bool=false)
     id = ""
     accession = ""
     description = IOBuffer()
@@ -1946,10 +2636,11 @@ function _parse_embl_record(lines::AbstractVector{<:String})
         elseif code == "SQ"
             in_sequence = true
         elseif in_sequence && code != "//"
-            # Sequence data: strip spaces and numbers
-            for c in content
-                if isletter(c)
-                    print(sequence, c)
+            for b in codeunits(content)
+                if (!preserve_case && UInt8('a') <= b <= UInt8('z'))
+                    write(sequence, UInt8(b - 0x20))
+                elseif (UInt8('a') <= b <= UInt8('z')) || (UInt8('A') <= b <= UInt8('Z'))
+                    write(sequence, b)
                 end
             end
         end
@@ -1965,13 +2656,14 @@ function _parse_embl_record(lines::AbstractVector{<:String})
         annotations[:accession] = accession
     end
 
-    sequence_text = String(take!(sequence))
+    sequence_bytes = take!(sequence)
+    sequence_text = String(copy(sequence_bytes))
     sequence_typed = if isempty(sequence_text) || validate_sequence(DNAAlphabet, sequence_text)
-        BioSequence{DNAAlphabet}(sequence_text)
+        BioSequence{DNAAlphabet}(sequence_bytes; validate=false)
     elseif validate_sequence(RNAAlphabet, sequence_text)
-        BioSequence{RNAAlphabet}(sequence_text)
+        BioSequence{RNAAlphabet}(sequence_bytes; validate=false)
     elseif validate_sequence(AminoAcidAlphabet, sequence_text)
-        BioSequence{AminoAcidAlphabet}(sequence_text)
+        BioSequence{AminoAcidAlphabet}(sequence_bytes; validate=false)
     else
         throw(ArgumentError("cannot infer alphabet for EMBL sequence"))
     end
@@ -2059,6 +2751,7 @@ function read_abif(io::IO)
         tag_num_elems = ntoh(read(io, UInt32))
         tag_data_size = ntoh(read(io, UInt32))
         tag_data_offset = ntoh(read(io, UInt32))
+        data_handle = ntoh(read(io, UInt32))
         
         pos = position(io)
 

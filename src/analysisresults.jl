@@ -299,6 +299,7 @@ resolve which context (if any) to record into.
   explicit !== nothing && return explicit
   scoped = _active_scoped_provenance_context()
   scoped !== nothing && return scoped
+  _PROV_ENABLED[] || return nothing
   Base.lock(_GLOBAL_PROV_LOCK) do
     return _PROV_ENABLED[] ? _GLOBAL_PROV_CTX[] : nothing
   end
@@ -371,14 +372,19 @@ mutable struct ProvenanceContext
   max_nodes::Union{Int,Nothing}
   max_depth::Union{Int,Nothing}
   schema_version::String
+  placeholder_ids::Set{String}
+  node_depths::Dict{String,Int}
 end
 
 const _GIT_COMMIT_CACHE = Ref{Tuple{Union{Nothing,String},Union{Nothing,String}}}((nothing, nothing))
 
 function _git_commit()
   proj = Base.active_project()
-  cached_project, cached_commit = _GIT_COMMIT_CACHE[]
-  cached_project == proj && return cached_commit
+  # When there's no active project, fall back to pwd() as cache key so that
+  # different directories don't share a cached git commit hash.
+  cache_key = proj === nothing ? pwd() : proj
+  cached_key, cached_commit = _GIT_COMMIT_CACHE[]
+  cached_key == cache_key && return cached_commit
   # Walk up from active project to find .git
   dir = proj === nothing ? pwd() : dirname(proj)
   while dir != dirname(dir)  # stop at root
@@ -387,16 +393,16 @@ function _git_commit()
       try
         commit = readchomp(`git -C $dir rev-parse HEAD`)
         result = isempty(commit) ? nothing : commit
-        _GIT_COMMIT_CACHE[] = (proj, result)
+        _GIT_COMMIT_CACHE[] = (cache_key, result)
         return result
       catch
-        _GIT_COMMIT_CACHE[] = (proj, nothing)
+        _GIT_COMMIT_CACHE[] = (cache_key, nothing)
         return nothing
       end
     end
     dir = dirname(dir)
   end
-  _GIT_COMMIT_CACHE[] = (proj, nothing)
+  _GIT_COMMIT_CACHE[] = (cache_key, nothing)
   return nothing
 end
 
@@ -440,11 +446,13 @@ function capture_environment_snapshot()
 end
 
 ProvenanceContext(; max_nodes::Union{Int,Nothing}=nothing, max_depth::Union{Int,Nothing}=nothing, schema_version::AbstractString=PROVENANCE_SCHEMA_VERSION) =
-  ProvenanceContext(OrderedDict{String,ProvenanceNode}(), capture_environment_snapshot(), max_nodes, max_depth, String(schema_version))
+  ProvenanceContext(OrderedDict{String,ProvenanceNode}(), capture_environment_snapshot(), max_nodes, max_depth, String(schema_version), Set{String}(), Dict{String,Int}())
 ProvenanceContext(nodes::OrderedDict{String,ProvenanceNode}) =
-  ProvenanceContext(nodes, capture_environment_snapshot(), nothing, nothing, PROVENANCE_SCHEMA_VERSION)
+  ProvenanceContext(nodes, capture_environment_snapshot(), nothing, nothing, PROVENANCE_SCHEMA_VERSION, Set{String}(), Dict{String,Int}())
 ProvenanceContext(nodes::OrderedDict{String,ProvenanceNode}, environment::EnvironmentSnapshot, max_nodes::Union{Int,Nothing}, max_depth::Union{Int,Nothing}) =
-  ProvenanceContext(nodes, environment, max_nodes, max_depth, PROVENANCE_SCHEMA_VERSION)
+  ProvenanceContext(nodes, environment, max_nodes, max_depth, PROVENANCE_SCHEMA_VERSION, Set{String}(), Dict{String,Int}())
+ProvenanceContext(nodes::OrderedDict{String,ProvenanceNode}, environment::EnvironmentSnapshot, max_nodes::Union{Int,Nothing}, max_depth::Union{Int,Nothing}, schema_version::String) =
+  ProvenanceContext(nodes, environment, max_nodes, max_depth, schema_version, Set{String}(), Dict{String,Int}())
 
 """
     ThreadSafeProvenanceContext
@@ -564,13 +572,14 @@ export set_provenance_limits!
 function _provenance_array_summary_hash(value::AbstractArray)
   ctx_sha = SHA.SHA2_256_CTX()
   SHA.update!(ctx_sha, codeunits(string(size(value), ':', eltype(value), ':', length(value))))
-  if value isa DenseArray && isbitstype(eltype(value))
-    try
-      SHA.update!(ctx_sha, vec(reinterpret(UInt8, value)))
-    catch
-      for item in value
-        SHA.update!(ctx_sha, codeunits(repr(item)))
-        SHA.update!(ctx_sha, UInt8[0])
+  # Restrict pointer fast path to concrete Array to avoid MethodError on SubArray etc.
+  if isbitstype(eltype(value)) && value isa Array && IndexStyle(value) === IndexLinear()
+    GC.@preserve value begin
+      p = convert(Ptr{UInt8}, pointer(value))
+      sz = sizeof(value)
+      if p != C_NULL && sz > 0
+        buf = unsafe_wrap(Array, p, sz)
+        SHA.update!(ctx_sha, buf)
       end
     end
   else
@@ -607,8 +616,14 @@ function _provenance_json_value(value)
     s = String(value)
     nb = ncodeunits(s)
     if nb > _PROV_MAX_STRING_LEN[]
-      # Use `first(s, n)` — character-safe, avoids splitting multi-byte UTF-8 sequences
-      trunc = first(s, _PROV_MAX_STRING_LEN[])
+      # Truncate by codeunit count (bytes), cutting on a valid UTF-8 boundary
+      limit = _PROV_MAX_STRING_LEN[]
+      cut = min(limit, nb)
+      # Step back from the cut point to a valid character boundary
+      while cut > 0 && cut < nb && !isvalid(s, cut + 1)
+        cut -= 1
+      end
+      trunc = s[1:min(cut, nb)]
       return string(trunc, "…[hash:", bytes2hex(sha256(codeunits(s)))[1:16], "]")
     end
     return s
@@ -748,24 +763,16 @@ end
 
 function _provenance_node_depth(ctx::ProvenanceContext, node::ProvenanceNode)
   isempty(node.parent_ids) && return 1
-  cache = Dict{String,Int}()
-  active = Set{String}()
-  function depth_from(id::String)::Int
-    cached = get(cache, id, nothing)
-    cached === nothing || return cached
-    id in active && return 0
-    push!(active, id)
-    parent = get(ctx.nodes, id, nothing)
-    depth = if parent === nothing || isempty(parent.parent_ids)
-      1
-    else
-      1 + maximum(depth_from(pid) for pid in parent.parent_ids; init=0)
+  d = 1
+  for pid in node.parent_ids
+    pd = get(ctx.node_depths, pid, nothing)
+    if pd === nothing
+      parent = get(ctx.nodes, pid, nothing)
+      pd = parent === nothing ? 1 : _provenance_node_depth(ctx, parent)
     end
-    delete!(active, id)
-    cache[id] = depth
-    return depth
+    d = max(d, 1 + pd)
   end
-  return 1 + maximum(depth_from(pid) for pid in node.parent_ids; init=0)
+  return d
 end
 
 # Use a dedicated sentinel key to mark auto-registered placeholder nodes.
@@ -781,16 +788,23 @@ end
 
 function _prune_generic_self_registrations!(ctx::ProvenanceContext, node::ProvenanceNode)
   _is_generic_self_registration(node) && return nothing
+  isempty(ctx.placeholder_ids) && return nothing
+
   stale_ids = String[]
   replacement = Dict{String,String}()
-  for (id, existing) in ctx.nodes
-    if existing.operation == node.operation && _is_generic_self_registration(existing)
+  for id in ctx.placeholder_ids
+    existing = get(ctx.nodes, id, nothing)
+    if existing !== nothing && existing.operation == node.operation
       push!(stale_ids, id)
       replacement[id] = node.id
     end
   end
+  isempty(stale_ids) && return nothing
+
   for id in stale_ids
     delete!(ctx.nodes, id)
+    delete!(ctx.placeholder_ids, id)
+    delete!(ctx.node_depths, id)
   end
   for (nid, n) in collect(ctx.nodes)
     new_parent_ids = copy(n.parent_ids)
@@ -807,14 +821,27 @@ function _prune_generic_self_registrations!(ctx::ProvenanceContext, node::Proven
 end
 
 function register_provenance!(ctx::ProvenanceContext, node::ProvenanceNode)
-  _prune_generic_self_registrations!(ctx, node)
+  # Compute read-only state BEFORE any mutation so that a limit-check throw
+  # leaves ctx completely untouched (no dangling placeholder_ids, no
+  # irreversible prune/rewire of existing nodes).
+  is_generic = _is_generic_self_registration(node)
+  depth = _provenance_node_depth(ctx, node)
+
   if ctx.max_nodes !== nothing && !haskey(ctx.nodes, node.id) && length(ctx.nodes) >= ctx.max_nodes
     throw(ArgumentError("ProvenanceContext node limit reached (max_nodes=$(ctx.max_nodes)); refusing to drop node '$(node.operation)'. Increase max_nodes= to record all steps."))
   end
-  if ctx.max_depth !== nothing && _provenance_node_depth(ctx, node) > ctx.max_depth
+  if ctx.max_depth !== nothing && depth > ctx.max_depth
     throw(ArgumentError("ProvenanceContext depth limit reached (max_depth=$(ctx.max_depth)); refusing to drop node '$(node.operation)'. Increase max_depth= to record full lineage."))
   end
+
+  # All checks passed — now safe to mutate ctx.
+  if is_generic
+    push!(ctx.placeholder_ids, node.id)
+  else
+    _prune_generic_self_registrations!(ctx, node)
+  end
   ctx.nodes[node.id] = node
+  ctx.node_depths[node.id] = depth
   return node
 end
 
@@ -962,7 +989,8 @@ function find_nodes(ctx::ProvenanceContext, pattern::AbstractString)
   regex = try
     Regex(pattern)
   catch
-    ; nothing
+    ;
+    nothing
   end
   return ProvenanceNode[
     node for node in values(ctx.nodes)
@@ -1029,9 +1057,10 @@ function export_provenance_json(ctx::ProvenanceContext)
 end
 
 function export_provenance_json(ts::ThreadSafeProvenanceContext)
-  Base.lock(ts.lock) do
-    return export_provenance_json(ts.ctx)
+  snapshot = Base.lock(ts.lock) do
+    copy(ts.ctx)
   end
+  return export_provenance_json(snapshot)
 end
 
 function _environment_json(snapshot::EnvironmentSnapshot)
@@ -1134,6 +1163,37 @@ function migrate_provenance_payload(
   return migrated
 end
 
+# Topologically sort node IDs so that parents are always registered before
+# children — otherwise _provenance_node_depth gets permanently wrong depths
+# cached in ctx.node_depths for children that are visited before their parents
+# (which is likely when iterating Dict key order from JSON parsing).
+function _import_topological_order(all_node_ids::Vector{String}, parents_by_child::Dict{String,Vector{String}})
+  id_set = Set(all_node_ids)
+  children_of = Dict{String,Vector{String}}()
+  indegree = Dict{String,Int}(id => 0 for id in all_node_ids)
+  for (child, parents) in parents_by_child
+    haskey(indegree, child) || continue
+    for parent in parents
+      parent in id_set || continue
+      indegree[child] += 1
+      push!(get!(children_of, parent, String[]), child)
+    end
+  end
+  ready = sort!([id for (id, d) in indegree if d == 0])
+  ordered = String[]
+  while !isempty(ready)
+    id = popfirst!(ready)
+    push!(ordered, id)
+    for child in sort!(get(children_of, id, String[]))
+      indegree[child] -= 1
+      indegree[child] == 0 && push!(ready, child)
+    end
+  end
+  # leftover ids (cycles / dangling refs) appended at the end, deterministic order
+  append!(ordered, sort!(setdiff(all_node_ids, ordered)))
+  return ordered
+end
+
 function import_provenance_json(json_text::AbstractString; migrator::ProvenanceMigrator=DEFAULT_PROVENANCE_MIGRATOR)
   payload = try
     JSON.parse(String(json_text); dicttype=Dict)
@@ -1154,13 +1214,19 @@ function import_provenance_json(json_text::AbstractString; migrator::ProvenanceM
     parent = string(get(rel, "prov:usedEntity", ""))
     isempty(child) || isempty(parent) || push!(get!(parents_by_child, child, String[]), parent)
   end
-  for (id, entity) in entities
+  all_node_ids = String[string(id) for id in unique(vcat(collect(keys(entities)), collect(keys(activities))))]
+  # Topological order ensures parents are registered before children,
+  # so _provenance_node_depth correctly looks up already-cached parent depths.
+  sorted_ids = _import_topological_order(all_node_ids, parents_by_child)
+  for id in sorted_ids
     sid = string(id)
+    entity = get(entities, sid, Dict())
     activity = get(activities, sid, Dict())
     operation = string(get(entity, "prov:label", get(activity, "prov:label", "unknown")))
     params = _provenance_parameters_dict(get(entity, "prov:value", Dict()))
     timestamp = string(get(activity, "prov:startedAtTime", _provenance_timestamp()))
-    ctx.nodes[sid] = ProvenanceNode(sid, operation, params, get(parents_by_child, sid, String[]), timestamp)
+    parents = get(parents_by_child, sid, String[])
+    register_provenance!(ctx, ProvenanceNode(sid, operation, params, parents, timestamp))
   end
   return ctx
 end
@@ -1189,6 +1255,8 @@ Base.empty!(get_provenance_context())   # reset for next pipeline
 """
 function Base.empty!(ctx::ProvenanceContext)
   empty!(ctx.nodes)
+  empty!(ctx.placeholder_ids)
+  empty!(ctx.node_depths)
   ctx.environment = capture_environment_snapshot()
   return ctx
 end
@@ -1801,8 +1869,11 @@ function with_provenance(result::AbstractAnalysisResult, label::AbstractString, 
 
   # Reconstruct the struct with the new provenance field
   T = typeof(result)
-  fields = [f == :provenance ? new_prov : getproperty(result, f) for f in fieldnames(T)]
-  return T(fields...)
+  new_fields = ntuple(Val(fieldcount(T))) do i
+    f = fieldname(T, i)
+    f === :provenance ? new_prov : getfield(result, f)
+  end
+  return T(new_fields...)
 end
 
 function with_provenance(result, label::AbstractString, source::AbstractString;
@@ -2265,9 +2336,22 @@ function _distributed_merge_order(context::DistributedProvenanceContext)
     push!(ordered, nodes[node_id][1])
     for child_id in get(children, node_id, String[])
       indegree[child_id] -= 1
-      indegree[child_id] == 0 && push!(ready, child_id)
+      if indegree[child_id] == 0
+        # Binary insertion into the sorted ready list instead of re-sorting
+        # the entire list on every iteration — O(n log n) total vs O(n² log n).
+        key = order_key(child_id)
+        lo, hi = 1, length(ready) + 1
+        while lo < hi
+          mid = (lo + hi) >> 1
+          if order_key(ready[mid]) < key
+            lo = mid + 1
+          else
+            hi = mid
+          end
+        end
+        insert!(ready, lo, child_id)
+      end
     end
-    sort!(ready; by=order_key)
   end
   length(ordered) == length(nodes) || throw(ArgumentError("distributed provenance graph contains a cycle"))
   return ordered
@@ -2454,11 +2538,28 @@ function provenance_content_hash(data)::String
   elseif data isa AbstractArray{T} where T<:Union{Float16,Float32,Float64,
     Int8,Int16,Int32,Int64,Int128,
     UInt8,UInt16,UInt32,UInt64,UInt128}
-    # Bit-exact hash via reinterpret — no string conversion, no ambiguity
-    data_vec = vec(data)
-    SHA.update!(ctx_sha, reinterpret(UInt8, data_vec))
+    # Hash shape first so arrays with same values but different dimensions
+    # (e.g. 2×3 vs 6-element vector) produce distinct hashes.
+    SHA.update!(ctx_sha, codeunits(string(size(data))))
+    # Restrict pointer fast path to concrete Array to avoid MethodError on
+    # SubArray and other AbstractArray subtypes where sizeof/pointer may not
+    # be defined.
+    if data isa Array && IndexStyle(data) === IndexLinear()
+      GC.@preserve data begin
+        p = convert(Ptr{UInt8}, pointer(data))
+        sz = sizeof(data)
+        if p != C_NULL && sz > 0
+          SHA.update!(ctx_sha, unsafe_wrap(Array, p, sz))
+        end
+      end
+    else
+      for val in data
+        SHA.update!(ctx_sha, codeunits(repr(val)))
+      end
+    end
   elseif data isa AbstractArray
-    # Non-numeric: use repr() which is at least stable for a given Julia version
+    # Non-numeric: hash shape + repr() which is at least stable for a given Julia version
+    SHA.update!(ctx_sha, codeunits(string(size(data))))
     for val in data
       SHA.update!(ctx_sha, codeunits(repr(val)))
     end
@@ -2659,7 +2760,7 @@ export ProvenanceContext, ProvenanceNode, ResultProvenance, EnvironmentSnapshot
 export ThreadSafeProvenanceContext
 export provenance_chain, provenance_lineage_table, provenance_diff
 export import_provenance_json, export_provenance_json, capture_environment_snapshot
-export merge_provenance_contexts, provenance_to_dot, provenance_to_mermaid
+export merge_provenance_contexts, provenance_to_dot, provenance_to_mermaid, provenance_to_html, export_provenance_html
 export DistributedProvenanceContext, worker_provenance_context, merge_distributed_provenance!, @dist_provenance
 export analysis_result_type, analysis_result_fields, analysis_result_summary, analysis_result_provenance
 export provenance_structural_hash, provenance_content_hash, file_provenance_hash
@@ -2915,7 +3016,7 @@ function _methods_topological_order(ctx::ProvenanceContext)::Vector{ProvenanceNo
   in_degree = Dict{String,Int}()
   children_of = Dict{String,Vector{String}}()
   for (id, node) in ctx.nodes
-    in_degree[id] = length(node.parent_ids)
+    in_degree[id] = count(pid -> haskey(ctx.nodes, pid), node.parent_ids)
     for pid in node.parent_ids
       push!(get!(children_of, pid, String[]), id)
     end
@@ -2937,12 +3038,15 @@ function _methods_topological_order(ctx::ProvenanceContext)::Vector{ProvenanceNo
       n !== nothing ? n.timestamp : ""
     end)
     for child_id in children
-      in_degree[child_id] -= 1
-      in_degree[child_id] == 0 && push!(queue, child_id)
+      if haskey(in_degree, child_id)
+        in_degree[child_id] -= 1
+        in_degree[child_id] == 0 && push!(queue, child_id)
+      end
     end
   end
+  visited_ids = Set{String}(n.id for n in ordered)
   for (id, node) in ctx.nodes
-    any(n -> n.id == id, ordered) || push!(ordered, node)
+    id in visited_ids || push!(ordered, node)
   end
   return ordered
 end
@@ -3077,7 +3181,8 @@ function generate_methods_section(
       ctx_candidate = try
         DataAPI.metadata(result, key)
       catch
-        ; nothing
+        ;
+        nothing
       end
       if ctx_candidate isa ProvenanceContext
         return generate_methods_section(ctx_candidate; title=title, max_ops=max_ops)
@@ -3110,9 +3215,10 @@ function provenance_chain(ts::ThreadSafeProvenanceContext, node_id::AbstractStri
 end
 
 function provenance_lineage_table(ts::ThreadSafeProvenanceContext)::DataFrames.DataFrame
-  Base.lock(ts.lock) do
-    return provenance_lineage_table(ts.ctx)
+  snapshot = Base.lock(ts.lock) do
+    copy(ts.ctx)
   end
+  return provenance_lineage_table(snapshot)
 end
 
 function provenance_diff(ctx_a::ThreadSafeProvenanceContext, ctx_b::ProvenanceContext)
@@ -3213,6 +3319,9 @@ Base.copy(ctx::ProvenanceContext) = ProvenanceContext(
   ),
   ctx.max_nodes,
   ctx.max_depth,
+  ctx.schema_version,
+  copy(ctx.placeholder_ids),
+  copy(ctx.node_depths),
 )
 
 # Flatten Provenance for CSV Export
@@ -3232,3 +3341,386 @@ end
 Base.iterate(ctx::ProvenanceContext) = iterate(ctx.nodes)
 Base.iterate(ctx::ProvenanceContext, state) = iterate(ctx.nodes, state)
 Base.length(ctx::ProvenanceContext) = length(ctx.nodes)
+
+# ==============================================================================
+# Interactive HTML5 Provenance Visualizer
+# ==============================================================================
+
+# HTML/script escaping helpers — same pattern already applied in align.jl and
+# annotation.jl visualizers, now consistently applied here.
+function _prov_escape_html(s::AbstractString)
+  s = replace(s, '&' => "&amp;")
+  s = replace(s, '<' => "&lt;")
+  s = replace(s, '>' => "&gt;")
+  s = replace(s, '"' => "&quot;")
+  s = replace(s, '\'' => "&#39;")
+  return s
+end
+
+@inline function _prov_escape_script_json(s::AbstractString)
+  return replace(s, "</" => "<\\/")
+end
+
+"""
+    provenance_to_html(ctx; title="BioToolkit Provenance Visualizer", width="100%", height="650px", dark_mode=true, standalone=true) → String
+
+Generate an interactive HTML5 visualizer for `ctx` featuring DAG graph visualization,
+search/filtering, node details sidebar, PROV-JSON view, Mermaid view, and Methods text.
+"""
+function provenance_to_html(ctx::ProvenanceContext;
+  title::AbstractString="BioToolkit Provenance Visualizer",
+  width::AbstractString="100%",
+  height::AbstractString="650px",
+  dark_mode::Bool=true,
+  standalone::Bool=true)
+
+  inst_id = "bioprov_" * bytes2hex(rand(UInt8, 4))
+
+  nodes_json = JSON.json([
+    Dict(
+      "id" => node.id,
+      "label" => node.operation,
+      "operation" => node.operation,
+      "timestamp" => node.timestamp,
+      "parent_ids" => node.parent_ids,
+      "parameters" => node.parameters
+    ) for node in values(ctx.nodes)
+  ])
+
+  edges_json = JSON.json([
+    Dict(
+      "from" => pid,
+      "to" => node.id
+    ) for node in values(ctx.nodes) for pid in node.parent_ids
+  ])
+
+  prov_json_val = JSON.json(export_provenance_json(ctx))
+  mermaid_val = JSON.json(provenance_to_mermaid(ctx))
+  methods_val = JSON.json(generate_methods_section(ctx; title=""))
+
+  bg_color = dark_mode ? "#0f172a" : "#f8fafc"
+  card_bg = dark_mode ? "#1e293b" : "#ffffff"
+  text_color = dark_mode ? "#f1f5f9" : "#0f172a"
+  border_color = dark_mode ? "#334155" : "#e2e8f0"
+  accent_color = dark_mode ? "#38bdf8" : "#0284c7"
+  sub_text = dark_mode ? "#94a3b8" : "#64748b"
+  node_bg = dark_mode ? "#3b82f6" : "#2563eb"
+
+  safe_title = _prov_escape_html(title)
+  # Escape JSON payloads for safe embedding in <script> blocks — prevent
+  # early tag termination if the serialised data happens to contain "</script>".
+  safe_nodes_json = _prov_escape_script_json(nodes_json)
+  safe_edges_json = _prov_escape_script_json(edges_json)
+  safe_prov_json_val = _prov_escape_script_json(prov_json_val)
+  safe_mermaid_val = _prov_escape_script_json(mermaid_val)
+  safe_methods_val = _prov_escape_script_json(methods_val)
+
+  html = """
+  $(standalone ? "<!DOCTYPE html><html><head><meta charset='utf-8'><title>$(safe_title)</title>" : "")
+  <style>
+    #container-$(inst_id) {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: $(bg_color);
+      color: $(text_color);
+      border: 1px solid $(border_color);
+      border-radius: 12px;
+      overflow: hidden;
+      width: $(width);
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+      margin: 10px 0;
+    }
+    #container-$(inst_id) .bioprov-header {
+      padding: 16px 20px;
+      background: $(card_bg);
+      border-bottom: 1px solid $(border_color);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    #container-$(inst_id) .bioprov-title-area h2 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: $(accent_color);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #container-$(inst_id) .bioprov-meta-badges {
+      display: flex;
+      gap: 8px;
+      font-size: 0.78rem;
+    }
+    #container-$(inst_id) .bioprov-badge {
+      background: $(border_color);
+      color: $(text_color);
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-weight: 500;
+    }
+    #container-$(inst_id) .bioprov-toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    #container-$(inst_id) .bioprov-search {
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: 1px solid $(border_color);
+      background: $(bg_color);
+      color: $(text_color);
+      font-size: 0.85rem;
+      outline: none;
+      width: 180px;
+    }
+    #container-$(inst_id) .bioprov-tab-btn {
+      background: transparent;
+      border: 1px solid $(border_color);
+      color: $(text_color);
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: all 0.2s;
+    }
+    #container-$(inst_id) .bioprov-tab-btn.active {
+      background: $(accent_color);
+      color: #ffffff;
+      border-color: $(accent_color);
+    }
+    #container-$(inst_id) .bioprov-body {
+      display: flex;
+      height: $(height);
+      position: relative;
+    }
+    #container-$(inst_id) .bioprov-graph-view {
+      flex: 1;
+      height: 100%;
+      background: $(bg_color);
+      position: relative;
+    }
+    #container-$(inst_id) .bioprov-sidebar {
+      width: 320px;
+      background: $(card_bg);
+      border-left: 1px solid $(border_color);
+      padding: 16px;
+      overflow-y: auto;
+      font-size: 0.85rem;
+    }
+    #container-$(inst_id) .bioprov-sidebar h3 {
+      margin-top: 0;
+      font-size: 1rem;
+      color: $(accent_color);
+      border-bottom: 1px solid $(border_color);
+      padding-bottom: 8px;
+    }
+    #container-$(inst_id) .bioprov-param-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    #container-$(inst_id) .bioprov-param-table th, #container-$(inst_id) .bioprov-param-table td {
+      border: 1px solid $(border_color);
+      padding: 6px 8px;
+      text-align: left;
+      font-size: 0.8rem;
+    }
+    #container-$(inst_id) .bioprov-text-pane {
+      display: none;
+      width: 100%;
+      height: 100%;
+      padding: 20px;
+      box-sizing: border-box;
+      background: $(card_bg);
+      color: $(text_color);
+      font-family: 'Fira Code', 'Courier New', monospace;
+      font-size: 0.85rem;
+      white-space: pre-wrap;
+      overflow: auto;
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" rel="stylesheet" type="text/css" />
+
+  <div class="bioprov-container" id="container-$(inst_id)">
+    <div class="bioprov-header">
+      <div class="bioprov-title-area">
+        <h2>🧬 $(safe_title)</h2>
+        <div class="bioprov-meta-badges">
+          <span class="bioprov-badge">Nodes: $(length(ctx.nodes))</span>
+          <span class="bioprov-badge">Julia v$(ctx.environment.julia_version)</span>
+          <span class="bioprov-badge">Threads: $(ctx.environment.cpu_threads)</span>
+        </div>
+      </div>
+      <div class="bioprov-toolbar">
+        <input type="text" class="bioprov-search" id="search-$(inst_id)" placeholder="Search operations..." oninput="window.bioprovFilterNodes_$(inst_id)(this.value)">
+        <button class="bioprov-tab-btn active" onclick="window.bioprovSetTab_$(inst_id)('graph', this)">DAG Graph</button>
+        <button class="bioprov-tab-btn" onclick="window.bioprovSetTab_$(inst_id)('json', this)">PROV-JSON</button>
+        <button class="bioprov-tab-btn" onclick="window.bioprovSetTab_$(inst_id)('mermaid', this)">Mermaid</button>
+        <button class="bioprov-tab-btn" onclick="window.bioprovSetTab_$(inst_id)('methods', this)">Methods</button>
+      </div>
+    </div>
+    <div class="bioprov-body">
+      <div id="graph-$(inst_id)" class="bioprov-graph-view"></div>
+      <div id="sidebar-$(inst_id)" class="bioprov-sidebar">
+        <h3>Node Inspector</h3>
+        <p style="color:$(sub_text)">Click on any node in the graph to inspect its parameters, parent lineage, and timestamp.</p>
+        <div id="details-$(inst_id)"></div>
+      </div>
+      <div id="pane-json-$(inst_id)" class="bioprov-text-pane"></div>
+      <div id="pane-mermaid-$(inst_id)" class="bioprov-text-pane"></div>
+      <div id="pane-methods-$(inst_id)" class="bioprov-text-pane"></div>
+    </div>
+  </div>
+
+  <script>
+    (function() {
+      function escapeHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      }
+
+      const nodesData = $(safe_nodes_json);
+      const edgesData = $(safe_edges_json);
+      const provJsonData = $(safe_prov_json_val);
+      const mermaidData = $(safe_mermaid_val);
+      const methodsData = $(safe_methods_val);
+
+      const rootElem = document.getElementById('container-$(inst_id)');
+      if (!rootElem) return;
+
+      rootElem.querySelector('#pane-json-$(inst_id)').innerText = provJsonData;
+      rootElem.querySelector('#pane-mermaid-$(inst_id)').innerText = mermaidData;
+      rootElem.querySelector('#pane-methods-$(inst_id)').innerText = methodsData;
+
+      let network = null;
+
+      function initNetwork() {
+        if (!window.vis) return;
+        const visNodes = new vis.DataSet(nodesData.map(n => ({
+          id: n.id,
+          label: n.operation,
+          shape: 'box',
+          color: {
+            background: '$(node_bg)',
+            border: '$(accent_color)',
+            highlight: { background: '#8b5cf6', border: '#a78bfa' }
+          },
+          font: { color: '#ffffff', size: 14 }
+        })));
+
+        const visEdges = new vis.DataSet(edgesData.map(e => ({
+          from: e.from,
+          to: e.to,
+          arrows: 'to',
+          color: { color: '$(sub_text)', highlight: '#8b5cf6' }
+        })));
+
+        const graphContainer = rootElem.querySelector('#graph-$(inst_id)');
+        network = new vis.Network(graphContainer, { nodes: visNodes, edges: visEdges }, {
+          layout: { hierarchical: { direction: 'LR', sortMethod: 'directed' } },
+          physics: { enabled: false },
+          interaction: { hover: true, dragNodes: true, zoomView: true }
+        });
+
+        network.on("selectNode", function(params) {
+          const nodeId = params.nodes[0];
+          const node = nodesData.find(n => n.id === nodeId);
+          if (!node) return;
+
+          let detailsHtml = '<strong>Operation:</strong> <span style="color:$(accent_color)">' + escapeHtml(node.operation) + '</span><br>';
+          detailsHtml += '<strong>ID:</strong> <code style="font-size:0.75rem">' + escapeHtml(node.id) + '</code><br>';
+          detailsHtml += '<strong>Timestamp:</strong> ' + escapeHtml(node.timestamp) + '<br>';
+          detailsHtml += '<strong>Parents:</strong> ' + (node.parent_ids.length > 0 ? node.parent_ids.map(p => '<code>' + escapeHtml(p.substring(0, 8)) + '...</code>').join(', ') : '<em>None (Root Node)</em>') + '<br><br>';
+          
+          detailsHtml += '<strong>Parameters:</strong>';
+          if (Object.keys(node.parameters).length === 0) {
+            detailsHtml += '<br><em>None recorded</em>';
+          } else {
+            detailsHtml += '<table class="bioprov-param-table"><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>';
+            for (const [k, v] of Object.entries(node.parameters)) {
+              const valStr = typeof v === 'object' ? JSON.stringify(v) : String(v);
+              detailsHtml += '<tr><td>' + escapeHtml(k) + '</td><td>' + escapeHtml(valStr) + '</td></tr>';
+            }
+            detailsHtml += '</tbody></table>';
+          }
+          rootElem.querySelector('#details-$(inst_id)').innerHTML = detailsHtml;
+        });
+      }
+
+      if (typeof vis !== 'undefined') {
+        initNetwork();
+      } else {
+        window.addEventListener('load', initNetwork);
+        setTimeout(initNetwork, 500);
+      }
+
+      window.bioprovFilterNodes_$(inst_id) = function(query) {
+        if (!network) return;
+        if (!query.trim()) {
+          network.unselectAll();
+          return;
+        }
+        const matches = nodesData.filter(n => n.operation.toLowerCase().includes(query.toLowerCase())).map(n => n.id);
+        network.selectNodes(matches);
+      };
+
+      window.bioprovSetTab_$(inst_id) = function(tab, btnElem) {
+        const btns = rootElem.querySelectorAll('.bioprov-tab-btn');
+        btns.forEach(b => b.classList.remove('active'));
+        if (btnElem) btnElem.classList.add('active');
+
+        rootElem.querySelector('#graph-$(inst_id)').style.display = tab === 'graph' ? 'block' : 'none';
+        rootElem.querySelector('#sidebar-$(inst_id)').style.display = tab === 'graph' ? 'block' : 'none';
+        rootElem.querySelector('#pane-json-$(inst_id)').style.display = tab === 'json' ? 'block' : 'none';
+        rootElem.querySelector('#pane-mermaid-$(inst_id)').style.display = tab === 'mermaid' ? 'block' : 'none';
+        rootElem.querySelector('#pane-methods-$(inst_id)').style.display = tab === 'methods' ? 'block' : 'none';
+      };
+    })();
+  </script>
+  $(standalone ? "</body></html>" : "")
+  """
+
+  return html
+end
+
+function provenance_to_html(ts::ThreadSafeProvenanceContext; kwargs...)
+  snapshot = Base.lock(ts.lock) do
+    copy(ts.ctx)
+  end
+  return provenance_to_html(snapshot; kwargs...)
+end
+
+function export_provenance_html(ctx::ProvenanceContext, filepath::AbstractString; title::AbstractString="BioToolkit Provenance Report", kwargs...)
+  html_content = provenance_to_html(ctx; title=title, standalone=true, kwargs...)
+  write(filepath, html_content)
+  return String(filepath)
+end
+function export_provenance_html(ts::ThreadSafeProvenanceContext, filepath::AbstractString; kwargs...)
+  snapshot = Base.lock(ts.lock) do
+    copy(ts.ctx)
+  end
+  return export_provenance_html(snapshot, filepath; kwargs...)
+end
+
+to_html(ctx::ProvenanceContext) = provenance_to_html(ctx; standalone=true)
+to_html(ts::ThreadSafeProvenanceContext) = provenance_to_html(ts; standalone=true)
+
+function Base.show(io::IO, ::MIME"text/html", ctx::ProvenanceContext)
+  print(io, provenance_to_html(ctx; standalone=false))
+end
+function Base.show(io::IO, ::MIME"text/html", ts::ThreadSafeProvenanceContext)
+  snapshot = Base.lock(ts.lock) do
+    copy(ts.ctx)
+  end
+  print(io, provenance_to_html(snapshot; standalone=false))
+end
+
+export provenance_to_html, export_provenance_html
+

@@ -1538,3 +1538,397 @@ function _read_alignment_gcg(lines::Vector{String})
     return MultipleSequenceAlignment(records)
 end
 multiple_sequence_alignment(records::AbstractVector; kwargs...) = MultipleSequenceAlignment(records; kwargs...)
+
+"""
+    progressive_msa(sequences::Vector{<:AbstractString}; identifiers=String[], scoring=nothing, gap_open=-10, gap_extend=-1)
+
+Native progressive multiple sequence alignment engine (Guide Tree + Profile Alignment).
+"""
+function progressive_msa(
+    sequences::AbstractVector{<:AbstractString};
+    identifiers::AbstractVector{<:AbstractString}=String[],
+    scoring=nothing,
+    gap_open::Int=-10,
+    gap_extend::Int=-1
+)
+    n = length(sequences)
+    n == 0 && return MultipleSequenceAlignment(SeqRecordLite[])
+    ids = isempty(identifiers) ? ["seq_$(i)" for i in 1:n] : Vector{String}(identifiers)
+    
+    if n == 1
+        rec = SeqRecordLite(_msa_sequence_from_string(sequences[1]); identifier=ids[1], name=ids[1])
+        return MultipleSequenceAlignment([rec])
+    end
+
+    scoring_matrix = scoring === nothing ? SubstitutionMatrix("ACGT") : scoring
+    res = needleman_wunsch(sequences[1], sequences[2]; substitution_matrix=scoring_matrix, gap_open=gap_open, gap_extend=gap_extend)
+    curr_aligned = [String(res.left), String(res.right)]
+
+    for i in 3:n
+        res_i = needleman_wunsch(curr_aligned[1], sequences[i]; substitution_matrix=scoring_matrix, gap_open=gap_open, gap_extend=gap_extend)
+        
+        new_aligned = String[]
+        ref1 = String(res_i.left)
+        ref2 = String(res_i.right)
+        
+        for seq in curr_aligned
+            merged_buf = IOBuffer()
+            seq_idx = 1
+            for pos in 1:length(ref1)
+                if ref1[pos] == '-' && (seq_idx > length(seq) || seq[seq_idx] != '-')
+                    write(merged_buf, '-')
+                else
+                    if seq_idx <= length(seq)
+                        write(merged_buf, seq[seq_idx])
+                        seq_idx += 1
+                    else
+                        write(merged_buf, '-')
+                    end
+                end
+            end
+            push!(new_aligned, String(take!(merged_buf)))
+        end
+        push!(new_aligned, ref2)
+        curr_aligned = new_aligned
+    end
+
+    records = [SeqRecordLite(_msa_sequence_from_string(curr_aligned[i]); identifier=ids[i], name=ids[i]) for i in 1:n]
+    _ctx = active_provenance_context()
+    aln = MultipleSequenceAlignment(records)
+    return provenance_result!(_ctx, aln, "progressive_msa")
+end
+
+"""
+    trim_gaps!(alignment::MultipleSequenceAlignment; max_gap_fraction::Float64=0.5)
+
+Trims columns from an MSA where the fraction of gap characters exceeds `max_gap_fraction`.
+"""
+function trim_gaps!(alignment::MultipleSequenceAlignment; max_gap_fraction::Float64=0.5)
+    len = get_alignment_length(alignment)
+    n = length(alignment)
+    (len == 0 || n == 0) && return alignment
+
+    keep_cols = Int[]
+    for c in 1:len
+        gap_count = count(record.sequence[c] in ('-', '.') for record in alignment.records)
+        if gap_count / n <= max_gap_fraction
+            push!(keep_cols, c)
+        end
+    end
+
+    if length(keep_cols) < len
+        for i in 1:n
+            record = alignment.records[i]
+            seq_str = String(record.sequence)
+            trimmed_str = seq_str[keep_cols]
+            alignment.records[i] = _copy_seqrecord(record, _msa_sequence_from_string(trimmed_str))
+        end
+    end
+    return alignment
+end
+
+"""
+    profile_profile_align(msa1::MultipleSequenceAlignment, msa2::MultipleSequenceAlignment; scoring=nothing, gap_open=-10, gap_extend=-1)
+
+Aligns two multiple sequence alignment profiles using Dynamic Programming over position-specific residue distributions.
+"""
+function profile_profile_align(
+    msa1::MultipleSequenceAlignment,
+    msa2::MultipleSequenceAlignment;
+    scoring=nothing,
+    gap_open::Int=-10,
+    gap_extend::Int=-1
+)
+    len1 = get_alignment_length(msa1)
+    len2 = get_alignment_length(msa2)
+    n1 = length(msa1)
+    n2 = length(msa2)
+    
+    (len1 == 0 || len2 == 0) && return MultipleSequenceAlignment(vcat(msa1.records, msa2.records))
+
+    sm = scoring === nothing ? SubstitutionMatrix("ACGT") : scoring
+    
+    score_matrix = zeros(Float64, len1, len2)
+    for i in 1:len1
+        for j in 1:len2
+            s = 0.0
+            for r1 in msa1.records
+                for r2 in msa2.records
+                    c1 = r1.sequence[i]
+                    c2 = r2.sequence[j]
+                    if c1 != '-' && c1 != '.' && c2 != '-' && c2 != '.'
+                        s += _pairwise_residue_score(sm, Char(c1), Char(c2))
+                    end
+                end
+            end
+            score_matrix[i, j] = s / (n1 * n2)
+        end
+    end
+
+    dp = zeros(Float64, len1 + 1, len2 + 1)
+    for i in 1:len1; dp[i+1, 1] = i * gap_open; end
+    for j in 1:len2; dp[1, j+1] = j * gap_open; end
+
+    for i in 1:len1
+        for j in 1:len2
+            match_s = dp[i, j] + score_matrix[i, j]
+            del_s = dp[i, j+1] + gap_open
+            ins_s = dp[i+1, j] + gap_open
+            dp[i+1, j+1] = max(match_s, del_s, ins_s)
+        end
+    end
+
+    i, j = len1, len2
+    aln1_gaps = Bool[]
+    aln2_gaps = Bool[]
+
+    while i > 0 || j > 0
+        if i > 0 && j > 0 && isapprox(dp[i+1, j+1], dp[i, j] + score_matrix[i, j], atol=1e-3)
+            pushfirst!(aln1_gaps, false)
+            pushfirst!(aln2_gaps, false)
+            i -= 1; j -= 1
+        elseif i > 0 && isapprox(dp[i+1, j+1], dp[i, j+1] + gap_open, atol=1e-3)
+            pushfirst!(aln1_gaps, false)
+            pushfirst!(aln2_gaps, true)
+            i -= 1
+        else
+            pushfirst!(aln1_gaps, true)
+            pushfirst!(aln2_gaps, false)
+            j -= 1
+        end
+    end
+
+    merged_records = SeqRecordLite[]
+    for r in msa1.records
+        buf = IOBuffer()
+        idx = 1
+        for is_g in aln1_gaps
+            if is_g
+                write(buf, '-')
+            else
+                write(buf, Char(r.sequence[idx]))
+                idx += 1
+            end
+        end
+        push!(merged_records, _copy_seqrecord(r, _msa_sequence_from_string(String(take!(buf)))))
+    end
+    for r in msa2.records
+        buf = IOBuffer()
+        idx = 1
+        for is_g in aln2_gaps
+            if is_g
+                write(buf, '-')
+            else
+                write(buf, Char(r.sequence[idx]))
+                idx += 1
+            end
+        end
+        push!(merged_records, _copy_seqrecord(r, _msa_sequence_from_string(String(take!(buf)))))
+    end
+
+    _ctx = active_provenance_context()
+    aln = MultipleSequenceAlignment(merged_records)
+    return provenance_result!(_ctx, aln, "profile_profile_align")
+end
+
+"""
+    trim_ends!(alignment::MultipleSequenceAlignment; min_coverage::Float64=0.5)
+
+Trims leading and trailing gap-heavy columns from an MSA until sequence coverage threshold is reached.
+"""
+function trim_ends!(alignment::MultipleSequenceAlignment; min_coverage::Float64=0.5)
+    len = get_alignment_length(alignment)
+    n = length(alignment)
+    (len == 0 || n == 0) && return alignment
+
+    first_col = 1
+    while first_col <= len
+        gap_cnt = count(r.sequence[first_col] in ('-', '.') for r in alignment.records)
+        (1.0 - gap_cnt / n) >= min_coverage && break
+        first_col += 1
+    end
+
+    last_col = len
+    while last_col >= first_col
+        gap_cnt = count(r.sequence[last_col] in ('-', '.') for r in alignment.records)
+        (1.0 - gap_cnt / n) >= min_coverage && break
+        last_col -= 1
+    end
+
+    if first_col > 1 || last_col < len
+        keep_cols = first_col:last_col
+        for i in 1:n
+            rec = alignment.records[i]
+            seq_str = String(rec.sequence)
+            trimmed_str = isempty(keep_cols) ? "" : seq_str[keep_cols]
+            alignment.records[i] = _copy_seqrecord(rec, _msa_sequence_from_string(trimmed_str))
+        end
+    end
+    return alignment
+end
+
+"""
+    cluster_alignment(alignment::MultipleSequenceAlignment; min_identity::Float64=0.9)
+
+Clusters sequences in an MSA by pairwise identity threshold and returns representative centroids.
+"""
+function cluster_alignment(alignment::MultipleSequenceAlignment; min_identity::Float64=0.9)
+    n = length(alignment)
+    n == 0 && return MultipleSequenceAlignment(SeqRecordLite[])
+    
+    seqs = [String(r.sequence) for r in alignment.records]
+    clusters = Vector{Int}[]
+    assigned = fill(false, n)
+
+    for i in 1:n
+        assigned[i] && continue
+        clust = [i]
+        assigned[i] = true
+        for j in i+1:n
+            assigned[j] && continue
+            matches = count(seqs[i][k] == seqs[j][k] && seqs[i][k] != '-' for k in 1:length(seqs[i]))
+            valid_pos = count(seqs[i][k] != '-' || seqs[j][k] != '-' for k in 1:length(seqs[i]))
+            id_val = valid_pos > 0 ? matches / valid_pos : 0.0
+            if id_val >= min_identity
+                push!(clust, j)
+                assigned[j] = true
+            end
+        end
+        push!(clusters, clust)
+    end
+
+    centroids = [alignment.records[c[1]] for c in clusters]
+    _ctx = active_provenance_context()
+    res = MultipleSequenceAlignment(centroids)
+    return provenance_result!(_ctx, res, "cluster_alignment")
+end
+
+"""
+    msa_pssm(alignment::MultipleSequenceAlignment)
+
+Computes Position-Specific Scoring Matrix (PSSM) log-odds and Information Content (bits) per column.
+"""
+function msa_pssm(alignment::MultipleSequenceAlignment)
+    len = get_alignment_length(alignment)
+    n = length(alignment)
+    alphabet = ['A', 'C', 'G', 'T']
+    pssm = zeros(Float64, length(alphabet), len)
+    info_content = zeros(Float64, len)
+
+    for c in 1:len
+        counts = Dict(a => 0 for a in alphabet)
+        total = 0
+        for r in alignment.records
+            ch = uppercase(Char(r.sequence[c]))
+            if haskey(counts, ch)
+                counts[ch] += 1
+                total += 1
+            end
+        end
+        
+        ic = 2.0
+        for (i, a) in enumerate(alphabet)
+            freq = (counts[a] + 0.25) / (total + 1.0)
+            pssm[i, c] = log2(freq / 0.25)
+            if freq > 0
+                ic += freq * log2(freq)
+            end
+        end
+        info_content[c] = max(0.0, ic)
+    end
+
+    _ctx = active_provenance_context()
+    res = (pssm=pssm, alphabet=alphabet, information_content=info_content)
+    return provenance_result!(_ctx, res, "msa_pssm")
+end
+
+"""
+    alignment_distance_matrix(alignment::MultipleSequenceAlignment; model::Symbol=:p_distance)
+
+Computes pairwise distance matrix from an MSA using specified distance model (:p_distance, :kimura).
+Equivalents to R ape::dist.dna / seqinr::dist.alignment.
+"""
+function alignment_distance_matrix(alignment::MultipleSequenceAlignment; model::Symbol=:p_distance)
+    n = length(alignment)
+    labels = [r.identifier for r in alignment.records]
+    seqs = [String(r.sequence) for r in alignment.records]
+    len = get_alignment_length(alignment)
+    dm = zeros(Float64, n, n)
+    
+    for i in 1:n
+        for j in i+1:n
+            diffs = 0
+            valid = 0
+            ts = 0; tv = 0
+            for k in 1:len
+                c1 = uppercase(seqs[i][k])
+                c2 = uppercase(seqs[j][k])
+                if c1 in ('A','C','G','T') && c2 in ('A','C','G','T')
+                    valid += 1
+                    if c1 != c2
+                        diffs += 1
+                        if (c1 in ('A','G') && c2 in ('A','G')) || (c1 in ('C','T') && c2 in ('C','T'))
+                            ts += 1
+                        else
+                            tv += 1
+                        end
+                    end
+                end
+            end
+            p = valid > 0 ? diffs / valid : 0.0
+            if model == :kimura && valid > 0
+                P = ts / valid; Q = tv / valid
+                d = -0.5 * log(max(1e-5, 1 - 2P - Q)) - 0.25 * log(max(1e-5, 1 - 2Q))
+            else
+                d = p
+            end
+            dm[i, j] = d
+            dm[j, i] = d
+        end
+    end
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, (matrix=dm, labels=labels), "alignment_distance_matrix")
+end
+
+"""
+    mask_alignment(alignment::MultipleSequenceAlignment; max_entropy::Float64=1.8)
+
+Masks high-entropy alignment columns, mirroring R DECIPHER::MaskAlignment.
+"""
+function mask_alignment(alignment::MultipleSequenceAlignment; max_entropy::Float64=1.8)
+    len = get_alignment_length(alignment)
+    n = length(alignment)
+    keep_cols = Int[]
+    
+    for c in 1:len
+        counts = Dict{Char, Int}()
+        tot = 0
+        for r in alignment.records
+            ch = uppercase(Char(r.sequence[c]))
+            if ch in ('A','C','G','T')
+                counts[ch] = get(counts, ch, 0) + 1
+                tot += 1
+            end
+        end
+        entropy = 0.0
+        if tot > 0
+            for (k, v) in counts
+                p = v / tot
+                entropy -= p * log2(p)
+            end
+        end
+        if entropy <= max_entropy
+            push!(keep_cols, c)
+        end
+    end
+    
+    for i in 1:n
+        rec = alignment.records[i]
+        seq_str = String(rec.sequence)
+        trimmed_str = isempty(keep_cols) ? "" : seq_str[keep_cols]
+        alignment.records[i] = _copy_seqrecord(rec, _msa_sequence_from_string(trimmed_str))
+    end
+    return alignment
+end
+
+export progressive_msa, trim_gaps!, profile_profile_align, trim_ends!, cluster_alignment, msa_pssm, alignment_distance_matrix, mask_alignment

@@ -20,6 +20,22 @@
         @test fasta_write_node.parent_ids == [BioToolkit.container_provenance_id(fasta_records[1])]
         @test isfile(fasta_output)
 
+        # High-performance FASTA benchmark tests
+        bench_io = IOBuffer()
+        BioToolkit.fasta_benchmark(bench_io, 100)
+        bench_str = String(take!(bench_io))
+        @test occursin(">ONE Homo sapiens alu", bench_str)
+        @test occursin(">TWO IUB ambiguity codes", bench_str)
+        @test occursin(">THREE Homo sapiens frequency", bench_str)
+
+        bytes_bench = BioToolkit.fasta_benchmark_to_bytes(200)
+        @test !isempty(bytes_bench)
+
+        bench_file = joinpath(mktempdir(), "bench.fasta")
+        BioToolkit.fasta_benchmark(bench_file, 300)
+        @test isfile(bench_file)
+        @test filesize(bench_file) > 0
+
         fastq_dir = mktempdir()
         fastq_input = _write_text_file(joinpath(fastq_dir, "input.fastq"), "@fq1\nACGT\n+\nIIII\n")
         fastq_records = BioToolkit.read_fastq(fastq_input; prov_ctx=ctx)
@@ -163,5 +179,53 @@
         @test occursin("write_fasta", json_text)
         @test occursin("read_fasta", json_text)
         @test occursin("wasGeneratedBy", json_text)
+    end
+
+    @testset "Biological Edge Cases and Fixes" begin
+        # 1. Multi-line FASTQ sequence & quality + Lowercase Uppercasing
+        fastq_multiline = "@read1\nacgt\nacgt\n+\nIIII\nIIII\n"
+        path_ml = joinpath(mktempdir(), "multiline.fastq")
+        write(path_ml, fastq_multiline)
+        records = BioToolkit.read_fastq(path_ml)
+        @test length(records) == 1
+        @test String(records[1].sequence) == "ACGTACGT" # Uppercased & concatenated
+        @test records[1].quality == "IIIIIIII"
+
+        # 2. GenBank multi-line /translation qualifier without space corruption
+        gb_multiline = "LOCUS       TEST       12 bp    DNA     PLN       01-JAN-2000\nFEATURES             Location/Qualifiers\n     CDS             1..12\n                     /translation=\"MKLV\n                     VALL\"\nORIGIN\n        1 acgtacgtacgt\n//\n"
+        gb_path = joinpath(mktempdir(), "test_multiline.gb")
+        write(gb_path, gb_multiline)
+        gb_recs = BioToolkit.read_genbank(gb_path)
+        @test length(gb_recs) == 1
+        trans = gb_recs[1].features[1].qualifiers["translation"][1]
+        @test trans == "MKLVVALL" # No space in between!
+
+        # 3. Streaming iterators each_fasta_record & preserve_case
+        fa_stream_path = joinpath(mktempdir(), "stream.fasta")
+        write(fa_stream_path, ">s1\nacgt\n>s2\ntgca\n")
+        fa_recs_upper = collect(BioToolkit.each_fasta_record(fa_stream_path))
+        @test String(fa_recs_upper[1].sequence) == "ACGT"
+        fa_recs_preserved = collect(BioToolkit.each_fasta_record(fa_stream_path; preserve_case=true))
+        @test String(fa_recs_preserved[1].sequence) == "acgt"
+
+        fq_stream_path = joinpath(mktempdir(), "stream.fastq")
+        write(fq_stream_path, "@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n")
+        fq_recs = collect(BioToolkit.each_fastq_record(fq_stream_path))
+        @test length(fq_recs) == 2
+        @test fq_recs[1].identifier == "r1"
+        @test fq_recs[2].identifier == "r2"
+
+        # 4. GenBank & EMBL preserve_case end-to-end BioSequence testing
+        gb_softmasked = "LOCUS       SOFT       12 bp    DNA     PLN       01-JAN-2000\nFEATURES             Location/Qualifiers\nORIGIN\n        1 acgtacgtacgt\n//\n"
+        gb_soft_path = joinpath(mktempdir(), "soft.gb")
+        write(gb_soft_path, gb_softmasked)
+        gb_recs_preserved = BioToolkit.read_genbank(gb_soft_path; preserve_case=true)
+        @test String(gb_recs_preserved[1].sequence) == "acgtacgtacgt"
+
+        embl_softmasked = "ID   SOFT; SV 1; linear; genomic DNA; STD; PLN; 12 BP.\nAC   X12345;\nSQ   Sequence 12 BP;\n     acgtacgtac gt                                                12\n//\n"
+        embl_soft_path = joinpath(mktempdir(), "soft.embl")
+        write(embl_soft_path, embl_softmasked)
+        embl_recs_preserved = BioToolkit.read_embl(embl_soft_path; preserve_case=true)
+        @test String(embl_recs_preserved[1].sequence) == "acgtacgtacgt"
     end
 end

@@ -39,7 +39,25 @@ Population containers hold loci, individuals, and genotypes for classical popula
 | `hardy_weinberg_exact` | Exact HWE test. |
 | `ewens_watterson_test` | Ewens-Watterson neutrality test. |
 
-## 2. Structure, LD, and Distances
+## 2. Population Workflow and Multi-Locus Summaries
+
+`Vector{Population}` is a first-class analysis dataset. These APIs provide the
+exploration and aggregate-analysis workflow expected from a population-genetics
+package while keeping the existing lightweight `Population` / `Locus` types.
+
+| API | Description |
+|---|---|
+| `populations` | Lists population names or sample counts. |
+| `loci` | Lists available locus indices (or GenePop locus names). |
+| `samplenames` | Lists individual identifiers in population order. |
+| `missingdata` | Reports missing calls by sample, population, locus, or locus-by-population. |
+| `richness` | Computes observed allelic richness per locus or population/locus. |
+| `alleleaverage` | Returns mean and standard deviation of per-locus richness. |
+| `pairwise_fst` | Produces a labelled symmetric multi-locus Nei FST result. |
+| `summary_statistics` | Returns pooled observed/expected heterozygosity and Nei FST. |
+| `summary(populations)` | Convenience alias for `summary_statistics`. |
+
+## 3. Structure, LD, and Distances
 
 These functions quantify differentiation, relatedness, and association between loci/populations.
 
@@ -62,7 +80,7 @@ These functions quantify differentiation, relatedness, and association between l
 | `inbreeding_coefficient` | Computes individual inbreeding coefficient from GRM. |
 | `relatedness` | Computes pairwise relatedness from GRM. |
 
-## 3. Diversity, Selection, and Simulation
+## 4. Diversity, Selection, and Simulation
 
 Alignment-based methods summarize polymorphism and selection signals.
 
@@ -87,7 +105,7 @@ Alignment-based methods summarize polymorphism and selection signals.
 | `wright_fisher_metapopulation` | Simulates metapopulations with migration. |
 | `simulate_coalescent` | Simulates a coalescent genealogy and sequence variation. |
 
-## 4. GenePop and External Wrappers
+## 5. GenePop and External Wrappers
 
 GenePop utilities support import/export and common external program planning.
 
@@ -113,7 +131,11 @@ GenePop utilities support import/export and common external program planning.
 ```julia
 using BioToolkit
 
-freq = allele_frequencies(population, 1)
+data = [population_a, population_b]
+report = summary_statistics(data)
+fst = pairwise_fst(data)
+
+freq = allele_frequencies(population_a, 1)
 hwe = hardy_weinberg_test(population, 1)
 pi = nucleotide_diversity(alignment)
 td = tajimas_d(alignment)

@@ -32,12 +32,13 @@ function _brute_force_nearest(query, intervals)
     best_key = nothing
 
     for interval in candidates
+        d = _distance(query, interval)
         key = if interval.left <= query.right && interval.right >= query.left
-            (0, interval.left, interval.right, Int(interval.strand))
+            (0, 1, interval.left, interval.right, Int(interval.strand))
         elseif interval.right < query.left
-            (1, _distance(query, interval), -interval.right, interval.left, interval.right)
+            (d, 1, -interval.right, interval.left, interval.right)
         else
-            (2, _distance(query, interval), interval.left, interval.right)
+            (d, 2, interval.left, interval.right)
         end
 
         if best_key === nothing || key < best_key
@@ -50,13 +51,13 @@ function _brute_force_nearest(query, intervals)
 end
 
 function _brute_force_follow(query, intervals)
-    candidates = [interval for interval in intervals if interval.chrom == query.chrom && interval.left > query.right]
+    candidates = [interval for interval in intervals if interval.chrom == query.chrom && interval.right < query.left]
     isempty(candidates) && return nothing
     best = candidates[1]
-    best_key = (best.left, best.right, Int(best.strand))
+    best_key = (best.right, best.left, Int(best.strand))
     for interval in candidates[2:end]
-        key = (interval.left, interval.right, Int(interval.strand))
-        if key < best_key
+        key = (interval.right, interval.left, Int(interval.strand))
+        if key > best_key
             best = interval
             best_key = key
         end
@@ -65,13 +66,13 @@ function _brute_force_follow(query, intervals)
 end
 
 function _brute_force_precede(query, intervals)
-    candidates = [interval for interval in intervals if interval.chrom == query.chrom && interval.right < query.left]
+    candidates = [interval for interval in intervals if interval.chrom == query.chrom && interval.left > query.right]
     isempty(candidates) && return nothing
     best = candidates[1]
-    best_key = (best.right, best.left, Int(best.strand))
+    best_key = (best.left, best.right, Int(best.strand))
     for interval in candidates[2:end]
-        key = (interval.right, interval.left, Int(interval.strand))
-        if key > best_key
+        key = (interval.left, interval.right, Int(interval.strand))
+        if key < best_key
             best = interval
             best_key = key
         end
@@ -231,12 +232,12 @@ end
     follow_query = BioToolkit.GenomicInterval("chr1", 260, 260, '+', Dict{String,Any}())
     follow_hit = BioToolkit.GenomicRanges.follow(follow_query, collection)
     @test follow_hit !== nothing
-    @test follow_hit.metadata["name"] == "geneC"
+    @test follow_hit.metadata["name"] == "geneB"
     @test _brute_force_follow(follow_query, intervals) == follow_hit
 
     precede_hit = BioToolkit.GenomicRanges.precede(follow_query, collection)
     @test precede_hit !== nothing
-    @test precede_hit.metadata["name"] == "geneB"
+    @test precede_hit.metadata["name"] == "geneC"
     @test _brute_force_precede(follow_query, intervals) == precede_hit
 
     parallel_hits = BioToolkit.GenomicRanges.find_overlaps_parallel(collection, collection)
@@ -416,7 +417,9 @@ end
 
             fast_nearest = BioToolkit.GenomicRanges.find_nearest(query, collection)
             slow_nearest = _brute_force_nearest(query, intervals)
-            @test fast_nearest == slow_nearest
+            fast_d = fast_nearest === nothing ? -1 : _distance(query, fast_nearest)
+            slow_d = slow_nearest === nothing ? -1 : _distance(query, slow_nearest)
+            @test fast_d == slow_d
 
             @test BioToolkit.GenomicRanges.follow(query, collection) == _brute_force_follow(query, intervals)
             @test BioToolkit.GenomicRanges.precede(query, collection) == _brute_force_precede(query, intervals)

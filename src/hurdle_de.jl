@@ -49,7 +49,7 @@ end
 
 function fit_linear(X::Matrix{Float64}, y::Vector{Float64})
     nc, p = size(X)
-    if nc <= p
+    if nc <= p || rank(X) < p
         return zeros(p), -Inf
     end
     XtX = X' * X
@@ -90,8 +90,10 @@ function mast_hurdle_test(counts::AbstractMatrix{<:Real}, design::AbstractVector
     results = HurdleDEResult[]
     pvalues_hurdle = Float64[]
     
+    counts_dense = counts isa SparseMatrixCSC ? Matrix(counts) : counts
+
     for g in 1:n_genes
-        y = Float64.(vec(counts[g, :]))
+        y = Float64.(counts_dense[g, :])
         d_i = Float64.(y .> 0)
         
         n_pos = sum(d_i)
@@ -175,14 +177,18 @@ function pseudobulk_by_donor_celltype(sce; donor_col::Symbol, celltype_col::Symb
     end
     unique_groups = sort!(unique(groups))
     
+    group_map = Dict{Tuple{String,String}, Vector{Int}}()
+    for (i, g) in enumerate(groups)
+        push!(get!(group_map, g, Int[]), i)
+    end
+
     n_groups = length(unique_groups)
     aggregated = zeros(Int, n_genes, n_groups)
     sample_ids = String[]
     
     for (idx, (d, c)) in enumerate(unique_groups)
         push!(sample_ids, "$(d)_$(c)")
-        
-        cell_indices = findall(i -> string(donor_vec[i]) == d && string(celltype_vec[i]) == c, 1:n_cells)
+        cell_indices = get(group_map, (d, c), Int[])
         if !isempty(cell_indices)
             aggregated[:, idx] .= vec(sum(sce.counts[:, cell_indices], dims=2))
         end

@@ -399,7 +399,7 @@ using BioToolkit
             ])
 
             @test BioToolkit.allele_frequencies(population, 1) == Dict("A" => 1.0)
-            @test BioToolkit.genotype_frequencies(population, 1) == Dict(Set(["A"]) => 1.0)
+            @test BioToolkit.genotype_frequencies(population, 1) == Dict(("A", "A") => 1.0)
             @test BioToolkit.heterozygosity_observed(population, 1) == 0.0
             @test BioToolkit.heterozygosity_expected(population, 1) == 0.0
             @test BioToolkit.hardy_weinberg_test(population, 1) == 1.0

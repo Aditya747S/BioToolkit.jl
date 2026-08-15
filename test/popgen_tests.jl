@@ -18,7 +18,8 @@ using LinearAlgebra
         @test f1[2] == 0.5
         
         g1 = genotype_frequencies(pop, 1)
-        @test g1[Set([1, 2])] == 1.0
+        @test length(g1) == 1
+        @test only(values(g1)) == 1.0
     end
 
     @testset "Heterozygosity" begin
@@ -202,6 +203,157 @@ end
     p_vals = linear_mixed_model_scan(genos, phenos, G)
     @test length(p_vals) == 1
     @test 0.0 <= p_vals[1] <= 1.0
+end
+
+@testset "PopGen correctness regressions" begin
+    missing_pop = Population{Int}("missing", [
+        PopGenIndividual{Int}("a", [Locus{Int}((1, 2))]),
+        PopGenIndividual{Int}("b", [Locus{Int}((0, 0))]),
+        PopGenIndividual{Int}("c", [Locus{Int}((2, 1))])
+    ])
+    frequencies = allele_frequencies(missing_pop, 1)
+    @test frequencies == Dict(1 => 0.5, 2 => 0.5)
+    @test heterozygosity_observed(missing_pop, 1) == 1.0
+    @test_throws ArgumentError allele_frequencies(missing_pop, 0)
+
+    # Exact HWE remains finite for samples where direct probability products underflow.
+    large_hwe = Population{Int}("large", vcat(
+        [PopGenIndividual{Int}("aa", [Locus{Int}((1, 1))]) for _ in 1:600],
+        [PopGenIndividual{Int}("bb", [Locus{Int}((2, 2))]) for _ in 1:600]))
+    @test 0.0 <= hardy_weinberg_exact(large_hwe, 1) <= 1.0
+
+    unphased = Population{Int}("unphased", [
+        PopGenIndividual{Int}("u$(i)", [Locus{Int}((1, 2)), Locus{Int}((1, 2))]) for i in 1:20])
+    @test linkage_disequilibrium(unphased, 1, 2)[3] < 1e-10
+
+    p_a = Population{Int}("a", [PopGenIndividual{Int}("a", [Locus{Int}((1, 1))])])
+    p_b = Population{Int}("b", [PopGenIndividual{Int}("b", [Locus{Int}((2, 2))])])
+    @test genetic_distance(p_a, p_b, 1, method=:rogers) == 1.0
+    @test genetic_distance(p_a, p_b, 1, method=:nei) == Inf
+    @test_throws ArgumentError genetic_distance(p_a, p_b, 1, method=:unknown)
+    @test_throws ArgumentError population_pcoa([0.0 1.0; 2.0 0.0])
+end
+
+@testset "Population workflow parity" begin
+    pa = Population{Int}("A", [
+        PopGenIndividual{Int}("a1", [Locus{Int}((1, 1)), Locus{Int}((1, 2))]),
+        PopGenIndividual{Int}("a2", [Locus{Int}((1, 1)), Locus{Int}((0, 0))])
+    ])
+    pb = Population{Int}("B", [
+        PopGenIndividual{Int}("b1", [Locus{Int}((2, 2)), Locus{Int}((2, 2))]),
+        PopGenIndividual{Int}("b2", [Locus{Int}((2, 2)), Locus{Int}((2, 2))])
+    ])
+    data = [pa, pb]
+    @test populations(data) == ["A", "B"]
+    @test populations(data; counts=true) == Dict("A" => 2, "B" => 2)
+    @test loci(data) == [1, 2]
+    @test samplenames(data) == ["a1", "a2", "b1", "b2"]
+    @test missingdata(data; by=:sample)[2].missing == 1
+    @test missingdata(data; by=:population)[1].missing == 1
+    @test richness(data; by=:locus)[1].richness == 2
+    @test richness(data; by=:population)[1].richness == 1
+    @test alleleaverage(data).mean == 2.0
+    fst = pairwise_fst(data)
+    @test fst.populations == ["A", "B"]
+    @test fst.estimates[1, 2] > 0.5
+    @test fst.loci_used[1, 2] == 2
+    stats = summary_statistics(data)
+    @test stats.n_loci == 2
+    @test 0.0 <= stats.fst <= 1.0
+    @test summary(data) == stats
+end
+
+@testset "PopGen.jl Parity Features" begin
+    pa = Population{Int}("A", [
+        PopGenIndividual{Int}("a1", [Locus{Int}((1, 1)), Locus{Int}((1, 2))]),
+        PopGenIndividual{Int}("a2", [Locus{Int}((1, 1)), Locus{Int}((1, 1))])
+    ])
+    pb = Population{Int}("B", [
+        PopGenIndividual{Int}("b1", [Locus{Int}((2, 2)), Locus{Int}((2, 2))]),
+        PopGenIndividual{Int}("b2", [Locus{Int}((2, 2)), Locus{Int}((2, 2))])
+    ])
+    data = [pa, pb]
+
+    # 1. Hudson & Weir-Cockerham single locus
+    h_fst = hudson_fst(pa, pb, 1)
+    @test !isnan(h_fst) && h_fst >= 0.0
+
+    wc_fst = weir_cockerham_fst(pa, pb, 1)
+    @test !isnan(wc_fst) && wc_fst >= 0.0
+
+    # 2. Pairwise FST with all methods
+    fst_hudson = pairwise_fst(data; method=:hudson)
+    @test fst_hudson.method === :hudson
+    @test fst_hudson.estimates[1, 2] > 0.5
+
+    fst_wc = pairwise_fst(data; method=:weir_cockerham)
+    @test fst_wc.method === :weir_cockerham
+    @test fst_wc.estimates[1, 2] > 0.5
+
+    fst_amova = pairwise_fst(data; method=:amova)
+    @test fst_amova.method === :amova
+
+    # 3. Permutation test
+    perm_res = fst_permutation_test(data; method=:nei, permutations=19)
+    @test size(perm_res.pvalues) == (2, 2)
+    @test perm_res.pvalues[1, 1] == 0.0
+
+    # 4. Sample heterozygosity
+    sample_ho = sample_heterozygosity(data)
+    @test length(sample_ho) == 4
+    @test sample_ho[1].sample == "a1"
+    @test sample_ho[1].ho == 0.5
+
+    # 5. Kinship estimators
+    for m in [:queller_goodnight, :blouin, :li_horvitz, :ritland, :lynch_li, :lynch_ritland, :moran, :loiselle]
+        kin = pairwise_kinship(data; method=m)
+        @test size(kin.matrix) == (4, 4)
+        @test kin.matrix[1, 1] == 1.0
+    end
+
+    # 6. Clustering suite
+    km = population_kmeans(data; k=2)
+    @test length(km.assignments) == 2
+
+    hc = population_hclust(data)
+    @test length(hc.linkage) == 1
+
+    kmed = population_kmedoids(data; k=2)
+    @test length(kmed.assignments) == 2
+
+    fcm = population_fuzzycmeans(data; k=2)
+    @test size(fcm.membership) == (2, 2)
+
+    db = population_dbscan(data; eps=1.0)
+    @test length(db.assignments) == 2
+
+    for clus_m in [:kmeans, :kmedoids, :hclust, :fuzzycmeans, :dbscan]
+        res = population_cluster(data; method=clus_m)
+        @test res !== nothing
+    end
+
+    # 7. Pairwise identical genotypes
+    pi_res = pairwise_identical(data)
+    @test size(pi_res.matrix) == (4, 4)
+    @test pi_res.matrix[1, 1] == 1.0
+
+    # 8. Multi-pop HWE
+    hwe_dict = hardy_weinberg_test(data, 1)
+    @test haskey(hwe_dict, "A") && haskey(hwe_dict, "B")
+
+    hwe_exact_dict = hardy_weinberg_exact(data, 1)
+    @test haskey(hwe_exact_dict, "A") && haskey(hwe_exact_dict, "B")
+
+    # 9. STRUCTURE format read/write
+    tmp_str, str_io = mktemp()
+    close(str_io)
+    try
+        write_structure(tmp_str, data)
+        read_pops = read_structure_record(tmp_str)
+        @test length(read_pops) >= 1
+    finally
+        isfile(tmp_str) && rm(tmp_str)
+    end
 end
 
 println("All PopGen tests passed successfully!")

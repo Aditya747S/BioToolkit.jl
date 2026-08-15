@@ -217,44 +217,61 @@ end
 function _posterior_consensus_alignment(::Type{A}, left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, posterior::Array{Float32,3}) where {A<:BioAlphabet}
   n = length(left)
   m = length(right)
+  
+  # Optimal Accuracy DP (Holmes 1998, Do et al. 2005)
+  dp = zeros(Float64, n + 1, m + 1)
+  trace = zeros(UInt8, n + 1, m + 1) # 1=Match, 2=Up(GapRight), 3=Left(GapLeft)
+  
+  @inbounds for i in 1:n
+      for j in 1:m
+          p_match = posterior[i+1, j+1, 1]
+          
+          match_val = dp[i, j] + p_match
+          up_val = dp[i, j+1]
+          left_val = dp[i+1, j]
+          
+          if match_val >= up_val && match_val >= left_val
+              dp[i+1, j+1] = match_val
+              trace[i+1, j+1] = 0x01
+          elseif up_val >= left_val
+              dp[i+1, j+1] = up_val
+              trace[i+1, j+1] = 0x02
+          else
+              dp[i+1, j+1] = left_val
+              trace[i+1, j+1] = 0x03
+          end
+      end
+  end
+  
   aligned_left = UInt8[]
   aligned_right = UInt8[]
-  i = 1
-  j = 1
   matches = 0
-  while i <= n || j <= m
-    if i <= n && j <= m
-      pm = posterior[i+1, j+1, 1]
-      pix = i <= n ? posterior[i+1, j, 2] : -Inf32
-      piy = j <= m ? posterior[i, j+1, 3] : -Inf32
-      if pm >= pix && pm >= piy
-        push!(aligned_left, left[i]);
-        push!(aligned_right, right[j])
-        matches += left[i] == right[j] ? 1 : 0
-        i += 1;
-        j += 1
-      elseif pix >= piy && i <= n
-        push!(aligned_left, left[i]);
-        push!(aligned_right, UInt8('-'))
-        i += 1
+  
+  i, j = n + 1, m + 1
+  while i > 1 || j > 1
+      if i > 1 && j > 1 && trace[i, j] == 0x01
+          push!(aligned_left, left[i-1])
+          push!(aligned_right, right[j-1])
+          matches += left[i-1] == right[j-1] ? 1 : 0
+          i -= 1; j -= 1
+      elseif i > 1 && (j == 1 || trace[i, j] == 0x02)
+          push!(aligned_left, left[i-1])
+          push!(aligned_right, UInt8('-'))
+          i -= 1
       else
-        push!(aligned_left, UInt8('-'));
-        push!(aligned_right, right[j])
-        j += 1
+          push!(aligned_left, UInt8('-'))
+          push!(aligned_right, right[j-1])
+          j -= 1
       end
-    elseif i <= n
-      push!(aligned_left, left[i]);
-      push!(aligned_right, UInt8('-'))
-      i += 1
-    else
-      push!(aligned_left, UInt8('-'));
-      push!(aligned_right, right[j])
-      j += 1
-    end
   end
+  
+  reverse!(aligned_left)
+  reverse!(aligned_right)
+  
   aln_len = length(aligned_left)
   identity = aln_len == 0 ? 0.0 : matches / aln_len
-  score = round(Int, sum(maximum(posterior[ii, jj, :]) for ii in axes(posterior, 1), jj in axes(posterior, 2) if ii > 1 || jj > 1))
+  score = round(Int, dp[n+1, m+1] * 100)
+  
   return PairwiseAlignmentResult(BioSequence{A}(aligned_left; validate=false), BioSequence{A}(aligned_right; validate=false), score, matches, identity)
 end
 
@@ -978,11 +995,17 @@ function SubstitutionMatrix(alphabet::String, scores::AbstractMatrix{<:Integer};
 end
 
 """
-    substitution_matrix(alphabet; kwargs...)
+    substitution_matrix(name_or_alphabet; kwargs...)
 
-Convenience alias for `SubstitutionMatrix(alphabet; kwargs...)`.
+Load a named substitution matrix (e.g. "BLOSUM62", "FOLDSEEK3DI") or build a matrix for an alphabet string.
 """
-substitution_matrix(alphabet::String; kwargs...) = SubstitutionMatrix(alphabet; kwargs...)
+function substitution_matrix(name_or_alphabet::String; kwargs...)
+    norm = _normalize_substitution_matrix_name(name_or_alphabet)
+    if haskey(_STANDARD_SUBSTITUTION_MATRIX_CACHE, norm) || haskey(_STANDARD_SUBSTITUTION_MATRIX_TEXT, name_or_alphabet) || haskey(_STANDARD_SUBSTITUTION_MATRIX_TEXT, norm) || norm in ("DNA", "NUC", "NUCLEOTIDE", "IDENTITY")
+        return named_substitution_matrix(name_or_alphabet)
+    end
+    return SubstitutionMatrix(name_or_alphabet; kwargs...)
+end
 
 """
     substitution_matrix(alphabet, scores; kwargs...)
@@ -3032,3 +3055,643 @@ function to_html(profile::AlignmentProfileHMM)
 </html>
 """
 end
+
+# ==============================================================================
+# CIGAR Engine, Coordinate Mapping, Banded & Specialized Alignments
+# ==============================================================================
+
+"""
+    cigar(left_seq, right_seq) -> String
+    cigar(alignment::PairwiseAlignmentResult) -> String
+
+Generate a SAM-compliant CIGAR string from an alignment (e.g. `"10M2I5M3D"`).
+"""
+function cigar(left_seq::BioSequence, right_seq::BioSequence)
+    length(left_seq) == length(right_seq) || throw(ArgumentError("aligned sequence lengths must match"))
+    l_bytes = left_seq.data
+    r_bytes = right_seq.data
+    len = length(l_bytes)
+    
+    len == 0 && return ""
+    
+    ops = Char[]
+    lens = Int[]
+    
+    @inbounds for i in 1:len
+        l = l_bytes[i]
+        r = r_bytes[i]
+        op = (l != UInt8('-') && r != UInt8('-')) ? 'M' : (l == UInt8('-') ? 'D' : 'I')
+        if !isempty(ops) && ops[end] == op
+            lens[end] += 1
+        else
+            push!(ops, op)
+            push!(lens, 1)
+        end
+    end
+    
+    buf = IOBuffer()
+    for (op, l) in zip(ops, lens)
+        print(buf, l, op)
+    end
+    return String(take!(buf))
+end
+
+cigar(aln::PairwiseAlignmentResult) = cigar(aln.left, aln.right)
+
+"""
+    parse_cigar(cigar_str::AbstractString) -> Vector{Tuple{Char, Int}}
+
+Parse a CIGAR string (e.g. `"10M2I5M"`) into a vector of `(operation, length)` tuples.
+"""
+function parse_cigar(cigar_str::AbstractString)
+    ops = Tuple{Char, Int}[]
+    for m in eachmatch(r"(\d+)([MIDNSHP=X])", String(cigar_str))
+        len = parse(Int, m.captures[1])
+        op = m.captures[2][1]
+        push!(ops, (op, len))
+    end
+    return ops
+end
+
+"""
+    count_matches(aln::PairwiseAlignmentResult) -> Int
+"""
+count_matches(aln::PairwiseAlignmentResult) = aln.matches
+
+"""
+    count_mismatches(aln::PairwiseAlignmentResult) -> Int
+"""
+function count_mismatches(aln::PairwiseAlignmentResult)
+    l_bytes = aln.left.data
+    r_bytes = aln.right.data
+    count = 0
+    @inbounds for i in 1:length(l_bytes)
+        if l_bytes[i] != UInt8('-') && r_bytes[i] != UInt8('-') && l_bytes[i] != r_bytes[i]
+            count += 1
+        end
+    end
+    return count
+end
+
+"""
+    count_insertions(aln::PairwiseAlignmentResult) -> Int
+"""
+function count_insertions(aln::PairwiseAlignmentResult)
+    r_bytes = aln.right.data
+    count = 0
+    @inbounds for i in 1:length(r_bytes)
+        if r_bytes[i] == UInt8('-')
+            count += 1
+        end
+    end
+    return count
+end
+
+"""
+    count_deletions(aln::PairwiseAlignmentResult) -> Int
+"""
+function count_deletions(aln::PairwiseAlignmentResult)
+    l_bytes = aln.left.data
+    count = 0
+    @inbounds for i in 1:length(l_bytes)
+        if l_bytes[i] == UInt8('-')
+            count += 1
+        end
+    end
+    return count
+end
+
+"""
+    count_aligned(aln::PairwiseAlignmentResult) -> Int
+"""
+count_aligned(aln::PairwiseAlignmentResult) = length(aln.left)
+
+# --- Alignment Coordinate Mapping Infrastructure ---
+
+"""
+    seq2ref(aln::PairwiseAlignmentResult, seq_pos::Int) -> Int
+Map a 1-based index in the query sequence to the corresponding index in the reference sequence.
+"""
+function seq2ref(aln::PairwiseAlignmentResult, seq_pos::Int)
+    l_bytes = aln.left.data
+    r_bytes = aln.right.data
+    curr_seq = 0
+    curr_ref = 0
+    @inbounds for i in 1:length(l_bytes)
+        if l_bytes[i] != UInt8('-')
+            curr_seq += 1
+        end
+        if r_bytes[i] != UInt8('-')
+            curr_ref += 1
+        end
+        if curr_seq == seq_pos
+            return r_bytes[i] == UInt8('-') ? 0 : curr_ref
+        end
+    end
+    return 0
+end
+
+"""
+    ref2seq(aln::PairwiseAlignmentResult, ref_pos::Int) -> Int
+Map a 1-based index in the reference sequence to the corresponding index in the query sequence.
+"""
+function ref2seq(aln::PairwiseAlignmentResult, ref_pos::Int)
+    l_bytes = aln.left.data
+    r_bytes = aln.right.data
+    curr_seq = 0
+    curr_ref = 0
+    @inbounds for i in 1:length(r_bytes)
+        if l_bytes[i] != UInt8('-')
+            curr_seq += 1
+        end
+        if r_bytes[i] != UInt8('-')
+            curr_ref += 1
+        end
+        if curr_ref == ref_pos
+            return l_bytes[i] == UInt8('-') ? 0 : curr_seq
+        end
+    end
+    return 0
+end
+
+"""
+    seq2aln(aln::PairwiseAlignmentResult, seq_pos::Int) -> Int
+"""
+function seq2aln(aln::PairwiseAlignmentResult, seq_pos::Int)
+    l_bytes = aln.left.data
+    curr_seq = 0
+    @inbounds for i in 1:length(l_bytes)
+        if l_bytes[i] != UInt8('-')
+            curr_seq += 1
+            if curr_seq == seq_pos
+                return i
+            end
+        end
+    end
+    return 0
+end
+
+"""
+    ref2aln(aln::PairwiseAlignmentResult, ref_pos::Int) -> Int
+"""
+function ref2aln(aln::PairwiseAlignmentResult, ref_pos::Int)
+    r_bytes = aln.right.data
+    curr_ref = 0
+    @inbounds for i in 1:length(r_bytes)
+        if r_bytes[i] != UInt8('-')
+            curr_ref += 1
+            if curr_ref == ref_pos
+                return i
+            end
+        end
+    end
+    return 0
+end
+
+"""
+    aln2seq(aln::PairwiseAlignmentResult, aln_pos::Int) -> Int
+"""
+function aln2seq(aln::PairwiseAlignmentResult, aln_pos::Int)
+    l_bytes = aln.left.data
+    aln_pos <= length(l_bytes) || return 0
+    return count(b -> b != UInt8('-'), l_bytes[1:aln_pos])
+end
+
+"""
+    aln2ref(aln::PairwiseAlignmentResult, aln_pos::Int) -> Int
+"""
+function aln2ref(aln::PairwiseAlignmentResult, aln_pos::Int)
+    r_bytes = aln.right.data
+    aln_pos <= length(r_bytes) || return 0
+    return count(b -> b != UInt8('-'), r_bytes[1:aln_pos])
+end
+
+# --- Banded Needleman-Wunsch Alignment ($O(k * N)$ complexity) ---
+
+"""
+    banded_needleman_wunsch(seq1, seq2; k=50, match=2, mismatch=-1, gap_open=-5, gap_extend=-1)
+
+Compute global alignment using a band width parameter `k`, reducing computation from O(M*N) to O(k*N).
+"""
+function banded_needleman_wunsch(seq1::BioSequence{A}, seq2::BioSequence{A}; k::Int=50, match::Int=2, mismatch::Int=-1, gap_open::Int=-5, gap_extend::Int=-1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: BioAlphabet}
+    s1 = seq1.data
+    s2 = seq2.data
+    m = length(s1)
+    n = length(s2)
+    
+    if abs(m - n) > k
+        return needleman_wunsch(seq1, seq2; match=match, mismatch=mismatch, gap_open=gap_open, gap_extend=gap_extend)
+    end
+    
+    INF = -1000000000
+    M_mat = fill(INF, m + 1, n + 1)
+    I_mat = fill(INF, m + 1, n + 1)
+    D_mat = fill(INF, m + 1, n + 1)
+    
+    M_mat[1, 1] = 0
+    for i in 1:min(m, k)
+        I_mat[i+1, 1] = gap_open + (i - 1) * gap_extend
+    end
+    for j in 1:min(n, k)
+        D_mat[1, j+1] = gap_open + (j - 1) * gap_extend
+    end
+    
+    for i in 1:m
+        min_j = max(1, i - k)
+        max_j = min(n, i + k)
+        for j in min_j:max_j
+            s_match = (s1[i] == s2[j]) ? match : mismatch
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            if prev_best != INF
+                M_mat[i+1, j+1] = prev_best + s_match
+            end
+            
+            from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + gap_open : INF
+            from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + gap_extend : INF
+            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + gap_open : INF
+            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            
+            from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + gap_open : INF
+            from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + gap_extend : INF
+            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + gap_open : INF
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+        end
+    end
+    
+    val = max(M_mat[m+1, n+1], I_mat[m+1, n+1], D_mat[m+1, n+1])
+    state = val == M_mat[m+1, n+1] ? :M : (val == I_mat[m+1, n+1] ? :I : :D)
+    
+    i, j = m, n
+    al1 = UInt8[]
+    al2 = UInt8[]
+    matches = 0
+    
+    while i > 0 || j > 0
+        if state == :M && i > 0 && j > 0
+            push!(al1, s1[i])
+            push!(al2, s2[j])
+            s1[i] == s2[j] && (matches += 1)
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            i -= 1; j -= 1
+        elseif state == :I && i > 0
+            push!(al1, s1[i])
+            push!(al2, UInt8('-'))
+            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + gap_extend : INF)
+                state = :I
+            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + gap_open : INF)
+                state = :M
+            else
+                state = :D
+            end
+            i -= 1
+        elseif state == :D && j > 0
+            push!(al1, UInt8('-'))
+            push!(al2, s2[j])
+            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + gap_extend : INF)
+                state = :D
+            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + gap_open : INF)
+                state = :M
+            else
+                state = :I
+            end
+            j -= 1
+        else
+            if i > 0
+                push!(al1, s1[i]); push!(al2, UInt8('-')); i -= 1
+            elseif j > 0
+                push!(al1, UInt8('-')); push!(al2, s2[j]); j -= 1
+            else
+                break
+            end
+        end
+    end
+    
+    reverse!(al1)
+    reverse!(al2)
+    final_score = val
+    aln_len = length(al1)
+    identity = aln_len > 0 ? matches / aln_len : 0.0
+    
+    res = PairwiseAlignmentResult(BioSequence{A}(al1), BioSequence{A}(al2), final_score, matches, identity)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, res, "banded_needleman_wunsch")
+end
+
+banded_needleman_wunsch(seq1::AbstractString, seq2::AbstractString; kwargs...) =
+    banded_needleman_wunsch(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); kwargs...)
+
+# --- Semi-Global and Overlap Alignment Modes ---
+
+"""
+    semi_global_align(seq1, seq2; match=2, mismatch=-1, gap_open=-5, gap_extend=-1)
+
+Perform semi-global alignment allowing free end-gaps at sequence boundaries.
+"""
+function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2, mismatch::Int=-1, gap_open::Int=-5, gap_extend::Int=-1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: BioAlphabet}
+    s1 = seq1.data
+    s2 = seq2.data
+    m = length(s1)
+    n = length(s2)
+    
+    INF = -1000000000
+    M_mat = fill(INF, m + 1, n + 1)
+    I_mat = fill(INF, m + 1, n + 1)
+    D_mat = fill(INF, m + 1, n + 1)
+    
+    M_mat[1, 1] = 0
+    for i in 1:m; I_mat[i+1, 1] = 0; end
+    for j in 1:n; D_mat[1, j+1] = 0; end
+    
+    for i in 1:m
+        for j in 1:n
+            s_match = (s1[i] == s2[j]) ? match : mismatch
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            if prev_best != INF
+                M_mat[i+1, j+1] = prev_best + s_match
+            end
+            
+            cost_open = (i == m) ? 0 : gap_open
+            cost_ext  = (i == m) ? 0 : gap_extend
+            from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF
+            from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext  : INF
+            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + cost_open : INF
+            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            
+            cost_open_d = (j == n) ? 0 : gap_open
+            cost_ext_d  = (j == n) ? 0 : gap_extend
+            from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF
+            from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d  : INF
+            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + cost_open_d : INF
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+        end
+    end
+    
+    max_score = INF
+    best_i, best_j = m, n
+    state = :M
+    for j in 0:n
+        val = max(M_mat[m+1, j+1], I_mat[m+1, j+1], D_mat[m+1, j+1])
+        if val > max_score
+            max_score = val
+            best_i, best_j = m, j
+            state = val == M_mat[m+1, j+1] ? :M : (val == I_mat[m+1, j+1] ? :I : :D)
+        end
+    end
+    for i in 0:m
+        val = max(M_mat[i+1, n+1], I_mat[i+1, n+1], D_mat[i+1, n+1])
+        if val > max_score
+            max_score = val
+            best_i, best_j = i, n
+            state = val == M_mat[i+1, n+1] ? :M : (val == I_mat[i+1, n+1] ? :I : :D)
+        end
+    end
+    
+    al1 = UInt8[]
+    al2 = UInt8[]
+    matches = 0
+    
+    for i in m:-1:best_i+1
+        push!(al1, s1[i]); push!(al2, UInt8('-'))
+    end
+    for j in n:-1:best_j+1
+        push!(al1, UInt8('-')); push!(al2, s2[j])
+    end
+    
+    i, j = best_i, best_j
+    while i > 0 || j > 0
+        if state == :M && i > 0 && j > 0
+            push!(al1, s1[i]); push!(al2, s2[j])
+            s1[i] == s2[j] && (matches += 1)
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            i -= 1; j -= 1
+        elseif state == :I && i > 0
+            push!(al1, s1[i]); push!(al2, UInt8('-'))
+            cost_open = (i == m) ? 0 : gap_open
+            cost_ext  = (i == m) ? 0 : gap_extend
+            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext : INF)
+                state = :I
+            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF)
+                state = :M
+            else
+                state = :D
+            end
+            i -= 1
+        elseif state == :D && j > 0
+            push!(al1, UInt8('-')); push!(al2, s2[j])
+            cost_open_d = (j == n) ? 0 : gap_open
+            cost_ext_d  = (j == n) ? 0 : gap_extend
+            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d : INF)
+                state = :D
+            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF)
+                state = :M
+            else
+                state = :I
+            end
+            j -= 1
+        else
+            if i > 0
+                push!(al1, s1[i]); push!(al2, UInt8('-')); i -= 1
+            elseif j > 0
+                push!(al1, UInt8('-')); push!(al2, s2[j]); j -= 1
+            else
+                break
+            end
+        end
+    end
+    
+    reverse!(al1)
+    reverse!(al2)
+    aln_len = length(al1)
+    identity = aln_len > 0 ? matches / aln_len : 0.0
+    
+    res = PairwiseAlignmentResult(BioSequence{A}(al1), BioSequence{A}(al2), max_score, matches, identity)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, res, "semi_global_align")
+end
+
+semi_global_align(seq1::AbstractString, seq2::AbstractString; kwargs...) =
+    semi_global_align(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); kwargs...)
+
+"""
+    overlap_align(seq1, seq2; match=2, mismatch=-1, gap_open=-5, gap_extend=-1)
+
+Perform overlap alignment for sequence read assembly.
+"""
+function overlap_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2, mismatch::Int=-1, gap_open::Int=-5, gap_extend::Int=-1, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx)) where {A <: BioAlphabet}
+    s1 = seq1.data
+    s2 = seq2.data
+    m = length(s1)
+    n = length(s2)
+    
+    INF = -1000000000
+    M_mat = fill(INF, m + 1, n + 1)
+    I_mat = fill(INF, m + 1, n + 1)
+    D_mat = fill(INF, m + 1, n + 1)
+    
+    M_mat[1, 1] = 0
+    for i in 1:m; I_mat[i+1, 1] = 0; end
+    for j in 1:n; D_mat[1, j+1] = 0; end
+    
+    for i in 1:m
+        for j in 1:n
+            s_match = (s1[i] == s2[j]) ? match : mismatch
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            if prev_best != INF
+                M_mat[i+1, j+1] = prev_best + s_match
+            end
+            
+            # Free end-gap logic for terminal overhangs
+            cost_open = (i == m) ? 0 : gap_open
+            cost_ext  = (i == m) ? 0 : gap_extend
+            from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF
+            from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext  : INF
+            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + cost_open : INF
+            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            
+            cost_open_d = (j == n) ? 0 : gap_open
+            cost_ext_d  = (j == n) ? 0 : gap_extend
+            from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF
+            from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d  : INF
+            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + cost_open_d : INF
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+        end
+    end
+    
+    max_score = INF
+    best_i, best_j = m, n
+    state = :M
+    for j in 1:n
+        val = max(M_mat[m+1, j+1], I_mat[m+1, j+1], D_mat[m+1, j+1])
+        if val > max_score
+            max_score = val
+            best_i, best_j = m, j
+            state = val == M_mat[m+1, j+1] ? :M : (val == I_mat[m+1, j+1] ? :I : :D)
+        end
+    end
+    for i in 1:m
+        val = max(M_mat[i+1, n+1], I_mat[i+1, n+1], D_mat[i+1, n+1])
+        if val > max_score
+            max_score = val
+            best_i, best_j = i, n
+            state = val == M_mat[i+1, n+1] ? :M : (val == I_mat[i+1, n+1] ? :I : :D)
+        end
+    end
+    
+    al1 = UInt8[]
+    al2 = UInt8[]
+    matches = 0
+    
+    for i in m:-1:best_i+1
+        push!(al1, s1[i]); push!(al2, UInt8('-'))
+    end
+    for j in n:-1:best_j+1
+        push!(al1, UInt8('-')); push!(al2, s2[j])
+    end
+    
+    i, j = best_i, best_j
+    while i > 0 || j > 0
+        if state == :M && i > 0 && j > 0
+            push!(al1, s1[i]); push!(al2, s2[j])
+            s1[i] == s2[j] && (matches += 1)
+            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
+            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            i -= 1; j -= 1
+        elseif state == :I && i > 0
+            push!(al1, s1[i]); push!(al2, UInt8('-'))
+            c_open = (i == m) ? 0 : gap_open
+            c_ext  = (i == m) ? 0 : gap_extend
+            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + c_ext : INF)
+                state = :I
+            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + c_open : INF)
+                state = :M
+            else
+                state = :D
+            end
+            i -= 1
+        elseif state == :D && j > 0
+            push!(al1, UInt8('-')); push!(al2, s2[j])
+            c_open = (j == n) ? 0 : gap_open
+            c_ext  = (j == n) ? 0 : gap_extend
+            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + c_ext : INF)
+                state = :D
+            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + c_open : INF)
+                state = :M
+            else
+                state = :I
+            end
+            j -= 1
+        else
+            if i > 0
+                push!(al1, s1[i]); push!(al2, UInt8('-')); i -= 1
+            elseif j > 0
+                push!(al1, UInt8('-')); push!(al2, s2[j]); j -= 1
+            else
+                break
+            end
+        end
+    end
+    
+    reverse!(al1)
+    reverse!(al2)
+    aln_len = length(al1)
+    identity = aln_len > 0 ? matches / aln_len : 0.0
+    
+    res = PairwiseAlignmentResult(BioSequence{A}(al1), BioSequence{A}(al2), max_score, matches, identity)
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, res, "overlap_align")
+end
+
+overlap_align(seq1::AbstractString, seq2::AbstractString; kwargs...) =
+    overlap_align(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); kwargs...)
+
+"""
+    differentiable_align(seq1::BioSequence, seq2::BioSequence; kwargs...)
+
+Differentiable dynamic programming alignment wrapper.
+"""
+function differentiable_align(seq1::BioSequence{A}, seq2::BioSequence{A}; scoring::DifferentiableScoring=DifferentiableScoring([1.0, -1.0, -1.0])) where {A<:BioAlphabet}
+    score = soft_alignment_score(seq1, seq2, scoring)
+    return PairwiseAlignmentResult(seq1, seq2, round(Int, score), 0, 0.0)
+end
+differentiable_align(seq1::AbstractString, seq2::AbstractString; kwargs...) =
+    differentiable_align(DNASeq(seq1; validate=false), DNASeq(seq2; validate=false); kwargs...)
+
+# --- Unified Pairwise Alignment Dispatcher ---
+
+"""
+    pairalign(mode::Symbol, seq1, seq2; kwargs...)
+
+Unified dispatcher for pairwise alignment:
+- `:global`: Needleman-Wunsch global alignment
+- `:semi_global`: Semi-global alignment with free end gaps
+- `:overlap`: Overlap alignment
+- `:local`: Smith-Waterman local alignment
+- `:banded`: Banded global alignment
+- `:pair_hmm`: Pair-HMM probabilistic posterior alignment
+- `:differentiable`: Differentiable dynamic programming alignment
+- `:codon`: Codon-aware frame-preserving alignment
+"""
+function pairalign(mode::Symbol, seq1, seq2; kwargs...)
+    if mode === :global || mode === :needleman_wunsch
+        return needleman_wunsch(seq1, seq2; kwargs...)
+    elseif mode === :semi_global
+        return semi_global_align(seq1, seq2; kwargs...)
+    elseif mode === :overlap
+        return overlap_align(seq1, seq2; kwargs...)
+    elseif mode === :local || mode === :smith_waterman
+        return smith_waterman(seq1, seq2; kwargs...)
+    elseif mode === :banded
+        return banded_needleman_wunsch(seq1, seq2; kwargs...)
+    elseif mode === :pair_hmm
+        return pairhmm_align(seq1, seq2; kwargs...)
+    elseif mode === :differentiable
+        return differentiable_align(seq1, seq2; kwargs...)
+    elseif mode === :codon
+        return pairwise_align_codons(seq1, seq2; kwargs...)
+    else
+        throw(ArgumentError("Unsupported pairalign mode: $mode"))
+    end
+end
+
