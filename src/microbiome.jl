@@ -22,16 +22,29 @@ using Distributions
 using Base.Threads
 using Graphs
 using Optim
-using Plots
+
+
 
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 using ..BioToolkit: BioSequence, DNAAlphabet, DNASeq, PhyloTree, get_terminals
 using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!
-import ..BioToolkit: shannon_entropy
+import ..BioToolkit: shannon_entropy, faith_pd
 
 @inline function _register_microbiome_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
   return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
 end
+
+function _get_plots_mod()
+  ext = Base.get_extension(parentmodule(Microbiome), :BioToolkitPlotsExt)
+  if ext !== nothing
+    return ext.Plots
+  elseif isdefined(Main, :Plots)
+    return Main.Plots
+  else
+    error("Plotting functions require Plots.jl to be loaded (`using Plots`).")
+  end
+end
+
 
 export CommunityProfile, PCoAResult, NMDSResult, ANCOMResult, SongbirdResult, SourceTrackingResult, MicrobiomeNetwork
 export clr_transform, ilr_transform, bray_curtis, unifrac, weighted_unifrac, shannon_entropy, simpson_index, faith_pd
@@ -615,10 +628,11 @@ end
 
 function pcoa_plot(result::PCoAResult; labels=nothing, color=nothing, title::String="PCoA", kwargs...)
   size(result.coordinates, 2) >= 2 || throw(ArgumentError("PCoAResult must have at least two coordinates"))
-  plot_obj = scatter(result.coordinates[:, 1], result.coordinates[:, 2]; legend=false, title=title, xlabel="PCoA 1", ylabel="PCoA 2", color=color, kwargs...)
+  PlotsMod = _get_plots_mod()
+  plot_obj = PlotsMod.scatter(result.coordinates[:, 1], result.coordinates[:, 2]; legend=false, title=title, xlabel="PCoA 1", ylabel="PCoA 2", color=color, kwargs...)
   if labels !== nothing
     for (index, label) in enumerate(labels)
-      annotate!(plot_obj, result.coordinates[index, 1], result.coordinates[index, 2], label)
+      PlotsMod.annotate!(plot_obj, result.coordinates[index, 1], result.coordinates[index, 2], label)
     end
   end
   return plot_obj
@@ -992,18 +1006,19 @@ function cooccurrence_network(profile::CommunityProfile; threshold::Real=0.4, la
 end
 
 function network_plot(network::MicrobiomeNetwork; title::String="Microbiome co-occurrence", layout=nothing, edge_scale::Real=2.5, show_labels::Bool=true, interactive::Bool=false, kwargs...)
+  PlotsMod = _get_plots_mod()
   coordinates = layout === nothing ? network.coordinates : _resolve_layout(network.graph, layout)
-  plot_obj = plot(; legend=false, aspect_ratio=:equal, title=title, xaxis=false, yaxis=false, kwargs...)
+  plot_obj = PlotsMod.plot(; legend=false, aspect_ratio=:equal, title=title, xaxis=false, yaxis=false, kwargs...)
   for ((left, right), weight) in network.weights
     color = weight >= 0 ? :steelblue : :tomato
     alpha = clamp(abs(weight), 0.15, 1.0)
     linewidth = max(0.5, abs(weight) * edge_scale)
-    plot!(plot_obj, [coordinates[left, 1], coordinates[right, 1]], [coordinates[left, 2], coordinates[right, 2]]; color=color, alpha=alpha, linewidth=linewidth)
+    PlotsMod.plot!(plot_obj, [coordinates[left, 1], coordinates[right, 1]], [coordinates[left, 2], coordinates[right, 2]]; color=color, alpha=alpha, linewidth=linewidth)
   end
-  scatter!(plot_obj, coordinates[:, 1], coordinates[:, 2]; markerstrokewidth=0, markersize=7, color=:black)
+  PlotsMod.scatter!(plot_obj, coordinates[:, 1], coordinates[:, 2]; markerstrokewidth=0, markersize=7, color=:black)
   show_labels || return plot_obj
   for (index, taxon) in enumerate(network.taxa)
-    annotate!(plot_obj, coordinates[index, 1], coordinates[index, 2], taxon)
+    PlotsMod.annotate!(plot_obj, coordinates[index, 1], coordinates[index, 2], taxon)
   end
   return plot_obj
 end

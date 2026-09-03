@@ -1,5 +1,7 @@
 using DataFrames
-using Turing
+if Base.find_package("Turing") !== nothing
+    using Turing
+end
 
 @testset "Proteomics and Metabolomics" begin
     mzml_text = """<mzML>
@@ -79,9 +81,11 @@ using Turing
                        0.2 0.8;
                        0.1 0.1]
     observed = [7, 2, 1]
-    tracking = BioToolkit.metabolomics_source_tracking(observed, source_profiles; draws=10)
-    @test tracking isa BioToolkit.MetabolomicsSourceTrackingResult
-    @test length(tracking.mean_proportions) == 2
+    if Base.get_extension(BioToolkit, :BioToolkitTuringExt) !== nothing || isdefined(Main, :Turing)
+        tracking = BioToolkit.metabolomics_source_tracking(observed, source_profiles; draws=10)
+        @test tracking isa BioToolkit.MetabolomicsSourceTrackingResult
+        @test length(tracking.mean_proportions) == 2
+    end
 
     annotated = BioToolkit.annotate_metabolite_features([1.0 2.0; 2.0 4.0])
     @test nrow(annotated) == 2

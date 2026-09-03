@@ -303,11 +303,11 @@ using BioToolkit: SummarizedExperiment, GeneIdType, OrganismDb, TxQuantRecord, T
         
         # 3. protein_interaction_network_alignment
         g1 = SimpleGraph(3)
-        add_edge!(g1, 1, 2)
-        add_edge!(g1, 2, 3)
+        Graphs.add_edge!(g1, 1, 2)
+        Graphs.add_edge!(g1, 2, 3)
         g2 = SimpleGraph(3)
-        add_edge!(g2, 1, 3)
-        add_edge!(g2, 3, 2)
+        Graphs.add_edge!(g2, 1, 3)
+        Graphs.add_edge!(g2, 3, 2)
         res_align = protein_interaction_network_alignment(g1, g2)
         @test length(res_align.alignment_map) > 0
     end

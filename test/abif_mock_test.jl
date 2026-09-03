@@ -31,7 +31,8 @@ function write_mock_abif_v3(filename)
         write(io, hton(UInt32(4))) # 4 elements
         write(io, hton(UInt32(4))) # Total size
         write(io, "TAGC")           # DATA in offset field
-        
+        write(io, hton(UInt32(0))) # handle/spare
+
         # Entry 2: FWO_1
         write(io, "FWO_")
         write(io, hton(UInt32(1)))
@@ -40,6 +41,7 @@ function write_mock_abif_v3(filename)
         write(io, hton(UInt32(4)))
         write(io, hton(UInt32(4)))
         write(io, "GATC")
+        write(io, hton(UInt32(0))) # handle/spare
     end
 end
 

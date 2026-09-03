@@ -1189,7 +1189,7 @@ function disulfide_bonds(structure::Structure; model_index::Int=1, cutoff::Real=
   for chain in model.chains
     for residue in chain.residues
       uppercase(residue.name) == "CYS" || continue
-      any(atom.name == "SG" for atom in residue.atoms) || continue
+      uppercase(atom.name) == "SG" || continue
       push!(cysteines, (chain=chain, residue=residue))
     end
   end
@@ -1197,10 +1197,10 @@ function disulfide_bonds(structure::Structure; model_index::Int=1, cutoff::Real=
   cutoff2 = Float64(cutoff)^2
   for left_index in firstindex(cysteines):(lastindex(cysteines)-1)
     left_item = cysteines[left_index]
-    left_atom = first(atom for atom in left_item.residue.atoms if atom.name == "SG")
+    left_atom = first(atom for atom in left_item.residue.atoms if uppercase(atom.name) == "SG")
     for right_index in (left_index+1):lastindex(cysteines)
       right_item = cysteines[right_index]
-      right_atom = first(atom for atom in right_item.residue.atoms if atom.name == "SG")
+      right_atom = first(atom for atom in right_item.residue.atoms if uppercase(atom.name) == "SG")
       distance2 = _distance2((left_atom.x, left_atom.y, left_atom.z), (right_atom.x, right_atom.y, right_atom.z))
       distance2 <= cutoff2 || continue
       push!(pairs, (
@@ -3236,3 +3236,76 @@ function run_pdb2pqr(input::Union{String,Structure}, output_path::String; comman
     input isa Structure && isfile(input_path) && rm(input_path, force=true)
   end
 end
+
+function BlenderIntegrator.to_blender_payload(st::Structure; style::Symbol=:cartoon, color_scheme::Symbol=:element, name::String=st.id)
+  atoms = Atom[]
+  res_indices = Int[]
+  for model in st.models
+    for chain in model.chains
+      for res in chain.residues
+        for atom in res.atoms
+          push!(atoms, atom)
+          push!(res_indices, res.seqnum)
+        end
+      end
+    end
+  end
+  if isempty(atoms)
+    atoms = structure_atoms(st)
+    res_indices = zeros(Int, length(atoms))
+  end
+  coords = coordinate_matrix(atoms)
+  elements = [atom.element for atom in atoms]
+  scores = [atom.bfactor for atom in atoms]
+  mat = BlenderMaterial(name=name * "_mat", color=(0.2, 0.6, 1.0, 1.0), roughness=0.3)
+  return BlenderProteinPayload(name, coords, elements, res_indices, style, color_scheme, mat; scores=scores)
+end
+
+"""
+    to_blender_scene(st::Structure; style=:cartoon, color_scheme=:chain, name=st.id)
+
+Convert a multi-chain macromolecular structure or viral capsid into a `BlenderScene` containing per-chain payload objects.
+"""
+function BlenderIntegrator.to_blender_scene(st::Structure; style::Symbol=:cartoon, color_scheme::Symbol=:chain, name::String=st.id)
+  scene_objects = AbstractBlenderObject[]
+  chains = isempty(st.models) ? Chain[] : st.models[1].chains
+  n_chains = length(chains)
+
+  for (i, ch) in enumerate(chains)
+    ch_atoms = Atom[]
+    res_indices = Int[]
+    for res in ch.residues
+      for atom in res.atoms
+        push!(ch_atoms, atom)
+        push!(res_indices, res.seqnum)
+      end
+    end
+    isempty(ch_atoms) && continue
+
+    coords = coordinate_matrix(ch_atoms)
+    elements = [atom.element for atom in ch_atoms]
+    scores = [atom.bfactor for atom in ch_atoms]
+
+    chain_color_scheme = color_scheme == :chain ? :element : color_scheme
+    chain_name = "$(name)_Chain_$(ch.id)"
+
+    mat_color = if color_scheme == :chain
+      hue = (i - 1) / max(n_chains, 1)
+      r = abs(hue * 6 - 3) - 1
+      g = 2 - abs(hue * 6 - 2)
+      b = 2 - abs(hue * 6 - 4)
+      (clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0), 1.0)
+    else
+      (0.2, 0.6, 1.0, 1.0)
+    end
+
+    mat = BlenderMaterial(name=chain_name * "_mat", color=mat_color)
+    pl = BlenderProteinPayload(chain_name, coords, elements, res_indices, style, chain_color_scheme, mat; scores=scores)
+    push!(scene_objects, pl)
+  end
+
+  return BlenderScene(objects=scene_objects)
+end
+
+
+

@@ -48,7 +48,7 @@ using BioToolkit
     @test isfinite(zph.global_chisq)
 
     # MAF reading, summarizing, TMB, somatic interactions
-    maf_path = tempname()
+    maf_path = Base.tempname()
     open(maf_path, "w") do io
         println(io, join(["Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification", "Variant_Type", "Chromosome", "Start_Position", "End_Position", "Reference_Allele", "Tumor_Seq_Allele2"], '\t'))
         println(io, join(["TP53", "P1", "Missense_Mutation", "SNP", "17", "7579472", "7579472", "C", "T"], '\t'))
@@ -89,8 +89,8 @@ using BioToolkit
     @test contains(cox_html, "escapeHtml(t.term)")
 
     # TCGA count file ingestion test
-    tcga_a = tempname()
-    tcga_b = tempname()
+    tcga_a = Base.tempname()
+    tcga_b = Base.tempname()
     open(tcga_a, "w") do io
         println(io, "gene\tcount")
         println(io, "TP53\t10")

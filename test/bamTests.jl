@@ -226,7 +226,7 @@ println("="^70)
     flag=SAM_FLAG_UNMAPPED)
 
   bam = BamFile(hdr, [rec1, rec2, rec3])
-  path = tempname() * ".bam"
+  path = Base.tempname() * ".bam"
   write_bam(path, bam; write_index=true)
   bam2 = read_bam(path)
 
@@ -246,7 +246,7 @@ println("="^70)
     println("granges() check skipped (GenomicRanges API mismatch?): ", e)
   end
 
-  sam_path = tempname() * ".sam"
+  sam_path = Base.tempname() * ".sam"
   write_sam(sam_path, bam2)
   bam3 = read_sam(sam_path)
   r1 = only(filter(r -> r.qname == "read1", bam3.records))
@@ -289,7 +289,7 @@ for i in 1:N
   big_records[i] = BamRecord("r$i", "chrBig", p, cig, s; flag=flag, mapq=UInt8(rand(0:60)))
 end
 big_bam = BamFile(big_hdr, big_records)
-big_path = tempname() * ".bam"
+big_path = Base.tempname() * ".bam"
 
 t_write = @elapsed write_bam(big_path, big_bam; write_index=true)
 t_read = @elapsed read_back = read_bam(big_path)

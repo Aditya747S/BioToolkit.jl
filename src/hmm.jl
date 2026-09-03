@@ -18,24 +18,24 @@
 #   - Eddy (2011) PLoS Comput Biol 7(10):e1002195 (HMMER3)
 # ==============================================================================
 
-export HMM, viterbi, forward, backward
+export AbstractHMM, HMM, GaussianHMM, ChromHMM, GenericEmissionHMM
+export log_emission, n_states, initial_distribution, transition_matrix, states
+export viterbi, forward, backward, forward_backward, posteriors, loglikelihood, joint_loglikelihood
 export baum_welch!, baum_welch_train
 export posterior_decode, posterior_state_probabilities
-export HMMSegment, segment_sequence
+export HMMSegment, segment_sequence, segment_chromatin
 export ProfileHMM, ProfileHMMNode, build_profile_hmm, score_profile_hmm
 export PairHMM, pair_hmm_align, pair_hmm_score
+export aic, bic, state_entropy, cross_validate_hmm
+export fit!, logdensityof
 export viterbi_train!, hmm_log_likelihood
-export save_hmm, load_hmm
+export save_hmm, load_hmm, to_blender_payload
 export baum_welch_from_se  # SummarizedExperiment convenience
+export statdists, nparams
 
 using Statistics
 using LinearAlgebra
-using Random
-
-# Biotype imports for type-safe dispatch
-using .BioToolkit: BioSequence, DNAAlphabet, RNAAlphabet, AminoAcidAlphabet,
-                   DNASeq, RNASeq, AASeq, SummarizedExperiment, assay
-using .BioToolkit: ProvenanceContext, provenance_result!, provenance_parent_ids, register_provenance!, ThreadSafeProvenanceContext, new_provenance_id, ProvenanceParams, active_provenance_context
+using Random: Random, MersenneTwister, AbstractRNG, default_rng, randperm
 
 @inline function _register_hmm_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -45,12 +45,112 @@ end
 # Core HMM type (unchanged from original)
 # ===========================================================================
 
+@inline function _hmm_logsumexp(values)
+    m = maximum(values)
+    m == -Inf && return m
+    total = 0.0
+    @inbounds for value in values
+        total += exp(value - m)
+    end
+    return m + log(total)
+end
+
+function _hmm_log_probabilities(values::AbstractVector, name::AbstractString)
+    any(x -> !isfinite(x) || x < 0, values) && throw(ArgumentError("$name probabilities must be finite and non-negative"))
+    total = sum(values)
+    total > 0 || throw(ArgumentError("$name probabilities must have positive mass"))
+    result = Vector{Float64}(undef, length(values))
+    @inbounds for i in eachindex(values)
+        result[i] = values[i] == 0 ? -Inf : log(Float64(values[i]) / total)
+    end
+    return result
+end
+
+function _hmm_normalize_log_vector(values::AbstractVector, name::AbstractString)
+    any(x -> isnan(x) || x == Inf, values) && throw(ArgumentError("$name log probabilities cannot contain NaN or +Inf"))
+    z = _hmm_logsumexp(values)
+    isfinite(z) || throw(ArgumentError("$name probabilities must have positive mass"))
+    return Float64.(values) .- z
+end
+
+function _hmm_log_matrix(matrix::AbstractMatrix, name::AbstractString)
+    result = Matrix{Float64}(undef, size(matrix))
+    for i in axes(matrix, 1)
+        result[i, :] .= _hmm_log_probabilities(view(matrix, i, :), "$name row $i")
+    end
+    return result
+end
+
+function _hmm_log_matrix_from_logs(matrix::AbstractMatrix, name::AbstractString)
+    result = Matrix{Float64}(undef, size(matrix))
+    for i in axes(matrix, 1)
+        result[i, :] .= _hmm_normalize_log_vector(view(matrix, i, :), "$name row $i")
+    end
+    return result
+end
+
+function _hmm_update_log_vector!(destination::AbstractVector, counts::AbstractVector)
+    total = sum(counts)
+    total <= 0 && return destination
+    @inbounds for i in eachindex(destination, counts)
+        destination[i] = counts[i] == 0 ? -Inf : log(counts[i] / total)
+    end
+    return destination
+end
+
+function _hmm_update_log_rows!(destination::AbstractMatrix, counts::AbstractMatrix)
+    for i in axes(destination, 1)
+        _hmm_update_log_vector!(view(destination, i, :), view(counts, i, :))
+    end
+    return destination
+end
+
+"""
+    AbstractHMM{T<:AbstractFloat}
+
+Abstract supertype for all Hidden Markov Model implementations in BioToolkit.
+Subtypes must implement:
+  - `states(hmm)` → Vector{String}
+  - `initial_distribution(hmm)` → Vector{T} (log-space)
+  - `transition_matrix(hmm)` → Matrix{T} (log-space N x N)
+  - `log_emission(hmm, state_idx, observation)` → T (log-probability)
+"""
+abstract type AbstractHMM{T<:AbstractFloat} end
+
+n_states(hmm::AbstractHMM) = length(states(hmm))
+states(hmm::AbstractHMM) = hmm.states
+initial_distribution(hmm::AbstractHMM) = hmm.initial
+transition_matrix(hmm::AbstractHMM) = hmm.transitions
+
+"""
+    GenericEmissionHMM{T, E}
+
+An HMM supporting arbitrary user-provided emission functions or distributions per state.
+`emissions` is a vector of callables where `emissions[i](obs)` returns the log-probability of `obs`.
+"""
+struct GenericEmissionHMM{T<:AbstractFloat, E} <: AbstractHMM{T}
+    states::Vector{String}
+    initial::Vector{T}        # Log-space
+    transitions::Matrix{T}    # Log-space N x N
+    emissions::Vector{E}      # State emission functions / distributions
+end
+
+function GenericEmissionHMM(states::AbstractVector{<:AbstractString}, initial::AbstractVector,
+                            transitions::AbstractMatrix, emissions::AbstractVector; log_space::Bool=false)
+    T = Float64
+    ini = log_space ? _hmm_normalize_log_vector(initial, "initial") : _hmm_log_probabilities(initial, "initial")
+    trn = log_space ? _hmm_log_matrix_from_logs(transitions, "transition") : _hmm_log_matrix(transitions, "transition")
+    return GenericEmissionHMM{T, eltype(emissions)}(collect(states), ini, trn, collect(emissions))
+end
+
+@inline log_emission(gem::GenericEmissionHMM, state_idx::Int, obs) = gem.emissions[state_idx](obs)
+
 """
     HMM{T<:AbstractFloat}
 
-A Hidden Markov Model operating in log-space for numerical stability.
+A discrete Hidden Markov Model operating in log-space for numerical stability.
 """
-struct HMM{T<:AbstractFloat}
+struct HMM{T<:AbstractFloat} <: AbstractHMM{T}
     states::Vector{String}
     alphabet::Vector{UInt8}
     initial::Vector{T}
@@ -60,23 +160,143 @@ struct HMM{T<:AbstractFloat}
     _unknown_emission::T
 
     function HMM{T}(states, alphabet, initial, transitions, emissions, unknown_prob=T(-Inf)) where {T}
+        isempty(states) && throw(ArgumentError("HMM must contain at least one state"))
+        isempty(alphabet) && throw(ArgumentError("HMM alphabet must not be empty"))
+        length(unique(states)) == length(states) || throw(ArgumentError("state names must be unique"))
+        length(unique(alphabet)) == length(alphabet) || throw(ArgumentError("alphabet symbols must be unique"))
         length(states) == length(initial) || throw(ArgumentError("initial must match states"))
         size(transitions) == (length(states), length(states)) || throw(ArgumentError("transitions must be N x N"))
         size(emissions) == (length(states), length(alphabet)) || throw(ArgumentError("emissions must be N x V"))
+        (any(isnan, initial) || any(isnan, transitions) || any(isnan, emissions)) && throw(ArgumentError("HMM log probabilities cannot be NaN"))
         lookup = fill(0, 256)
         for (i, b) in enumerate(alphabet); lookup[Int(b)+1] = i; end
         new{T}(states, alphabet, initial, transitions, emissions, lookup, unknown_prob)
     end
 end
 
-function HMM(states::Vector{String}, alphabet::Vector{UInt8}, initial::AbstractVector,
+function HMM(states::AbstractVector{<:AbstractString}, alphabet::AbstractVector{UInt8}, initial::AbstractVector,
              transitions::AbstractMatrix, emissions::AbstractMatrix; log_space::Bool=false)
     T = Float64
-    ini = T.(log_space ? initial : log.(max.(initial, eps(T))))
-    trn = Matrix{T}(log_space ? transitions : log.(max.(transitions, eps(T))))
-    ems = Matrix{T}(log_space ? emissions  : log.(max.(emissions,  eps(T))))
-    return HMM{T}(states, alphabet, ini, trn, ems)
+    if log_space
+        ini = _hmm_normalize_log_vector(initial, "initial")
+        trn = _hmm_log_matrix_from_logs(transitions, "transition")
+        ems = _hmm_log_matrix_from_logs(emissions, "emission")
+    else
+        ini = _hmm_log_probabilities(initial, "initial")
+        trn = _hmm_log_matrix(transitions, "transition")
+        ems = _hmm_log_matrix(emissions, "emission")
+    end
+    return HMM{T}(String.(states), collect(alphabet), ini, trn, ems)
 end
+
+Base.size(hmm::HMM) = (length(hmm.states), length(hmm.alphabet))
+Base.size(hmm::HMM, dim::Integer) = size(hmm)[dim]
+
+Base.copy(hmm::HMM{T}) where {T} = HMM{T}(
+    copy(hmm.states),
+    copy(hmm.alphabet),
+    copy(hmm.initial),
+    copy(hmm.transitions),
+    copy(hmm.emissions),
+    hmm._unknown_emission
+)
+
+"""
+    statdists(hmm) → Vector{Vector{Float64}}
+
+Return the stationary state distribution(s) of `hmm`.
+"""
+function statdists(hmm::HMM)
+    A_prob = exp.(hmm.transitions)
+    eig = eigen(collect(transpose(A_prob)))
+    dists = Vector{Float64}[]
+    for (i, val) in enumerate(eig.values)
+        if isapprox(real(val), 1.0; atol=1e-5) && isapprox(imag(val), 0.0; atol=1e-5)
+            vec_r = real.(eig.vectors[:, i])
+            total = sum(vec_r)
+            total > 0 && push!(dists, vec_r ./ total)
+        end
+    end
+    return dists
+end
+
+"""
+    nparams(hmm) → Int
+
+Return the number of free parameters in `hmm`.
+"""
+function nparams(hmm::HMM)
+    n_states = length(hmm.states)
+    n_alpha  = length(hmm.alphabet)
+    return (n_states - 1) + n_states * (n_states - 1) + n_states * (n_alpha - 1)
+end
+
+function _hmm_sample_categorical(rng::AbstractRNG, log_probs::AbstractVector{T}) where {T}
+    m = maximum(log_probs)
+    probs = exp.(log_probs .- m)
+    total = sum(probs)
+    total > 0 || throw(ArgumentError("cannot sample from zero probability mass distribution"))
+    u = rand(rng, T) * total
+    acc = zero(T)
+    for (i, p) in enumerate(probs)
+        acc += p
+        u <= acc && return i
+    end
+    return length(log_probs)
+end
+
+"""
+    rand([rng=default_rng()], hmm::HMM, T::Integer; seq::Bool=false) → Vector{UInt8} | (Vector{Int}, Vector{UInt8})
+
+Simulate a trajectory of `T` timesteps from `hmm`.
+"""
+function Random.rand(rng::AbstractRNG, hmm::HMM, T::Integer; seq::Bool=false)
+    T >= 0 || throw(ArgumentError("sequence length must be non-negative"))
+    z = Vector{Int}(undef, T)
+    obs = Vector{UInt8}(undef, T)
+    T == 0 && return seq ? (z, obs) : obs
+
+    z[1] = _hmm_sample_categorical(rng, hmm.initial)
+    col1 = _hmm_sample_categorical(rng, view(hmm.emissions, z[1], :))
+    obs[1] = hmm.alphabet[col1]
+
+    @inbounds for t in 2:T
+        z[t] = _hmm_sample_categorical(rng, view(hmm.transitions, z[t-1], :))
+        col_t = _hmm_sample_categorical(rng, view(hmm.emissions, z[t], :))
+        obs[t] = hmm.alphabet[col_t]
+    end
+
+    return seq ? (z, obs) : obs
+end
+
+Random.rand(hmm::HMM, T::Integer; kwargs...) = Random.rand(Random.default_rng(), hmm, T; kwargs...)
+
+"""
+    joint_loglikelihood(hmm, sequence, states) → Float64
+
+Compute the joint log-likelihood log P(sequence, states | HMM).
+"""
+function joint_loglikelihood(hmm::HMM{T}, sequence::AbstractVector{UInt8}, states::AbstractVector{<:Integer}) where {T}
+    L = length(sequence)
+    length(states) == L || throw(ArgumentError("sequence and states must have matching length"))
+    L == 0 && return zero(T)
+
+    s1 = states[1]
+    (1 <= s1 <= length(hmm.states)) || throw(BoundsError(hmm.states, s1))
+    ll = hmm.initial[s1] + _get_emission_logprob(hmm, s1, sequence[1])
+
+    @inbounds for t in 2:L
+        prev_s = states[t-1]
+        curr_s = states[t]
+        (1 <= curr_s <= length(hmm.states)) || throw(BoundsError(hmm.states, curr_s))
+        ll += hmm.transitions[prev_s, curr_s] + _get_emission_logprob(hmm, curr_s, sequence[t])
+    end
+
+    return ll
+end
+
+joint_loglikelihood(hmm::HMM, seq::BioSequence, states) = joint_loglikelihood(hmm, _hmm_bytes(seq), states)
+joint_loglikelihood(hmm::HMM, seq::AbstractString, states) = joint_loglikelihood(hmm, _hmm_bytes(seq), states)
 
 @inline function _get_emission_logprob(hmm::HMM{T}, state_idx::Int, byte::UInt8) where {T}
     col = hmm._emission_lookup[Int(byte)+1]
@@ -84,13 +304,21 @@ end
     return hmm.emissions[state_idx, col]
 end
 
+@inline log_emission(hmm::HMM, state_idx::Int, byte::UInt8) = _get_emission_logprob(hmm, state_idx, byte)
+
+@inline _hmm_bytes(sequence::AbstractVector{UInt8}) = sequence
+@inline _hmm_bytes(sequence::BioSequence) = sequence.data
+@inline _hmm_bytes(sequence::AbstractString) = collect(codeunits(String(sequence)))
+@inline _hmm_bytes(sequence) = collect(codeunits(String(sequence)))
+
 @inline function logaddexp(x::T, y::T) where {T<:AbstractFloat}
+    (isnan(x) || isnan(y)) && throw(DomainError((x, y), "logaddexp received NaN"))
     x == -Inf && return y; y == -Inf && return x
     m = max(x, y); return m + log1p(exp(min(x,y) - m))
 end
 
 # ===========================================================================
-# Viterbi (original; unchanged)
+# Viterbi Algorithm (Generic for AbstractHMM and specialized for discrete HMM)
 # ===========================================================================
 
 """
@@ -98,6 +326,40 @@ end
 
 Compute the most likely hidden state path using the Viterbi algorithm.
 """
+function viterbi(hmm::AbstractHMM{T}, sequence::AbstractVector) where {T}
+    L = length(sequence); N = n_states(hmm)
+    _ctx = active_provenance_context()
+    L == 0 && return _register_hmm_result!(_ctx, (Int[], T(-Inf)), "viterbi"; parameters=(seq_length=0, n_states=N))
+    v = Matrix{T}(undef, N, L)
+    tb = Matrix{Int}(undef, N, L)
+    ini = initial_distribution(hmm)
+    trn = transition_matrix(hmm)
+    @inbounds for i in 1:N
+        v[i,1] = ini[i] + log_emission(hmm, i, sequence[1])
+        tb[i,1] = 0
+    end
+    @inbounds for t in 2:L
+        obs_t = sequence[t]
+        for j in 1:N
+            best_p, best_i = T(-Inf), 0
+            for i in 1:N
+                p = v[i,t-1] + trn[i,j]
+                p > best_p && (best_p = p; best_i = i)
+            end
+            v[j,t] = best_p + log_emission(hmm, j, obs_t)
+            tb[j,t] = best_i
+        end
+    end
+    best_p, best_last = T(-Inf), 0
+    @inbounds for i in 1:N; v[i,L] > best_p && (best_p = v[i,L]; best_last = i); end
+    best_last == 0 && throw(ArgumentError("observation sequence has zero probability under this HMM"))
+    path = Vector{Int}(undef, L)
+    curr = best_last
+    @inbounds for t in L:-1:1; path[t] = curr; curr = tb[curr,t]; end
+    result = (path, best_p)
+    return _register_hmm_result!(_ctx, result, "viterbi"; parameters=(seq_length=L, n_states=N, log_prob=Float64(best_p)))
+end
+
 function viterbi(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     L = length(sequence); N = length(hmm.states)
     _ctx = active_provenance_context()
@@ -122,25 +384,48 @@ function viterbi(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     end
     best_p, best_last = T(-Inf), 0
     @inbounds for i in 1:N; v[i,L] > best_p && (best_p = v[i,L]; best_last = i); end
+    best_last == 0 && throw(ArgumentError("observation sequence has zero probability under this HMM"))
     path = Vector{Int}(undef, L)
-    if best_last != 0
-        curr = best_last
-        @inbounds for t in L:-1:1; path[t] = curr; curr = tb[curr,t]; end
-    end
+    curr = best_last
+    @inbounds for t in L:-1:1; path[t] = curr; curr = tb[curr,t]; end
     result = (path, best_p)
     return _register_hmm_result!(_ctx, result, "viterbi"; parameters=(seq_length=L, n_states=N, log_prob=Float64(best_p)))
 end
 
-viterbi(hmm::HMM, seq::BioSequence; _ctx=nothing)     = viterbi(hmm, seq.data)
-viterbi(hmm::HMM, seq::String; _ctx=nothing)          = viterbi(hmm, collect(codeunits(String(seq))))
+viterbi(hmm::AbstractHMM, seq::BioSequence; _ctx=nothing)     = viterbi(hmm, _hmm_bytes(seq))
+viterbi(hmm::AbstractHMM, seq::AbstractString; _ctx=nothing) = viterbi(hmm, _hmm_bytes(seq))
 
 # ===========================================================================
-# Forward (original; log-space, rolling buffer)
+# Forward Algorithm (Generic AbstractHMM & Specialized HMM)
 # ===========================================================================
 
 """
     forward(hmm, sequence) → log_probability
 """
+function forward(hmm::AbstractHMM{T}, sequence::AbstractVector) where {T}
+    L = length(sequence); N = n_states(hmm)
+    _ctx = active_provenance_context()
+    L == 0 && return _register_hmm_result!(_ctx, T(-Inf), "forward"; parameters=(seq_length=0, n_states=N))
+    alpha = Matrix{T}(undef, N, 2); cc, pc = 1, 2
+    ini = initial_distribution(hmm)
+    trn = transition_matrix(hmm)
+    @inbounds for i in 1:N
+        alpha[i,cc] = ini[i] + log_emission(hmm, i, sequence[1])
+    end
+    @inbounds for t in 2:L
+        cc, pc = pc, cc
+        obs_t = sequence[t]
+        for j in 1:N
+            s = T(-Inf)
+            for i in 1:N; s = logaddexp(s, alpha[i,pc] + trn[i,j]); end
+            alpha[j,cc] = s + log_emission(hmm, j, obs_t)
+        end
+    end
+    total = T(-Inf)
+    @inbounds for i in 1:N; total = logaddexp(total, alpha[i,cc]); end
+    return _register_hmm_result!(_ctx, total, "forward"; parameters=(seq_length=L, n_states=N, log_likelihood=Float64(total)))
+end
+
 function forward(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     L = length(sequence); N = length(hmm.states)
     _ctx = active_provenance_context()
@@ -162,16 +447,35 @@ function forward(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     return _register_hmm_result!(_ctx, total, "forward"; parameters=(seq_length=L, n_states=N, log_likelihood=Float64(total)))
 end
 
-forward(hmm::HMM, seq::BioSequence; _ctx=nothing)    = forward(hmm, seq.data)
-forward(hmm::HMM, seq::String; _ctx=nothing)         = forward(hmm, collect(codeunits(String(seq))))
+forward(hmm::AbstractHMM, seq::BioSequence; _ctx=nothing)    = forward(hmm, _hmm_bytes(seq))
+forward(hmm::AbstractHMM, seq::AbstractString; _ctx=nothing) = forward(hmm, _hmm_bytes(seq))
 
 # ===========================================================================
-# Backward (original)
+# Backward Algorithm
 # ===========================================================================
 
 """
     backward(hmm, sequence) → N × L log-probability matrix
 """
+function backward(hmm::AbstractHMM{T}, sequence::AbstractVector) where {T}
+    L = length(sequence); N = n_states(hmm)
+    beta = Matrix{T}(undef, N, L)
+    L == 0 && return beta
+    trn = transition_matrix(hmm)
+    @inbounds for i in 1:N; beta[i,L] = T(0); end
+    @inbounds for t in L-1:-1:1
+        obs_next = sequence[t+1]
+        for i in 1:N
+            s = T(-Inf)
+            for j in 1:N
+                s = logaddexp(s, trn[i,j] + log_emission(hmm, j, obs_next) + beta[j,t+1])
+            end
+            beta[i,t] = s
+        end
+    end
+    return beta
+end
+
 function backward(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     L = length(sequence); N = length(hmm.states)
     beta = Matrix{T}(undef, N, L)
@@ -190,13 +494,28 @@ function backward(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     return beta
 end
 
-backward(hmm::HMM, seq::BioSequence)    = backward(hmm, seq.data)
-backward(hmm::HMM, seq::String)        = backward(hmm, collect(codeunits(String(seq))))
-# Removed backward(::HMM, ::AbstractString) - use BioSequence instead
+backward(hmm::AbstractHMM, seq::BioSequence)    = backward(hmm, _hmm_bytes(seq))
+backward(hmm::AbstractHMM, seq::AbstractString) = backward(hmm, _hmm_bytes(seq))
 
 # ===========================================================================
-# Full forward table (N × L) — needed for Baum-Welch
+# Full forward table (N × L) — needed for Baum-Welch & Posterior Decoding
 # ===========================================================================
+
+function _forward_table(hmm::AbstractHMM{T}, sequence::AbstractVector) where {T}
+    L = length(sequence); N = n_states(hmm)
+    alpha = fill(T(-Inf), N, L)
+    ini = initial_distribution(hmm)
+    trn = transition_matrix(hmm)
+    @inbounds for i in 1:N
+        alpha[i,1] = ini[i] + log_emission(hmm, i, sequence[1])
+    end
+    @inbounds for t in 2:L, j in 1:N
+        s = T(-Inf)
+        for i in 1:N; s = logaddexp(s, alpha[i,t-1] + trn[i,j]); end
+        alpha[j,t] = s + log_emission(hmm, j, sequence[t])
+    end
+    return alpha
+end
 
 function _forward_table(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
     L = length(sequence); N = length(hmm.states)
@@ -213,7 +532,7 @@ function _forward_table(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
 end
 
 # ===========================================================================
-# NEW: HMM log-likelihood
+# HMM Log-Likelihood
 # ===========================================================================
 
 """
@@ -221,19 +540,16 @@ end
 
 Compute the total log-likelihood of a set of observed sequences given `hmm`.
 """
-function hmm_log_likelihood(hmm::HMM, sequences)
+function hmm_log_likelihood(hmm::AbstractHMM, sequences)
     total = 0.0
     for seq in sequences
-        bytes = seq isa AbstractVector{UInt8} ? seq :
-                seq isa BioSequence ? seq.data : collect(codeunits(String(seq)))
-        total += forward(hmm, bytes)
+        total += forward(hmm, seq)
     end
-
     return total
 end
 
 # ===========================================================================
-# NEW: Posterior state probabilities (smoothed decoding)
+# Posterior State Probabilities (Smoothed Decoding)
 # ===========================================================================
 
 """
@@ -242,11 +558,13 @@ end
 Compute γ_t(i) = P(state=i at t | sequence, hmm) using forward-backward.
 Equivalent to the "E-step" responsibilities without accumulating.
 """
-function posterior_state_probabilities(hmm::HMM{T}, sequence::AbstractVector{UInt8}) where {T}
-    L = length(sequence); N = length(hmm.states)
+function posterior_state_probabilities(hmm::AbstractHMM{T}, sequence::AbstractVector) where {T}
+    L = length(sequence); N = n_states(hmm)
+    L == 0 && return Matrix{Float64}(undef, N, 0)
     alpha = _forward_table(hmm, sequence)
     beta  = backward(hmm, sequence)
     log_px = forward(hmm, sequence)
+    isfinite(log_px) || throw(ArgumentError("observation sequence has zero probability under this HMM"))
     gamma = Matrix{Float64}(undef, N, L)
     @inbounds for t in 1:L
         s = -Inf
@@ -258,10 +576,19 @@ function posterior_state_probabilities(hmm::HMM{T}, sequence::AbstractVector{UIn
     return gamma
 end
 
-# Removed posterior_state_probabilities(::HMM, ::AbstractString) - use BioSequence instead
+posterior_state_probabilities(hmm::AbstractHMM, seq::AbstractString; _ctx=nothing) =
+    posterior_state_probabilities(hmm, _hmm_bytes(seq))
+
+"""Return smoothed state posteriors and the sequence log likelihood."""
+function forward_backward(hmm::AbstractHMM, sequence)
+    return posterior_state_probabilities(hmm, sequence), forward(hmm, sequence)
+end
+
+posteriors(hmm::AbstractHMM, sequence) = first(forward_backward(hmm, sequence))
+loglikelihood(hmm::AbstractHMM, sequence) = forward(hmm, sequence)
 
 # ===========================================================================
-# NEW: Posterior decode (MAP assignment per position)
+# Posterior Decode (MAP assignment per position)
 # ===========================================================================
 
 """
@@ -270,12 +597,9 @@ end
 Assign each position to the highest-posterior state. Softer than Viterbi;
 does not guarantee globally-consistent paths. Analogous to `hmmlearn.decode`.
 """
-function posterior_decode(hmm::HMM, sequence)
-    bytes = sequence isa AbstractVector{UInt8} ? sequence :
-            sequence isa BioSequence           ? sequence.data : collect(codeunits(String(sequence)))
-    gamma = posterior_state_probabilities(hmm, bytes)
+function posterior_decode(hmm::AbstractHMM, sequence)
+    gamma = posterior_state_probabilities(hmm, sequence)
     assignments = [argmax(gamma[:,t]) for t in axes(gamma,2)]
-
     return assignments, gamma
 end
 
@@ -319,6 +643,7 @@ function baum_welch!(hmm::HMM{T}, sequences; max_iter::Int=100, tol::Real=1e-4, 
             # Log-probability of this sequence
             log_px = -Inf
             for i in 1:N; log_px = logaddexp(log_px, alpha[i,L]); end
+            isfinite(log_px) || throw(ArgumentError("observation sequence has zero probability under this HMM"))
             total_ll += log_px
 
             # γ_t(i) accumulation
@@ -360,17 +685,11 @@ function baum_welch!(hmm::HMM{T}, sequences; max_iter::Int=100, tol::Real=1e-4, 
         end
 
         # M-step: update parameters in-place using HMM field mutation
-        ini_sum  = max(sum(ini_acc),  eps(Float64))
-        new_ini  = log.(ini_acc  ./ ini_sum)
-        trans_row_sums = max.(vec(sum(trans_acc, dims=2)), eps(Float64))
-        new_trans = log.(trans_acc ./ trans_row_sums)
-        emis_row_sums  = max.(vec(sum(emis_acc,  dims=2)), eps(Float64))
-        new_emis  = log.(emis_acc  ./ emis_row_sums)
-
-        # Mutate the HMM fields (they're Vector/Matrix so in-place assignment works)
-        hmm.initial    .= new_ini
-        hmm.transitions .= new_trans
-        hmm.emissions   .= new_emis
+        # Preserve distributions for states/rows with zero expected count;
+        # manufacturing eps-sized probabilities makes EM silently invalid.
+        _hmm_update_log_vector!(hmm.initial, ini_acc)
+        _hmm_update_log_rows!(hmm.transitions, trans_acc)
+        _hmm_update_log_rows!(hmm.emissions, emis_acc)
     end
     return log_likelihoods
 end
@@ -382,13 +701,20 @@ Randomly initialise and Baum-Welch train a new HMM from scratch.
 """
 function baum_welch_train(n_states::Int, alphabet::Vector{UInt8}, sequences;
                           max_iter::Int=100, tol::Real=1e-4, seed::Int=1, verbose::Bool=false)
-    rng   = Random.MersenneTwister(seed)
+    rng   = MersenneTwister(seed)
     N, V  = n_states, length(alphabet)
-    ini   = normalize(rand(rng, Float64, N), 1)
+    ini_values = rand(rng, Float64, N)
+    ini   = ini_values ./ sum(ini_values)
     trans = Matrix{Float64}(undef, N, N)
-    for i in 1:N; trans[i,:] = normalize(rand(rng, Float64, N), 1); end
+    for i in 1:N
+        values = rand(rng, Float64, N)
+        trans[i, :] = values ./ sum(values)
+    end
     emis  = Matrix{Float64}(undef, N, V)
-    for i in 1:N; emis[i,:]  = normalize(rand(rng, Float64, V), 1); end
+    for i in 1:N
+        values = rand(rng, Float64, V)
+        emis[i, :] = values ./ sum(values)
+    end
     hmm   = HMM(["state_$i" for i in 1:n_states], alphabet, ini, trans, emis)
     lls   = baum_welch!(hmm, sequences; max_iter=max_iter, tol=tol, verbose=verbose)
     _ctx = active_provenance_context()
@@ -414,7 +740,7 @@ function viterbi_train!(hmm::HMM{T}, sequences; max_iter::Int=50, tol::Real=1e-4
             s isa BioSequence ? s.data : collect(codeunits(String(s))) for s in sequences]
 
     prev_ll = -Inf
-    for iter in 1:max_iter
+    for _ in 1:max_iter
         ini_acc   = zeros(Float64, N)
         trans_acc = zeros(Float64, N, N)
         emis_acc  = zeros(Float64, N, V)
@@ -430,16 +756,9 @@ function viterbi_train!(hmm::HMM{T}, sequences; max_iter::Int=50, tol::Real=1e-4
             end
         end
 
-        ini_sum  = max(sum(ini_acc),  eps())
-        hmm.initial    .= log.(ini_acc  ./ ini_sum)
-        for i in 1:N
-            rs = max(sum(trans_acc[i,:]), eps())
-            hmm.transitions[i,:] .= log.(trans_acc[i,:] ./ rs)
-        end
-        for i in 1:N
-            rs = max(sum(emis_acc[i,:]), eps())
-            hmm.emissions[i,:]   .= log.(emis_acc[i,:]  ./ rs)
-        end
+        _hmm_update_log_vector!(hmm.initial, ini_acc)
+        _hmm_update_log_rows!(hmm.transitions, trans_acc)
+        _hmm_update_log_rows!(hmm.emissions, emis_acc)
 
         ll = hmm_log_likelihood(hmm, seqs)
         abs(ll - prev_ll) < Float64(tol) && break
@@ -562,8 +881,7 @@ Segment a sequence into contiguous runs of the same hidden state.
 Analogous to `hmmlearn` `predict` + run-length encoding.
 """
 function segment_sequence(hmm::HMM, sequence; method::Symbol=:viterbi)
-    bytes = sequence isa AbstractVector{UInt8} ? sequence :
-            sequence isa BioSequence           ? sequence.data : collect(codeunits(String(sequence)))
+    bytes = _hmm_bytes(sequence)
 
     if method == :posterior
         assignments, gamma = posterior_decode(hmm, bytes)
@@ -580,12 +898,12 @@ function segment_sequence(hmm::HMM, sequence; method::Symbol=:viterbi)
     for t in 2:length(assignments)
         if assignments[t] != prev_state
             push!(segments, HMMSegment(seg_start, t-1, prev_state,
-                hmm.states[prev_state], log(max(mean(probs[seg_start:t-1]), eps()))))
+                hmm.states[prev_state], log(max(sum(probs[seg_start:t-1]) / (t - seg_start), eps()))))
             seg_start = t; prev_state = assignments[t]
         end
     end
     push!(segments, HMMSegment(seg_start, length(assignments), prev_state,
-        hmm.states[prev_state], log(max(mean(probs[seg_start:end]), eps()))))
+        hmm.states[prev_state], log(max(sum(probs[seg_start:end]) / (length(probs) - seg_start + 1), eps()))))
 
     return segments
 end
@@ -696,8 +1014,16 @@ function score_profile_hmm(phmm::ProfileHMM, sequence::BioSequence; return_per_p
     end
 
     best = max(M[n+1,L+1], I[n+1,L+1], D[n+1,L+1])
+    score = best - phmm.null_log_odds
 
-    return best - phmm.null_log_odds
+    # Prefix scores are useful for locating the strongest local hit while
+    # retaining the scalar return value used by the ordinary API.
+    if return_per_position
+        per_position = [max(M[i+1,L+1], I[i+1,L+1], D[i+1,L+1]) - phmm.null_log_odds
+                        for i in 1:n]
+        return (score=score, per_position=per_position)
+    end
+    return score
 end
 
 # ===========================================================================
@@ -833,3 +1159,428 @@ function load_hmm(path::AbstractString)
 
     return HMM(String.(states), alphabet, initial, transitions, emissions; log_space=true)
 end
+
+# ===========================================================================
+# Gaussian HMM (Continuous Observation Signals: CNV, Intensity, Mass Spec)
+# ===========================================================================
+
+"""
+    GaussianHMM{T<:AbstractFloat}
+
+A Hidden Markov Model with 1D Gaussian emissions per state for continuous signals.
+"""
+struct GaussianHMM{T<:AbstractFloat} <: AbstractHMM{T}
+    states::Vector{String}
+    initial::Vector{T}        # Log-space
+    transitions::Matrix{T}    # Log-space N x N
+    means::Vector{T}          # State means μ_k
+    vars::Vector{T}           # State variances σ_k^2 (>0)
+
+    function GaussianHMM{T}(states, initial, transitions, means, vars) where {T}
+        N = length(states)
+        length(initial) == N || throw(ArgumentError("initial must match number of states"))
+        size(transitions) == (N, N) || throw(ArgumentError("transitions matrix must be N x N"))
+        length(means) == N || throw(ArgumentError("means vector must match number of states"))
+        length(vars) == N || throw(ArgumentError("vars vector must match number of states"))
+        any(v -> v <= 0 || !isfinite(v), vars) && throw(ArgumentError("variances must be strictly positive and finite"))
+        new{T}(String.(states), T.(initial), T.(transitions), T.(means), T.(vars))
+    end
+end
+
+@inline log_emission(ghmm::GaussianHMM, state_idx::Int, x::Real) = _gaussian_logpdf(ghmm.means[state_idx], ghmm.vars[state_idx], x)
+
+function GaussianHMM(states::AbstractVector{<:AbstractString}, initial::AbstractVector,
+                     transitions::AbstractMatrix, means::AbstractVector, vars::AbstractVector;
+                     log_space::Bool=false)
+    T = Float64
+    ini = log_space ? _hmm_normalize_log_vector(initial, "initial") : _hmm_log_probabilities(initial, "initial")
+    trn = log_space ? _hmm_log_matrix_from_logs(transitions, "transition") : _hmm_log_matrix(transitions, "transition")
+    return GaussianHMM{T}(collect(states), ini, trn, collect(means), collect(vars))
+end
+
+@inline function _gaussian_logpdf(mean::T, var::T, x::Real) where {T}
+    dx = Float64(x) - mean
+    return -0.5 * (log(2π * var) + (dx * dx) / var)
+end
+
+function forward(ghmm::GaussianHMM{T}, sequence::AbstractVector{<:Real}) where {T}
+    L = length(sequence); N = length(ghmm.states)
+    L == 0 && return T(-Inf)
+    alpha = Matrix{T}(undef, N, 2); cc, pc = 1, 2
+    @inbounds for i in 1:N
+        alpha[i,cc] = ghmm.initial[i] + _gaussian_logpdf(ghmm.means[i], ghmm.vars[i], sequence[1])
+    end
+    @inbounds for t in 2:L
+        cc, pc = pc, cc
+        x_t = sequence[t]
+        for j in 1:N
+            s = T(-Inf)
+            for i in 1:N; s = logaddexp(s, alpha[i,pc] + ghmm.transitions[i,j]); end
+            alpha[j,cc] = s + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], x_t)
+        end
+    end
+    total = T(-Inf)
+    @inbounds for i in 1:N; total = logaddexp(total, alpha[i,cc]); end
+    return total
+end
+
+function backward(ghmm::GaussianHMM{T}, sequence::AbstractVector{<:Real}) where {T}
+    L = length(sequence); N = length(ghmm.states)
+    beta = Matrix{T}(undef, N, L)
+    L == 0 && return beta
+    @inbounds for i in 1:N; beta[i,L] = T(0); end
+    @inbounds for t in L-1:-1:1
+        x_next = sequence[t+1]
+        for i in 1:N
+            s = T(-Inf)
+            for j in 1:N
+                s = logaddexp(s, ghmm.transitions[i,j] + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], x_next) + beta[j,t+1])
+            end
+            beta[i,t] = s
+        end
+    end
+    return beta
+end
+
+function viterbi(ghmm::GaussianHMM{T}, sequence::AbstractVector{<:Real}) where {T}
+    L = length(sequence); N = length(ghmm.states)
+    L == 0 && return (Int[], T(-Inf))
+    v = Matrix{T}(undef, N, L)
+    tb = Matrix{Int}(undef, N, L)
+    @inbounds for i in 1:N
+        v[i,1] = ghmm.initial[i] + _gaussian_logpdf(ghmm.means[i], ghmm.vars[i], sequence[1])
+        tb[i,1] = 0
+    end
+    @inbounds for t in 2:L
+        x_t = sequence[t]
+        for j in 1:N
+            best_p, best_i = T(-Inf), 0
+            for i in 1:N
+                p = v[i,t-1] + ghmm.transitions[i,j]
+                p > best_p && (best_p = p; best_i = i)
+            end
+            v[j,t] = best_p + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], x_t)
+            tb[j,t] = best_i
+        end
+    end
+    best_p, best_last = T(-Inf), 0
+    @inbounds for i in 1:N; v[i,L] > best_p && (best_p = v[i,L]; best_last = i); end
+    best_last == 0 && throw(ArgumentError("observation sequence has zero probability under Gaussian HMM"))
+    path = Vector{Int}(undef, L)
+    curr = best_last
+    @inbounds for t in L:-1:1; path[t] = curr; curr = tb[curr,t]; end
+    return path, best_p
+end
+
+function posterior_state_probabilities(ghmm::GaussianHMM{T}, sequence::AbstractVector{<:Real}) where {T}
+    L = length(sequence); N = length(ghmm.states)
+    L == 0 && return Matrix{Float64}(undef, N, 0)
+    alpha = fill(T(-Inf), N, L)
+    @inbounds for i in 1:N
+        alpha[i,1] = ghmm.initial[i] + _gaussian_logpdf(ghmm.means[i], ghmm.vars[i], sequence[1])
+    end
+    @inbounds for t in 2:L, j in 1:N
+        s = T(-Inf)
+        for i in 1:N; s = logaddexp(s, alpha[i,t-1] + ghmm.transitions[i,j]); end
+        alpha[j,t] = s + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], sequence[t])
+    end
+    beta = backward(ghmm, sequence)
+    gamma = Matrix{Float64}(undef, N, L)
+    @inbounds for t in 1:L
+        s = -Inf
+        for i in 1:N; s = logaddexp(s, alpha[i,t] + beta[i,t]); end
+        for i in 1:N
+            gamma[i,t] = exp(alpha[i,t] + beta[i,t] - s)
+        end
+    end
+    return gamma
+end
+
+function baum_welch!(ghmm::GaussianHMM{T}, sequences; max_iter::Int=100, tol::Real=1e-4) where {T}
+    N = length(ghmm.states)
+    seqs = [collect(Float64.(s)) for s in sequences]
+    log_likelihoods = Float64[]
+    ini_acc  = zeros(Float64, N)
+    trans_acc = zeros(Float64, N, N)
+
+    for iter in 1:max_iter
+        fill!(ini_acc, 0.0)
+        fill!(trans_acc, 0.0)
+        mean_num = zeros(Float64, N)
+        mean_den = zeros(Float64, N)
+        total_ll = 0.0
+
+        for s in seqs
+            L = length(s)
+            L < 1 && continue
+            gamma = posterior_state_probabilities(ghmm, s)
+            log_px = forward(ghmm, s)
+            total_ll += log_px
+
+            for t in 1:L
+                for i in 1:N
+                    γ = gamma[i,t]
+                    t == 1 && (ini_acc[i] += γ)
+                    mean_num[i] += γ * s[t]
+                    mean_den[i] += γ
+                end
+            end
+
+            alpha = fill(T(-Inf), N, L)
+            @inbounds for i in 1:N; alpha[i,1] = ghmm.initial[i] + _gaussian_logpdf(ghmm.means[i], ghmm.vars[i], s[1]); end
+            @inbounds for t in 2:L, j in 1:N
+                st = T(-Inf)
+                for i in 1:N; st = logaddexp(st, alpha[i,t-1] + ghmm.transitions[i,j]); end
+                alpha[j,t] = st + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], s[t])
+            end
+            beta = backward(ghmm, s)
+
+            for t in 1:(L-1)
+                denom = -Inf
+                for i in 1:N, j in 1:N
+                    denom = logaddexp(denom, alpha[i,t] + ghmm.transitions[i,j] + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], s[t+1]) + beta[j,t+1])
+                end
+                for i in 1:N, j in 1:N
+                    ξ = exp(alpha[i,t] + ghmm.transitions[i,j] + _gaussian_logpdf(ghmm.means[j], ghmm.vars[j], s[t+1]) + beta[j,t+1] - denom)
+                    trans_acc[i,j] += ξ
+                end
+            end
+        end
+
+        push!(log_likelihoods, total_ll)
+
+        _hmm_update_log_vector!(ghmm.initial, ini_acc)
+        _hmm_update_log_rows!(ghmm.transitions, trans_acc)
+        for i in 1:N
+            if mean_den[i] > 0
+                new_m = mean_num[i] / mean_den[i]
+                ghmm.means[i] = new_m
+                v_num = 0.0
+                for s in seqs
+                    gamma_s = posterior_state_probabilities(ghmm, s)
+                    for t in 1:length(s)
+                        dx = s[t] - new_m
+                        v_num += gamma_s[i,t] * dx * dx
+                    end
+                end
+                ghmm.vars[i] = max(v_num / mean_den[i], 1e-4)
+            end
+        end
+
+        if length(log_likelihoods) >= 2 && abs(log_likelihoods[end] - log_likelihoods[end-1]) < Float64(tol)
+            break
+        end
+    end
+    return log_likelihoods
+end
+
+# ===========================================================================
+# ChromHMM (Multivariate Epigenomic Binary Signal HMM)
+# ===========================================================================
+
+"""
+    ChromHMM{T<:AbstractFloat}
+
+Multivariate Bernoulli HMM for chromatin state learning across multi-track histone mark signals (ChromHMM architecture).
+"""
+struct ChromHMM{T<:AbstractFloat} <: AbstractHMM{T}
+    states::Vector{String}
+    mark_names::Vector{String}
+    initial::Vector{T}              # Log-space
+    transitions::Matrix{T}          # Log-space N x N
+    emission_probs::Matrix{Float64} # N states x M marks (in [0,1])
+
+    function ChromHMM{T}(states, mark_names, initial, transitions, emission_probs) where {T}
+        N = length(states); M = length(mark_names)
+        length(initial) == N || throw(ArgumentError("initial must match number of states"))
+        size(transitions) == (N, N) || throw(ArgumentError("transitions matrix must be N x N"))
+        size(emission_probs) == (N, M) || throw(ArgumentError("emission_probs matrix must be N x M"))
+        any(p -> p < 0 || p > 1, emission_probs) && throw(ArgumentError("emission probabilities must be in [0,1]"))
+        new{T}(String.(states), String.(mark_names), T.(initial), T.(transitions), Float64.(emission_probs))
+    end
+end
+
+function ChromHMM(states::AbstractVector{<:AbstractString}, mark_names::AbstractVector{<:AbstractString},
+                  initial::AbstractVector, transitions::AbstractMatrix, emission_probs::AbstractMatrix;
+                  log_space::Bool=false)
+    T = Float64
+    ini = log_space ? _hmm_normalize_log_vector(initial, "initial") : _hmm_log_probabilities(initial, "initial")
+    trn = log_space ? _hmm_log_matrix_from_logs(transitions, "transition") : _hmm_log_matrix(transitions, "transition")
+    return ChromHMM{T}(collect(states), collect(mark_names), ini, trn, collect(emission_probs))
+end
+
+@inline function _chrom_emission_logprob(chmm::ChromHMM, state_idx::Int, mark_vector::AbstractVector{<:Real})
+    logp = 0.0
+    @inbounds for m in 1:length(mark_vector)
+        p = clamp(chmm.emission_probs[state_idx, m], 1e-6, 1.0 - 1e-6)
+        logp += mark_vector[m] > 0 ? log(p) : log(1.0 - p)
+    end
+    return logp
+end
+
+@inline log_emission(chmm::ChromHMM, state_idx::Int, mark_vector::AbstractVector{<:Real}) = _chrom_emission_logprob(chmm, state_idx, mark_vector)
+
+function viterbi(chmm::ChromHMM{T}, mark_matrix::AbstractMatrix{<:Real}) where {T}
+    M, L = size(mark_matrix); N = length(chmm.states)
+    L == 0 && return (Int[], T(-Inf))
+    v = Matrix{T}(undef, N, L)
+    tb = Matrix{Int}(undef, N, L)
+    @inbounds for i in 1:N
+        v[i,1] = chmm.initial[i] + _chrom_emission_logprob(chmm, i, view(mark_matrix, :, 1))
+        tb[i,1] = 0
+    end
+    @inbounds for t in 2:L
+        m_t = view(mark_matrix, :, t)
+        for j in 1:N
+            best_p, best_i = T(-Inf), 0
+            for i in 1:N
+                p = v[i,t-1] + chmm.transitions[i,j]
+                p > best_p && (best_p = p; best_i = i)
+            end
+            v[j,t] = best_p + _chrom_emission_logprob(chmm, j, m_t)
+            tb[j,t] = best_i
+        end
+    end
+    best_p, best_last = T(-Inf), 0
+    @inbounds for i in 1:N; v[i,L] > best_p && (best_p = v[i,L]; best_last = i); end
+    path = Vector{Int}(undef, L)
+    curr = best_last
+    @inbounds for t in L:-1:1; path[t] = curr; curr = tb[curr,t]; end
+    return path, best_p
+end
+
+"""
+    segment_chromatin(chmm, mark_matrix) → Vector{HMMSegment}
+
+Segment genome into chromatin states based on multi-track histone mark binary signals.
+"""
+function segment_chromatin(chmm::ChromHMM, mark_matrix::AbstractMatrix{<:Real})
+    path, log_p = viterbi(chmm, mark_matrix)
+    L = length(path)
+    segments = HMMSegment[]
+    L == 0 && return segments
+    seg_start = 1; prev_state = path[1]
+    for t in 2:L
+        if path[t] != prev_state
+            push!(segments, HMMSegment(seg_start, t-1, prev_state, chmm.states[prev_state], log_p / L))
+            seg_start = t; prev_state = path[t]
+        end
+    end
+    push!(segments, HMMSegment(seg_start, L, prev_state, chmm.states[prev_state], log_p / L))
+    return segments
+end
+
+# ===========================================================================
+# Model Selection, Entropy & StatsAPI Wrappers
+# ===========================================================================
+
+"""
+    aic(hmm, sequences) → Float64
+
+Akaike Information Criterion: AIC = 2*k - 2*logL.
+"""
+function aic(hmm::HMM, sequences)
+    k = nparams(hmm)
+    ll = hmm_log_likelihood(hmm, sequences)
+    return 2 * k - 2 * ll
+end
+
+"""
+    bic(hmm, sequences) → Float64
+
+Bayesian Information Criterion: BIC = k*ln(N_obs) - 2*logL.
+"""
+function bic(hmm::HMM, sequences)
+    k = nparams(hmm)
+    total_obs = sum(length(s) for s in sequences)
+    ll = hmm_log_likelihood(hmm, sequences)
+    return k * log(max(total_obs, 1)) - 2 * ll
+end
+
+"""
+    state_entropy(gamma::AbstractMatrix{Float64}) → Vector{Float64}
+
+Compute Shannon state assignment entropy per position from posterior probabilities γ (N x L).
+"""
+function state_entropy(gamma::AbstractMatrix{Float64})
+    L = size(gamma, 2)
+    entropies = Vector{Float64}(undef, L)
+    for t in 1:L
+        h = 0.0
+        for i in 1:size(gamma, 1)
+            p = gamma[i,t]
+            p > 0 && (h -= p * log2(p))
+        end
+        entropies[t] = h
+    end
+    return entropies
+end
+
+"""
+    cross_validate_hmm(sequences, n_states_range; k_folds=5, seed=1) → Dict{Int,Float64}
+
+Perform K-fold cross-validation over `n_states_range` to select the optimal number of HMM states.
+"""
+function cross_validate_hmm(sequences, n_states_range; k_folds::Int=5, seed::Int=1)
+    rng = MersenneTwister(seed)
+    n_seqs = length(sequences)
+    n_seqs >= k_folds || throw(ArgumentError("Number of sequences ($n_seqs) must be >= k_folds ($k_folds)"))
+    shuffled_idx = randperm(rng, n_seqs)
+    fold_size = ceil(Int, n_seqs / k_folds)
+
+    results = Dict{Int, Float64}()
+    for k in n_states_range
+        val_lls = Float64[]
+        for f in 1:k_folds
+            val_indices = shuffled_idx[((f-1)*fold_size + 1):min(f*fold_size, n_seqs)]
+            train_indices = setdiff(shuffled_idx, val_indices)
+            train_seqs = sequences[train_indices]
+            val_seqs = sequences[val_indices]
+
+            alphabet = UInt8.(collect(b"ACGT"))
+            if !isempty(sequences) && sequences[1] isa AbstractVector{UInt8}
+                alphabet = unique(vcat(sequences...))
+            end
+
+            trained_hmm, _ = baum_welch_train(k, alphabet, train_seqs; seed=seed+f, max_iter=30)
+            push!(val_lls, hmm_log_likelihood(trained_hmm, val_seqs))
+        end
+        results[k] = mean(val_lls)
+    end
+    return results
+end
+
+"""
+    fit!(hmm::HMM, sequences; kwargs...)
+
+In-place Baum-Welch training wrapper for standard StatsAPI interface.
+"""
+fit!(hmm::HMM, sequences; kwargs...) = baum_welch!(hmm, sequences; kwargs...)
+
+"""
+    logdensityof(hmm::HMM, sequence) → Float64
+
+Alias for forward sequence log-likelihood.
+"""
+logdensityof(hmm::HMM, sequence) = forward(hmm, sequence)
+
+# ===========================================================================
+# Blender 3D Integrator Payload Overload
+# ===========================================================================
+
+import .BlenderIntegrator: BlenderMaterial, BlenderHMMPayload, to_blender_payload
+
+"""
+    to_blender_payload(hmm::AbstractHMM, sequence; name="HMM_Landscape") → BlenderHMMPayload
+
+Convert any HMM model and sequence into a 3D BlenderHMMPayload visualization node.
+"""
+function to_blender_payload(hmm::AbstractHMM, sequence; name::String="HMM_Landscape")
+    gamma = posterior_state_probabilities(hmm, sequence)
+    st = states(hmm)
+    trans = exp.(transition_matrix(hmm))
+    mat = BlenderMaterial(name="HMMMaterial", color=(0.2, 0.6, 0.9, 1.0))
+    return BlenderHMMPayload(name, st, trans, gamma, mat)
+end
+
+

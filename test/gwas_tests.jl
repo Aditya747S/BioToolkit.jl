@@ -2,6 +2,7 @@ using Test
 using LinearAlgebra
 using Statistics
 using SimpleWeightedGraphs
+using Plots
 using BioToolkit
 
 function _write_u16_le(io::IO, value::Integer)

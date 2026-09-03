@@ -1,8 +1,42 @@
+using Test
+using BioToolkit
 using Random
 using DataFrames
 
 function _interval_signature(interval)
     return (interval.chrom, interval.left, interval.right, interval.strand, get(interval.metadata, "name", ""))
+end
+
+@testset "GenomicRanges Bioconductor-inspired accessors and interval utilities" begin
+    intervals = [
+        BioToolkit.GenomicInterval("chr1", 1, 10, '+', Dict("id" => 1)),
+        BioToolkit.GenomicInterval("chr1", 8, 12, '+', Dict("id" => 2)),
+        BioToolkit.GenomicInterval("chr2", 1, 3, '.', Dict("id" => 3)),
+    ]
+    collection = BioToolkit.GenomicRanges.build_collection(intervals)
+
+    @test BioToolkit.GenomicRanges.start(intervals[1]) == 1
+    @test BioToolkit.GenomicRanges.stop(intervals[1]) == 10
+    @test BioToolkit.GenomicRanges.end_position(collection) == [10, 12, 3]
+    @test BioToolkit.GenomicRanges.seqnames(intervals[1]) == "chr1"
+    @test BioToolkit.GenomicRanges.strand(intervals[1]) == '+'
+    @test BioToolkit.GenomicRanges.mcols(intervals[1])["id"] == 1
+    @test length(BioToolkit.GenomicRanges.subset_by_overlaps(collection, BioToolkit.GenomicRanges.build_collection([BioToolkit.GenomicInterval("chr1", 9, 9)]))) == 2
+    @test BioToolkit.GenomicRanges.overlaps_any(intervals, BioToolkit.GenomicRanges.build_collection([BioToolkit.GenomicInterval("chr1", 9, 9)])) == [true, true, false]
+    @test BioToolkit.GenomicRanges.restrict(intervals, 3, 9)[1].left == 3
+    terminator = BioToolkit.GenomicRanges.terminators(intervals[1:1], 2, 3)[1]
+    @test (terminator.chrom, terminator.left, terminator.right, terminator.strand) == ("chr1", 9, 13, '+')
+    @test length(BioToolkit.GenomicRanges.tile(intervals[1:1], 3)[1]) == 3
+    @test length(BioToolkit.GenomicRanges.sliding_windows(intervals[1:1], 4)[1]) == 7
+    @test !BioToolkit.GenomicRanges.is_disjoint(collection)
+    @test BioToolkit.GenomicRanges.disjoint_bins(intervals) == [1, 2, 1]
+    @test BioToolkit.GenomicRanges.duplicated_intervals(vcat(intervals, intervals[1:1])) == [false, false, false, true]
+    @test BioToolkit.GenomicRanges.range_intervals(collection)[1].left == 1
+    @test BioToolkit.GenomicRanges.poverlaps(intervals, intervals) == [true, true, true]
+    @test length(BioToolkit.GenomicRanges.overlaps_ranges(intervals[1], collection)) == 2
+    @test length(BioToolkit.GenomicRanges.find_overlap_pairs(intervals, collection)) == 5
+    @test !BioToolkit.GenomicRanges.is_normal(intervals)
+    @test length(BioToolkit.GenomicRanges.tile_genome(Dict("chr1" => 10, "chr2" => 5), 3)) == 3
 end
 
 _sorted_intervals(intervals) = sort(collect(intervals), by = _interval_signature)
@@ -435,4 +469,147 @@ end
         slow_positions = _coverage_positions(intervals)
         @test fast_positions == slow_positions
     end
+end
+
+@testset "GenomicRanges indexed bulk queries" begin
+    empty_collection = BioToolkit.GenomicRanges.build_collection(BioToolkit.GenomicInterval[])
+    @test isempty(empty_collection)
+    @test BioToolkit.GenomicRanges.find_overlaps(
+        BioToolkit.GenomicInterval("chr1", 1, 2), empty_collection) == BioToolkit.GenomicInterval[]
+    @test BioToolkit.GenomicRanges.count_overlaps(
+        BioToolkit.GenomicInterval("chr1", 1, 2), empty_collection) == 0
+
+    subject = BioToolkit.GenomicRanges.build_collection([
+        BioToolkit.GenomicInterval("chr1", 10, 20, '+', Dict("id" => 1)),
+        BioToolkit.GenomicInterval("chr1", 15, 25, '-', Dict("id" => 2)),
+        BioToolkit.GenomicInterval("chr1", 40, 50, '.', Dict("id" => 3)),
+        BioToolkit.GenomicInterval("chr2", 1, 5, '.', Dict("id" => 4)),
+    ])
+    queries = [
+        BioToolkit.GenomicInterval("chr1", 18, 18, '+'),
+        BioToolkit.GenomicInterval("chr1", 30, 35, '+'),
+        BioToolkit.GenomicInterval("chr2", 3, 3, '.'),
+    ]
+
+    bulk_hits = BioToolkit.GenomicRanges.find_overlaps(queries, subject)
+    @test [sort(get.(getfield.(hits, :metadata), "id", 0)) for hits in bulk_hits] == [[1, 2], [], [4]]
+    @test BioToolkit.GenomicRanges.count_overlaps(queries, subject) == [2, 0, 1]
+    @test collect(BioToolkit.GenomicRanges.eachoverlap(queries[1], subject)) == bulk_hits[1]
+    @test BioToolkit.GenomicRanges.hasintersection(queries[1], subject)
+    @test !BioToolkit.GenomicRanges.hasintersection(queries[2], subject)
+    @test length(collect(BioToolkit.GenomicRanges.eachoverlap(queries, subject))) == 3
+
+    query_collection = BioToolkit.GenomicRanges.build_collection(queries)
+    @test BioToolkit.GenomicRanges.find_overlaps(query_collection, subject) == bulk_hits
+    @test BioToolkit.GenomicRanges.count_overlaps(query_collection, subject) == [2, 0, 1]
+
+    tied_subject = BioToolkit.GenomicRanges.build_collection([
+        BioToolkit.GenomicInterval("chr1", 10, 10),
+        BioToolkit.GenomicInterval("chr1", 30, 30),
+    ])
+    tied = BioToolkit.GenomicRanges.nearest(BioToolkit.GenomicInterval("chr1", 20, 20), tied_subject; select=:all)
+    @test length(tied) == 2
+    @test BioToolkit.GenomicRanges.nearest(BioToolkit.GenomicInterval("chr1", 20, 20), tied_subject) isa BioToolkit.GenomicInterval
+end
+
+@testset "GenomicRanges storage and missing-row safety" begin
+    empty_metadata_interval = BioToolkit.GenomicInterval("chr1", 1, 2)
+    @test typeof(empty_metadata_interval) == BioToolkit.GenomicInterval{String,Int,Int,Char,NamedTuple{(),Tuple{}}}
+    collection = BioToolkit.GenomicRanges.build_collection([empty_metadata_interval])
+    @test eltype(collection.intervals) == BioToolkit.GenomicIntervalEmpty
+
+    table = DataFrame(chrom=["chr1", missing, "chr2"], start=[1, 2, missing], stop=[3, 4, 8])
+    parsed = BioToolkit.GenomicRanges.read_intervals(table)
+    @test length(parsed) == 1
+    @test parsed[1].chrom == "chr1"
+end
+
+@testset "Bioconductor API gap coverage" begin
+    table = DataFrame(
+        seq=["chr1", "chr1", missing],
+        s=[0, 10, 20],
+        e=[5, 15, 25],
+        strand_col=['+', '-', '+'],
+        feature=["a", "b", "ignored"])
+    intervals = BioToolkit.make_granges_from_dataframe(
+        table; chrom_col=:seq, start_col=:s, end_col=:e, strand_col=:strand_col,
+        metadata_cols=[:feature], zero_based=true)
+    @test length(intervals) == 2
+    @test intervals[1].left == 1
+    @test intervals[2].right == 15
+
+    grouped = BioToolkit.make_granges_list_from_dataframe(
+        DataFrame(group=["a", "a", "b"], chrom=["chr1", "chr1", "chr2"], start=[1, 5, 2], stop=[3, 8, 4]); group_col=:group)
+    @test sort(collect(keys(grouped))) == ["a", "b"]
+    @test length(grouped["a"]) == 2
+
+    @test BioToolkit.which_as_iranges([false, true, true, false, true]) == [BioToolkit.IRange(2, 2), BioToolkit.IRange(5, 1)]
+    @test BioToolkit.as_normal_iranges([BioToolkit.IRange(1, 3), BioToolkit.IRange(4, 2)]) == [BioToolkit.IRange(1, 5)]
+    @test BioToolkit.break_in_chunks(10, 3) == [1:4, 5:8, 9:10]
+    @test BioToolkit.is_small_genome(Dict("chr1" => 10, "chr2" => 20))
+end
+
+@testset "Expanded Bioconductor parity features" begin
+    # GPos and IPos tests
+    gp = BioToolkit.GPos("chr1", 100, '+')
+    @test BioToolkit.is_gpos(gp)
+    @test gp.left == 100 && gp.right == 100
+    gps = BioToolkit.GPos("chr1", [10, 20, 30])
+    @test length(gps) == 3 && all(BioToolkit.is_gpos, gps)
+
+    ip = BioToolkit.IPos(50)
+    @test BioToolkit.is_ipos(ip)
+    @test ip.start == 50 && ip.width == 1
+    ips = BioToolkit.IPos([1, 2, 3])
+    @test length(ips) == 3 && all(BioToolkit.is_ipos, ips)
+
+    # zoom tests
+    iv = BioToolkit.GenomicInterval("chr1", 10, 20, '+', Dict{String,Any}())
+    z_out = BioToolkit.zoom(iv, 2.0)
+    @test BioToolkit.GenomicRanges.width(z_out) == 22
+    z_in = BioToolkit.zoom_in(iv, 2.0)
+    @test BioToolkit.GenomicRanges.width(z_in) == 6
+
+    # seqlevels style mapping
+    styles = ["chr1", "chrX", "chrMT"]
+    mapped_ens = BioToolkit.map_seqlevels_style(styles, :Ensembl)
+    @test mapped_ens == ["1", "X", "MT"]
+    mapped_ucsc = BioToolkit.map_seqlevels_style(mapped_ens, :UCSC)
+    @test mapped_ucsc == ["chr1", "chrX", "chrMT"]
+
+    # coverage_by_transcript
+    exons_tx1 = BioToolkit.build_collection([
+        BioToolkit.GenomicInterval("chr1", 1, 5, '+'),
+        BioToolkit.GenomicInterval("chr1", 10, 12, '+')
+    ])
+    transcripts = Dict("tx1" => exons_tx1)
+    segs = [BioToolkit.CoverageSegment("chr1", 1, 15, 2)]
+    tx_cov = BioToolkit.coverage_by_transcript(segs, transcripts)
+    @test tx_cov["tx1"] == [2, 2, 2, 2, 2, 2, 2, 2] # 5 + 3 = 8 bases
+
+    # extract_transcript_seqs and extract_upstream_seqs
+    genome = Dict("chr1" => "ATCGATCGATCGATCGATCG")
+    tx_seqs = BioToolkit.extract_transcript_seqs(genome, transcripts)
+    @test tx_seqs["tx1"] == "ATCGATCG"
+
+    up_seqs = BioToolkit.extract_upstream_seqs(genome, transcripts; width=3)
+    @test up_seqs["tx1"] == ""
+    
+    exons_tx2 = BioToolkit.build_collection([
+        BioToolkit.GenomicInterval("chr1", 10, 15, '-')
+    ])
+    transcripts_minus = Dict("tx2" => exons_tx2)
+    tx_seqs_minus = BioToolkit.extract_transcript_seqs(genome, transcripts_minus)
+    @test tx_seqs_minus["tx2"] == BioToolkit.GenomicRanges._reverse_complement_string("TCGATC")
+
+    # extend_exons_into_introns & element_lengths
+    ext = BioToolkit.extend_exons_into_introns(transcripts, 2)
+    @test ext["tx1"][1].right == 7
+    @test BioToolkit.element_lengths(transcripts) == Dict("tx1" => 2)
+
+    # vcat for IntervalCollection
+    c1 = BioToolkit.build_collection([BioToolkit.GenomicInterval("chr1", 1, 5)])
+    c2 = BioToolkit.build_collection([BioToolkit.GenomicInterval("chr2", 10, 15)])
+    c_cat = vcat(c1, c2)
+    @test length(c_cat) == 2
 end

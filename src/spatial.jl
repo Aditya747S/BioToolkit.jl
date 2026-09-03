@@ -21,7 +21,9 @@ using DataFrames
 using SpecialFunctions: erf
 
 using ..SingleCell: SingleCellExperiment, find_markers, normalize_counts
-using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
+using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!, BlenderIntegrator
+using ..BlenderIntegrator: BlenderSpatialPayload, BlenderMaterial, to_blender_payload
+
 
 export SpatialExperiment, DeconvolutionResult
 export build_reference_matrix, rctd_deconvolution, cell2location_deconvolution
@@ -45,6 +47,19 @@ struct SpatialExperiment{M<:AbstractMatrix{Int}}
     experiment::SingleCellExperiment{M}
     spatial_coords::Matrix{Float64}
 end
+
+function BlenderIntegrator.to_blender_payload(spatial::SpatialExperiment; name::String="SpatialSpots", glyph_scale::Float64=1.0)
+    coords2d = spatial.spatial_coords
+    n_spots = size(coords2d, 1)
+    coords3d = zeros(Float64, n_spots, 3)
+    coords3d[:, 1:size(coords2d, 2)] .= coords2d
+    
+    labels = copy(spatial.experiment.cell_ids)
+    colors = [(0.2, 0.8, 0.4) for _ in 1:n_spots]
+    mat = BlenderMaterial(name=name * "_mat", color=(0.2, 0.8, 0.4, 1.0), roughness=0.5)
+    return BlenderSpatialPayload(name, coords3d, labels, colors, glyph_scale, mat)
+end
+
 
 struct DeconvolutionResult <: AbstractAnalysisResult
     spot_ids::Vector{String}

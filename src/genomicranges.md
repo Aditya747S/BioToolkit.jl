@@ -6,7 +6,7 @@
 
 ### Purpose
 
-Genomic analysis relies heavily on interval algebra: overlap peaks with genes, trim ranges to chromosome lengths, calculate coverage, derive promoters, disjoin intervals, and subtract masked regions. This module provides those operations in pure Julia using sorted interval collections with per-chromosome indices and interval trees.
+Genomic analysis relies heavily on interval algebra: overlap peaks with genes, trim ranges to chromosome lengths, calculate coverage, derive promoters, disjoin intervals, and subtract masked regions. This module provides those operations in pure Julia using sorted interval collections with compact per-chromosome prefix indices.
 
 ---
 
@@ -16,7 +16,7 @@ Genomic analysis relies heavily on interval algebra: overlap peaks with genes, t
 |---|---|
 | **Closed interval coordinates** | `GenomicInterval(left, right)` stores inclusive endpoints. |
 | **Chromosome partitioning** | `IntervalCollection` stores per-chromosome ranges for faster queries. |
-| **Sorted arrays plus interval trees** | Collections keep sorted arrays and per-chromosome `IntervalTree{Int}` indices. |
+| **Sorted arrays plus compact prefix indices** | Collections keep sorted coordinate arrays and per-chromosome prefix-max endpoint indices, avoiding one heap-allocated tree node per interval. |
 | **Metadata carries provenance** | Interval metadata is stamped unless provenance already exists. |
 | **Set operations preserve interval metadata** | Generated intervals usually copy metadata from the source interval. |
 | **DataFrame conversion preserves metadata columns** | Interval metadata keys become extra columns in tabular output. |
@@ -43,12 +43,12 @@ Genomic analysis relies heavily on interval algebra: overlap peaks with genes, t
 ### `GenomicInterval`
 
 ```julia
-struct GenomicInterval
-    chrom::String
-    left::Int
-    right::Int
-    strand::Char
-    metadata::Dict{String,Any}
+struct GenomicInterval{C,L,R,S,M}
+    chrom::C
+    left::L
+    right::R
+    strand::S
+    metadata::M
 end
 ```
 
@@ -66,20 +66,19 @@ end
 ### `IntervalCollection`
 
 ```julia
-struct IntervalCollection
+struct IntervalCollection{I<:GenomicInterval}
     chroms::PooledStringVector
     starts::Vector{Int}
     ends::Vector{Int}
     strands::Vector{Char}
-    metadata::Vector{Dict{String,Any}}
-    intervals::Vector{GenomicInterval}
+    intervals::Vector{I}
     chrom_indices::Dict{String,UnitRange{Int}}
     chrom_end_indices::Dict{String,Vector{Int}}
-    trees::Dict{String,IntervalTree{Int}}
+    prefix_max_ends::Dict{String,Vector{Int}}
 end
 ```
 
-**Description:** Sorted, indexed collection of genomic intervals. It stores both columnar arrays and the original interval vector.
+**Description:** Sorted, indexed collection of genomic intervals. Coordinate columns are retained as compact query caches; per-interval metadata is stored only once.
 
 ### `CoverageSegment`
 
@@ -139,7 +138,7 @@ build_collection(intervals::AbstractVector{<:GenomicInterval}) -> IntervalCollec
 IntervalCollection(intervals::AbstractVector{<:GenomicInterval})
 ```
 
-**Description:** Sorts intervals by chromosome, start, end, and strand; builds pooled chromosome arrays; creates per-chromosome index ranges; and builds interval trees for overlap queries.
+**Description:** Sorts intervals by chromosome, start, end, and strand; builds pooled chromosome arrays; creates per-chromosome index ranges; and builds prefix-max endpoint indices for overlap queries.
 
 **Interface:**
 
@@ -161,7 +160,7 @@ find_overlaps(query::GenomicInterval, subject::IntervalCollection)
 overlap(query, subject)
 ```
 
-**Description:** Returns subject intervals overlapping the query. The collection uses chromosome-specific interval trees for candidate lookup.
+**Description:** Returns subject intervals overlapping the query. The collection uses chromosome-specific compact prefix indices for candidate lookup.
 
 ### `distance`
 

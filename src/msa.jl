@@ -1616,6 +1616,13 @@ function trim_gaps!(alignment::MultipleSequenceAlignment; max_gap_fraction::Floa
         end
     end
 
+    if isempty(keep_cols)
+        for i in 1:n
+            record = alignment.records[i]
+            alignment.records[i] = _copy_seqrecord(record, _msa_sequence_from_string(""))
+        end
+        return alignment
+    end
     if length(keep_cols) < len
         for i in 1:n
             record = alignment.records[i]

@@ -17,6 +17,7 @@ using Statistics
 using LinearAlgebra
 using ..BioToolkit: AminoAcidAlphabet, BioSequence, DNAAlphabet, threaded_foreach
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!, with_provenance
+import ..BioToolkit: differential_vj_usage
 
 @inline function _register_immunology_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)

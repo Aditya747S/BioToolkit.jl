@@ -1319,7 +1319,7 @@ function provenance_record(
   parent_ids::AbstractVector{<:AbstractString}=String[],
   timestamp::Union{Nothing,AbstractString}=nothing)
   return ResultProvenance(
-    id === nothing ? "" : String(id),
+    id === nothing ? new_provenance_id() : String(id),
     String(label),
     String(source),
     Symbol(status),

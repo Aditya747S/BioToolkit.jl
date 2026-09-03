@@ -895,6 +895,13 @@ function _bam_record_from_stream(io::BGZFStreams.BGZFStream, header::BamHeader)
   aux_bytes >= 0 || throw(ArgumentError("malformed BAM record: block size ($block_size) is smaller than consumed bytes ($consumed)"))
   tags = aux_bytes == 0 ? Dict{String,Any}() : _parse_bam_tags(read(io, aux_bytes))
 
+  if n_cigar == 2 && haskey(tags, "CG")
+    cg_val = tags["CG"]
+    if cg_val isa AbstractVector
+      cigar = BamCigarOp[_decode_bam_cigar(UInt32(op)) for op in cg_val]
+    end
+  end
+
   refname = _reference_name(header, refid)
   mate_refname = _reference_name(header, next_refid)
   return record_start, BamRecord(qname, flag, refname, pos, mapq, cigar, mate_refname, next_pos, tlen, sequence, quality, tags)
@@ -1044,11 +1051,19 @@ function _write_bam_record(io::BGZFStreams.BGZFStream, header::BamHeader, record
   mate_refindex = record.mate_refname === nothing ? 0 : get(header.ref_map, record.mate_refname) do
     throw(ArgumentError("reference '$(record.mate_refname)' not found in BAM header"))
   end
-  cigar_bytes = UInt32[_encode_bam_cigar(op) for op in record.cigar]
+  record_tags = record.tags
+  cigar_to_encode = record.cigar
+  if length(record.cigar) > 65535
+    record_tags = copy(record.tags)
+    record_tags["CG"] = UInt32[_encode_bam_cigar(op) for op in record.cigar]
+    cigar_to_encode = BamCigarOp[BamCigarOp(length(record.sequence), 'S'), BamCigarOp(0, 'N')]
+  end
+
+  cigar_bytes = UInt32[_encode_bam_cigar(op) for op in cigar_to_encode]
   sequence_bytes = _encode_bam_sequence(record.sequence)
   quality_bytes = _encode_bam_quality(record.quality, length(record.sequence))
   tag_io = IOBuffer()
-  _write_bam_tags(tag_io, record.tags)
+  _write_bam_tags(tag_io, record_tags)
   tags_bytes = take!(tag_io)
 
   block_size = Int32(32 + ncodeunits(record.qname) + 1 + 4 * length(cigar_bytes) + length(sequence_bytes) + length(quality_bytes) + length(tags_bytes))
@@ -1527,6 +1542,13 @@ is_secondary(record::BamRecord) = (record.flag & SAM_FLAG_SECONDARY) != 0
 is_qc_failed(record::BamRecord) = (record.flag & SAM_FLAG_QC_FAIL) != 0
 is_duplicate(record::BamRecord) = (record.flag & SAM_FLAG_DUPLICATE) != 0
 is_supplementary(record::BamRecord) = (record.flag & SAM_FLAG_SUPPLEMENTARY) != 0
+ismapped(record::BamRecord) = !is_unmapped(record)
+
+alignlength(record::BamRecord) = _bam_reference_span(record.cigar)
+leftposition(record::BamRecord) = record.pos < 0 ? 0 : Int(record.pos) + 1
+rightposition(record::BamRecord) = record.pos < 0 ? 0 : Int(record.pos) + alignlength(record)
+readname(record::BamRecord) = record.qname
+cigar_rle(record::BamRecord) = ([op.op for op in record.cigar], [op.length for op in record.cigar])
 
 """
     filter_bam(reader; flags_req=0, flags_no=0, min_mapq=0)
@@ -1651,10 +1673,22 @@ function _parse_sam_cigar(cigar_str::AbstractString)
 end
 
 function _parse_sam_tag_value(type_char::AbstractString, value_str::AbstractString)
-  if type_char == "i" || type_char in ("c", "C", "s", "S", "I")
+  if type_char == "i"
     return parse(Int32, value_str)
+  elseif type_char == "c"
+    return parse(Int8, value_str)
+  elseif type_char == "C"
+    return parse(UInt8, value_str)
+  elseif type_char == "s"
+    return parse(Int16, value_str)
+  elseif type_char == "S"
+    return parse(UInt16, value_str)
+  elseif type_char == "I"
+    return parse(UInt32, value_str)
   elseif type_char == "f"
     return parse(Float32, value_str)
+  elseif type_char == "d"
+    return parse(Float64, value_str)
   elseif type_char == "A"
     return isempty(value_str) ? ' ' : value_str[1]
   elseif type_char == "B"
@@ -1663,7 +1697,23 @@ function _parse_sam_tag_value(type_char::AbstractString, value_str::AbstractStri
     raw_nums = value_str[3:end]
     isempty(raw_nums) && return subtype in ('f', 'd') ? Float32[] : Int32[]
     nums = Base.split(raw_nums, ',')
-    return subtype in ('f', 'd') ? parse.(Float32, nums) : parse.(Int32, nums)
+    if subtype == 'c'
+      return parse.(Int8, nums)
+    elseif subtype == 'C'
+      return parse.(UInt8, nums)
+    elseif subtype == 's'
+      return parse.(Int16, nums)
+    elseif subtype == 'S'
+      return parse.(UInt16, nums)
+    elseif subtype == 'I'
+      return parse.(UInt32, nums)
+    elseif subtype == 'f'
+      return parse.(Float32, nums)
+    elseif subtype == 'd'
+      return parse.(Float64, nums)
+    else
+      return parse.(Int32, nums)
+    end
   else  # "Z" or "H"
     return String(value_str)
   end
@@ -1728,6 +1778,9 @@ function read_sam(io::IO)
   end
 
   hdr_text = join(header_lines, "\n")
+  if isempty(references)
+    references = _bam_infer_reference_lengths(records)
+  end
   hdr = BamHeader(hdr_text, references)
   return BamFile(hdr, records)
 end

@@ -228,6 +228,9 @@ function hardy_weinberg_test(pop::Population{T}, locus_idx::Integer;
   p = (2obs_p2 + obs_pq) / (2.0 * total_genos)
   q = 1.0 - p
   exp_p2, exp_q2, exp_pq = p^2 * total_genos, q^2 * total_genos, 2p * q * total_genos
+  if exp_p2 == 0 || exp_q2 == 0 || exp_pq == 0
+    return 1.0  # chi-square undefined for zero expected counts; fail to reject H0
+  end
   chi2 = (obs_p2 - exp_p2)^2 / exp_p2 +
          (obs_q2 - exp_q2)^2 / exp_q2 +
          (obs_pq - exp_pq)^2 / exp_pq
@@ -655,7 +658,9 @@ function genetic_distance(pop1::Population{T}, pop2::Population{T}, locus_idx::I
     j11 = sum(x^2 for x in p)
     j22 = sum(y^2 for y in q)
     j12 = sum(x * y for (x, y) in zip(p, q))
-    identity = j12 / sqrt(j11 * j22)
+    denom = sqrt(j11 * j22)
+    denom == 0.0 && return Inf  # monomorphic populations
+    identity = j12 / denom
     return identity <= 0.0 ? Inf : -log(identity)
   elseif method === :cavalli_sforza
     return sqrt(max(0.0, 2.0 * (1.0 - sum(sqrt(x * y) for (x, y) in zip(p, q)))))
@@ -1124,10 +1129,12 @@ function site_frequency_spectrum(alignment::MultipleSequenceAlignment; folded::B
     if valid_col && length(freqs) == 2
       # Bi-allelic site
       counts = collect(values(freqs))
-      allele_count = min(counts[1], counts[2])
-      if !folded
-        # For unfolded, we ideally need an outgroup to specify the ancestral allele.
-        # If folded=false but no outgroup, it's ambiguous. Treating the most frequent as ancestral.
+      if folded
+        allele_count = min(counts[1], counts[2])
+      else
+        # unfolded mode requires an outgroup to determine ancestral allele.
+        # Without an outgroup, folded=false behaves identically to folded=true.
+        # To use true unfolded SFS, provide an outgroup sequence.
         allele_count = min(counts[1], counts[2])
       end
       if allele_count > 0 && allele_count <= lim

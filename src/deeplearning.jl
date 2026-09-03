@@ -1559,4 +1559,29 @@ function export_cell_type_annotation_html(res, filepath::AbstractString; kwargs.
   return String(filepath)
 end
 
+import ..BlenderIntegrator: to_blender_payload, BlenderMaterial, BlenderSpatialPayload
+
+"""
+    to_blender_payload(lm::LatentModelResult; name="LatentEmbedding", glyph_scale=0.25)
+
+Convert a neural network `LatentModelResult` into a 3D `BlenderSpatialPayload` for Blender rendering.
+"""
+function to_blender_payload(lm::LatentModelResult; name::String="LatentEmbedding", glyph_scale::Real=0.25)
+  latent = lm.latent
+  n = size(latent, 1)
+  coords = size(latent, 2) >= 3 ? latent[:, 1:3] : (size(latent, 2) == 2 ? hcat(latent, zeros(n)) : hcat(latent, zeros(n, 2)))
+  labels = fill("LatentCell", n)
+  colors = [begin
+    hue = (i - 1) / max(n, 1)
+    r = abs(hue * 6 - 3) - 1
+    g = 2 - abs(hue * 6 - 2)
+    b = 2 - abs(hue * 6 - 4)
+    (clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0))
+  end for i in 1:n]
+  mat = BlenderMaterial(name=name * "_mat")
+  return BlenderSpatialPayload(name, Matrix{Float64}(coords), labels, colors, Float64(glyph_scale), mat)
 end
+
+
+end
+

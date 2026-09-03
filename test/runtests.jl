@@ -3,12 +3,14 @@ using BioToolkit
 ENV["JULIA_CUDA_USE_BINARYBUILDER"] = "true"
 using CUDA
 using Arrow
-using Plots
-using Turing
-using Tables
-
-include(joinpath(@__DIR__, "..", "ext", "BioToolkitTuringExt.jl"))
-BioToolkitTuringExt.__init__()
+if Base.find_package("Plots") !== nothing
+    using Plots
+end
+if Base.find_package("Turing") !== nothing
+    using Turing
+    include(joinpath(@__DIR__, "..", "ext", "BioToolkitTuringExt.jl"))
+    BioToolkitTuringExt.__init__()
+end
 
 if Base.find_package("Flux") !== nothing
     include(joinpath(@__DIR__, "..", "ext", "BioToolkitFluxExt.jl"))

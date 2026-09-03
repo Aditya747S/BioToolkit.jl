@@ -188,7 +188,7 @@ translate_dna!(buffer, bytes; stop_at_stop=false)
 hamming_distance(left, right; use_cuda=false)
 ```
 
-**Description:** Counts mismatches between equal-length sequences.
+**Description:** Counts mismatches between equal-length nucleotide sequences. Accepts `BioSequence` types (DNASeq, RNASeq) or raw `AbstractVector{UInt8}` or `AbstractString`. String inputs are automatically converted to `DNASeq` for typed analysis.
 
 **Errors:** Throws `ArgumentError` if lengths differ.
 

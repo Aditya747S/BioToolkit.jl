@@ -21,12 +21,24 @@ using Distributions
 using JSON
 using Downloads
 using Printf
-using Plots
+
 
 using ..BioToolkit: ResultProvenance, provenance_record, AbstractAnalysisResult, analysis_result_summary, ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_container_provenance!, register_provenance!, _provenance_timestamp
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg
 
 import ..BioToolkit: to_html, export_html
+
+function _get_plots_mod()
+  ext = Base.get_extension(parentmodule(Clinical), :BioToolkitPlotsExt)
+  if ext !== nothing
+    return ext.Plots
+  elseif isdefined(Main, :Plots)
+    return Main.Plots
+  else
+    error("Plotting functions require Plots.jl to be loaded (`using Plots`).")
+  end
+end
+
 
 export PatientCohort, KaplanMeierResult, CoxResult, CoxTermResult, MAFRecord, MAFSummary
 export read_maf, summarize_maf, tcga_query, tcga_download_files, merge_tcga_count_files, tcga_ingest, kaplan_meier, logrank_test, cox_ph
@@ -457,12 +469,12 @@ Plot a Kaplan-Meier survival curve.
 """
 function kaplan_meier_plot(result::KaplanMeierResult; title::String="Kaplan-Meier", xlabel::String="Time", ylabel::String="Survival probability", show_censors::Bool=true, kwargs...)
   _ctx = active_provenance_context()
-
+  PlotsMod = _get_plots_mod()
   x, y = _km_plot_data(result)
-  plt = plot(x, y; seriestype=:steppost, linewidth=2.5, color=:black, title=title, xlabel=xlabel, ylabel=ylabel, ylim=(0, 1.05), legend=false, kwargs...)
+  plt = PlotsMod.plot(x, y; seriestype=:steppost, linewidth=2.5, color=:black, title=title, xlabel=xlabel, ylabel=ylabel, ylim=(0, 1.05), legend=false, kwargs...)
   if show_censors && !isempty(result.censor_times)
     censor_y = [_km_survival_at(result, t) for t in result.censor_times]
-    scatter!(plt, result.censor_times, censor_y; markershape=_KM_CENSOR_MARKER, markercolor=:black, markersize=6, label=nothing)
+    PlotsMod.scatter!(plt, result.censor_times, censor_y; markershape=_KM_CENSOR_MARKER, markercolor=:black, markersize=6, label=nothing)
   end
   return provenance_result!(_ctx, plt, "kaplan_meier_plot"; parents=provenance_parent_ids(result), parameters=(title=title, show_censors=show_censors))
 end
@@ -876,9 +888,10 @@ Plot coefficient estimates and confidence intervals from a Cox model fit.
 """
 function forest_plot(cox_result::CoxResult)
   _ctx = active_provenance_context()
+  PlotsMod = _get_plots_mod()
   n = length(cox_result.terms)
   if n == 0
-    plt = plot(title="Cox forest plot", legend=false)
+    plt = PlotsMod.plot(title="Cox forest plot", legend=false)
     return provenance_result!(_ctx, plt, "forest_plot"; parents=provenance_parent_ids(cox_result), parameters=(term_count=0))
   end
   terms = reverse(cox_result.terms)
@@ -887,17 +900,17 @@ function forest_plot(cox_result::CoxResult)
   lower_errors = [max(term.hazard_ratio - term.ci_lower, eps(Float64)) for term in terms]
   upper_errors = [max(term.ci_upper - term.hazard_ratio, eps(Float64)) for term in terms]
   pvalues = [term.pvalue for term in terms]
-  p1 = plot(hazard_ratios, 1:n; xerror=(lower_errors, upper_errors), seriestype=:scatter, marker=:circle, markersize=7, color=:black, legend=false, xscale=:log10, xlabel="Hazard ratio", yticks=(1:n, labels), title="Cox forest plot", ylim=(0.5, n + 0.5), framestyle=:box)
-  vline!(p1, [1.0]; linestyle=:dash, color=:gray)
-  p2 = plot(; xlim=(0, 1), ylim=(0.5, n + 0.5), framestyle=:none, grid=false, legend=false, xticks=false, yticks=false, title="Summary")
+  p1 = PlotsMod.plot(hazard_ratios, 1:n; xerror=(lower_errors, upper_errors), seriestype=:scatter, marker=:circle, markersize=7, color=:black, legend=false, xscale=:log10, xlabel="Hazard ratio", yticks=(1:n, labels), title="Cox forest plot", ylim=(0.5, n + 0.5), framestyle=:box)
+  PlotsMod.vline!(p1, [1.0]; linestyle=:dash, color=:gray)
+  p2 = PlotsMod.plot(; xlim=(0, 1), ylim=(0.5, n + 0.5), framestyle=:none, grid=false, legend=false, xticks=false, yticks=false, title="Summary")
   for (index, term) in enumerate(terms)
     row = n - index + 1
-    annotate!(p2, 0.02, row, Plots.text(term.term, 8, :black, :left))
-    annotate!(p2, 0.40, row, Plots.text(@sprintf("HR %.2f", term.hazard_ratio), 8, :black, :left))
-    annotate!(p2, 0.68, row, Plots.text(@sprintf("95%% CI %.2f-%.2f", term.ci_lower, term.ci_upper), 8, :black, :left))
-    annotate!(p2, 0.98, row, Plots.text(@sprintf("p=%.3g", term.pvalue), 8, :black, :right))
+    PlotsMod.annotate!(p2, 0.02, row, PlotsMod.text(term.term, 8, :black, :left))
+    PlotsMod.annotate!(p2, 0.40, row, PlotsMod.text(@sprintf("HR %.2f", term.hazard_ratio), 8, :black, :left))
+    PlotsMod.annotate!(p2, 0.68, row, PlotsMod.text(@sprintf("95%% CI %.2f-%.2f", term.ci_lower, term.ci_upper), 8, :black, :left))
+    PlotsMod.annotate!(p2, 0.98, row, PlotsMod.text(@sprintf("p=%.3g", term.pvalue), 8, :black, :right))
   end
-  plt = plot(p1, p2; layout=(1, 2), size=(1100, 420))
+  plt = PlotsMod.plot(p1, p2; layout=(1, 2), size=(1100, 420))
   return provenance_result!(_ctx, plt, "forest_plot"; parents=provenance_parent_ids(cox_result), parameters=(term_count=n))
 end
 
@@ -1114,18 +1127,19 @@ function _mutation_level(labels::String)
 end
 
 function _oncoprint_plot(result::OncoprintResult; title::String="Oncoprint", kwargs...)
+  PlotsMod = _get_plots_mod()
   if isempty(result.genes) || isempty(result.samples)
-    return plot(title=title, legend=false)
+    return PlotsMod.plot(title=title, legend=false)
   end
   codes = zeros(Int, size(result.matrix))
   for row in axes(result.matrix, 1), col in axes(result.matrix, 2)
     codes[row, col] = result.matrix[row, col] > 0 ? _mutation_level(result.mutation_labels[row, col]) : 0
   end
-  heat = plot(codes; seriestype=:heatmap, colorbar=true, c=:magma, xlabel="Patients", ylabel="Genes", title=title, yticks=(1:length(result.genes), reverse(result.genes)), xticks=(1:length(result.samples), result.samples), yflip=true, kwargs...)
+  heat = PlotsMod.plot(codes; seriestype=:heatmap, colorbar=true, c=:magma, xlabel="Patients", ylabel="Genes", title=title, yticks=(1:length(result.genes), reverse(result.genes)), xticks=(1:length(result.samples), result.samples), yflip=true, kwargs...)
   for row in axes(result.mutation_labels, 1), col in axes(result.mutation_labels, 2)
     label = result.mutation_labels[row, col]
     isempty(label) && continue
-    annotate!(heat, col, row, text(label, 6, :white, :center))
+    PlotsMod.annotate!(heat, col, row, PlotsMod.text(label, 6, :white, :center))
   end
   return heat
 end

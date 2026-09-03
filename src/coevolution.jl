@@ -18,7 +18,9 @@ using LinearAlgebra
 using Random
 using Statistics
 
-using ..BioToolkit: Atom, Chain, Model, MultipleSequenceAlignment, Residue, SeqRecordLite, Structure
+using ..BioToolkit: Atom, Chain, Model, MultipleSequenceAlignment, Residue, SeqRecordLite, Structure, BlenderIntegrator
+using ..BlenderIntegrator: BlenderContactPayload, BlenderMaterial
+
 using ..BioToolkit: ProvenanceContext, ProvenanceParams, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_result!, register_provenance!
 import ..BioToolkit: to_html, export_html
 
@@ -58,6 +60,15 @@ struct ContactMap
     scores::Matrix{Float64}
     residue_ids::Vector{Int}
 end
+
+function BlenderIntegrator.to_blender_payload(cmap::ContactMap, coords::Matrix{Float64}; tube_radius::Float64=0.2, top_n::Int=50, name::String="ContactNetwork")
+    pairs_info = top_contact_pairs(cmap; top_n=top_n)
+    pairs = [(p[1], p[2]) for p in pairs_info]
+    scores = [p[3] for p in pairs_info]
+    mat = BlenderMaterial(name=name * "_mat", color=(1.0, 0.4, 0.1, 1.0), roughness=0.2)
+    return BlenderContactPayload(name, coords, pairs, scores, tube_radius, mat)
+end
+
 
 struct PseudoLikelihoodModel
     fields::Matrix{Float64}
@@ -178,6 +189,9 @@ function sequence_reweighting(encoded_alignment::AbstractMatrix{<:Integer};
     identity_threshold::Real=0.8,
     prov_ctx=nothing,
     _ctx=active_provenance_context(prov_ctx))
+
+    identity_threshold > 1.0 && throw(ArgumentError("identity_threshold must be in (0, 1], got $identity_threshold"))
+    identity_threshold <= 0 && throw(ArgumentError("identity_threshold must be in (0, 1], got $identity_threshold"))
 
     n, l = size(encoded_alignment)
     weights = ones(Float64, n)
@@ -776,14 +790,6 @@ function mutual_information_contacts(alignment::MultipleSequenceAlignment;
 
     apc_mi = apc ? _apc_correct(mi_scores) : mi_scores
 
-    for i in 1:l
-        lo = max(1, i - min_separation + 1)
-        hi = min(l, i + min_separation - 1)
-        for j in lo:hi
-            apc_mi[i, j] = 0.0
-        end
-    end
-
     norm_scores = _normalize_scores(apc_mi; min_separation=min_separation)
     result = ContactMap(norm_scores, collect(1:l))
 
@@ -1363,7 +1369,7 @@ function positional_covariation_matrix(alignment::MultipleSequenceAlignment;
         result = (covariation=cor_mat, positions=collect(1:l))
         return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     elseif metric in (:mi, :mutual_information)
-        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=0, apc=false, max_gap_fraction=1.0, min_sequence_coverage=0.0, identity_threshold=identity_threshold, weights=weights_vec, _ctx=_ctx)
+        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=min_separation, apc=apc, max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, identity_threshold=identity_threshold, weights=weights_vec, _ctx=_ctx)
         result = (covariation=mi_map.scores, positions=collect(1:l))
         return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     else

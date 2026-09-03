@@ -4,6 +4,8 @@ using Random
 using Statistics
 using Logging: with_logger, NullLogger
 using DataFrames
+using Test
+using BioToolkit
 
 function _build_synthetic_count_matrix()
     gene_ids = ["gene$(index)" for index in 1:51]
@@ -381,5 +383,33 @@ end
     hurdle_res = BioToolkit.DifferentialExpression.mast_hurdle_test(cm, fixed; min_cells=1)
     @test length(hurdle_res) == length(cm.gene_ids)
     @test isfinite(hurdle_res[1].pvalue_hurdle)
+end
+
+@testset "DifferentialExpression GLM solver hierarchy & accessors" begin
+    cm = _build_synthetic_count_matrix()
+    fixed = [:Control, :Control, :Treat, :Treat]
+    res = BioToolkit.differential_expression(cm, fixed)
+    
+    # Accessor testing
+    r1 = res[1]
+    @test BioToolkit.coefficients(r1) == r1.log2_fold_change
+    @test BioToolkit.stderror(r1) == r1.lfc_se
+    @test BioToolkit.pvalue(r1) == r1.pvalue
+    @test BioToolkit.padj(r1) == r1.padj
+
+    # Solver Hierarchy
+    X = [1.0 0.0; 1.0 0.0; 1.0 1.0; 1.0 1.0]
+    native_solver = BioToolkit.DifferentialExpression.NativeIRLSSolver(X)
+    adapter_solver = BioToolkit.DifferentialExpression.GLMjlAdapterSolver(X; backend=:native)
+
+    @test native_solver isa BioToolkit.DifferentialExpression.AbstractGLMSolver
+    @test adapter_solver isa BioToolkit.DifferentialExpression.AbstractGLMSolver
+
+    beta1, se1, stat1 = BioToolkit.DifferentialExpression.fit_gene_fast!(native_solver, [0, 0, 10, 10], zeros(4), 0.1)
+    beta2, se2, stat2 = BioToolkit.DifferentialExpression.fit_gene_fast!(adapter_solver, [0, 0, 10, 10], zeros(4), 0.1)
+
+    @test beta1 ≈ beta2
+    @test se1 ≈ se2
+    @test stat1 ≈ stat2
 end
 

@@ -775,6 +775,39 @@ end
 
 IntervalTree{T}() where {T} = IntervalTree{T}(Ref{Union{Nothing,IntervalTreeNode{T}}}(nothing))
 
+"""
+    _itn_build_balanced(lefts, rights, payloads, lo, hi)
+
+Build an interval tree from endpoint-sorted columns in linear time.  Recursive
+median construction avoids the repeated AVL rotations used by incremental
+insertion when an `IntervalCollection` is created in bulk.
+"""
+function _itn_build_balanced(
+    lefts::AbstractVector{Int},
+    rights::AbstractVector{Int},
+    payloads::AbstractVector{T},
+    lo::Int,
+    hi::Int) where {T}
+    lo > hi && return nothing
+    mid = lo + ((hi - lo) >>> 1)
+    left = _itn_build_balanced(lefts, rights, payloads, lo, mid - 1)
+    right = _itn_build_balanced(lefts, rights, payloads, mid + 1, hi)
+    node = IntervalTreeNode{T}(
+        lefts[mid], rights[mid], rights[mid], payloads[mid], left, right, 1)
+    node.height = 1 + max(_itn_height(left), _itn_height(right))
+    node.max_end = max(rights[mid], _itn_max_end(left), _itn_max_end(right))
+    return node
+end
+
+function _itn_build_balanced(
+    lefts::AbstractVector{Int},
+    rights::AbstractVector{Int},
+    payloads::AbstractVector{T}) where {T}
+    length(lefts) == length(rights) == length(payloads) ||
+        throw(ArgumentError("interval endpoint and payload columns must have equal lengths"))
+    return _itn_build_balanced(lefts, rights, payloads, 1, length(payloads))
+end
+
 function _itn_height(node::Union{Nothing,IntervalTreeNode})
     return node === nothing ? 0 : node.height
 end
@@ -875,6 +908,22 @@ function query_overlaps(tree::IntervalTree{T}, query_left::Int, query_right::Int
     results = T[]
     _itn_query(tree.root[], query_left, query_right, results)
     return results
+end
+
+"""Count overlaps without allocating a result vector."""
+function query_overlap_count(tree::IntervalTree, query_left::Int, query_right::Int)
+    return _itn_query_count(tree.root[], query_left, query_right)
+end
+
+function _itn_query_count(node::Nothing, ::Int, ::Int)
+    return 0
+end
+
+function _itn_query_count(node::IntervalTreeNode, ql::Int, qr::Int)
+    node.max_end < ql && return 0
+    count = (node.left_endpoint <= qr && node.right_endpoint >= ql) ? 1 : 0
+    node.left_endpoint > qr && return count + _itn_query_count(node.left, ql, qr)
+    return count + _itn_query_count(node.left, ql, qr) + _itn_query_count(node.right, ql, qr)
 end
 
 function _itn_query(node::Nothing, ::Int, ::Int, ::Vector)

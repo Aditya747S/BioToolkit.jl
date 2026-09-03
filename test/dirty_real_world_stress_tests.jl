@@ -17,7 +17,7 @@ using BioToolkit
 
             @test length(records) == 3
             @test records[1].identifier == "read one with spaces"
-            @test String(records[1].sequence) == "AC GT-NN"
+            @test String(records[1].sequence) == "ACGT-NN"
             @test records[2].identifier == "empty record"
             @test length(records[2].sequence) == 0
             @test records[3].identifier == "single line header"

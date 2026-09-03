@@ -805,5 +805,42 @@ function dspikein_calibration(spike_counts::AbstractVector{<:Real}, sample_count
   return provenance_result!(_ctx, calibrated, "dspikein_calibration"; parents=String[])
 end
 
+import ..BlenderIntegrator: to_blender_payload, BlenderMaterial, BlenderSpatialPayload
+
+"""
+    to_blender_payload(exp::MassSpecExperiment; name="MassSpec3D", glyph_scale=0.2)
+
+Convert LC-MS spectral peaks from a `MassSpecExperiment` into a 3D `BlenderSpatialPayload` (Retention Time x m/z x Intensity).
+"""
+function to_blender_payload(exp::MassSpecExperiment; name::String="MassSpec3D", glyph_scale::Real=0.2)
+  all_rt = Float64[]
+  all_mz = Float64[]
+  all_intensity = Float64[]
+  for s in exp.spectra
+    for i in 1:length(s.mz)
+      push!(all_rt, s.rt)
+      push!(all_mz, s.mz[i])
+      push!(all_intensity, s.intensity[i])
+    end
+  end
+  n = length(all_rt)
+  n > 0 || throw(ArgumentError("MassSpecExperiment has no spectral peaks"))
+
+  max_int = max(maximum(all_intensity), 1e-5)
+  coords = hcat(all_rt, all_mz, all_intensity ./ max_int .* 10.0)
+  labels = fill("Peak", n)
+  colors = [begin
+    norm_i = all_intensity[i] / max_int
+    r = min(1.0, max(0.0, 1.5 * norm_i - 0.2))
+    g = min(1.0, max(0.0, 2.0 * norm_i - 1.0))
+    b = min(1.0, max(0.0, 1.0 - 1.5 * norm_i))
+    (r, g, b)
+  end for i in 1:n]
+  mat = BlenderMaterial(name=name * "_mat")
+  return BlenderSpatialPayload(name, Matrix{Float64}(coords), labels, colors, Float64(glyph_scale), mat)
 end
+
+
+end
+
 

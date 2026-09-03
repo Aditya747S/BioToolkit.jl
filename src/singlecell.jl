@@ -1,8 +1,8 @@
 module SingleCell
 
 using DataFrames
-using CUDA
 using JSON
+
 using Mmap
 using Optim
 using OrdinaryDiffEq
@@ -13,12 +13,12 @@ using Random
 using Graphs
 using SimpleWeightedGraphs: SimpleWeightedGraph, SimpleWeightedEdge
 using SpecialFunctions: erfc, loggamma
-using Plots: plot, scatter, scatter!, plot!, heatmap, quiver!, bar
 
 using Serialization
 
+
 using ..DifferentialExpression: CountMatrix, DEResult, benjamini_hochberg, calc_norm_factors, differential_expression, estimate_dispersions, filter_low_counts, vst, _mast_markers
-using ..BioToolkit: threaded_foreach, threaded_map_collect
+using ..BioToolkit: threaded_foreach, threaded_map_collect, _is_cuda_backed_array, resolve_backend, maybe_to_device, maybe_to_host
 using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, provenance_summary, provenance_result!, register_provenance!, stamp_provenance!, update_provenance!, with_provenance, BackendConfig, ConvergenceReport, ModelFitDiagnostics
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,17 @@ function _register_singlecell_result!(ctx::ProvenanceContext, result, operation:
         parameters=NamedTuple())
     register_provenance!(ctx, operation; parents=parents, parameters=parameters)
     return result
+end
+
+function _get_plots_mod()
+  ext = Base.get_extension(parentmodule(SingleCell), :BioToolkitPlotsExt)
+  if ext !== nothing
+    return ext.Plots
+  elseif isdefined(Main, :Plots)
+    return Main.Plots
+  else
+    error("Plotting functions require Plots.jl to be loaded (`using Plots`).")
+  end
 end
 export SingleCellExperiment, SingleCellProjectionModel, count_matrix, normalize_counts, sctransform, find_variable_features, fit_singlecell_projection_model, project_singlecell, run_pca, find_neighbors, find_spatial_neighbors, run_umap, cluster_cells, find_clusters, calculate_pseudotime, find_cluster_markers, find_markers, summarize_clusters, cluster_marker_summary
 export detect_doublets, integrate_batches, integrate_data, score_cell_cycle
@@ -115,7 +126,7 @@ function _normalize_spatial_coords(spatial_coords::AbstractMatrix{<:Real}, n_cel
 end
 
 function SingleCellExperiment(counts::AbstractMatrix{<:Integer}, gene_ids::AbstractVector{<:String}, cell_ids::AbstractVector{<:String}; metadata::AbstractDict=Dict{String,Any}(), spatial_coords::Union{Nothing,AbstractMatrix}=nothing)
-    matrix = counts isa SparseMatrixCSC ? sparse(Int.(counts)) : counts isa CUDA.CuArray ? Int.(counts) : sparse(Int.(counts))
+    matrix = counts isa SparseMatrixCSC ? sparse(Int.(counts)) : _is_cuda_backed_array(counts) ? Int.(Array(counts)) : sparse(Int.(counts))
     size(matrix, 1) == length(gene_ids) || throw(ArgumentError("gene_ids must match the number of rows in counts"))
     size(matrix, 2) == length(cell_ids) || throw(ArgumentError("cell_ids must match the number of columns in counts"))
     standardized_coords = spatial_coords === nothing ? nothing : _normalize_spatial_coords(spatial_coords, length(cell_ids))
@@ -165,7 +176,7 @@ end
 Return the `CountMatrix` view used by the differential-expression layer.
 """
 function count_matrix(experiment::SingleCellExperiment)
-    counts = experiment.counts isa CUDA.CuArray ? Array(experiment.counts) : experiment.counts
+    counts = _is_cuda_backed_array(experiment.counts) ? Array(experiment.counts) : experiment.counts
     return CountMatrix(counts, experiment.gene_ids, experiment.cell_ids)
 end
 
@@ -178,9 +189,6 @@ function _matrix_triplets(matrix::SparseMatrixCSC{<:Real,Int})
     return rows, cols, Float64.(values)
 end
 
-function _matrix_triplets(matrix::CUDA.CuArray{<:Real,2})
-    return _matrix_triplets(Array(matrix))
-end
 
 function _matrix_triplets(matrix::AbstractMatrix{<:Real})
     rows = Int[]
@@ -238,8 +246,8 @@ function normalize_counts(experiment::SingleCellExperiment; scale_factor::Real=1
     _ctx = active_provenance_context()
     counts = experiment.counts
     if use_cuda
-        CUDA.functional() || throw(ArgumentError("CUDA is not available"))
-        gpu_counts = counts isa CUDA.CuArray ? counts : CUDA.CuArray{Float32}(Array(counts))
+        resolve_backend(backend=:gpu) == :gpu || throw(ArgumentError("GPU acceleration is not available"))
+        gpu_counts = _is_cuda_backed_array(counts) ? counts : maybe_to_device(Float32.(Array(counts)); backend=:gpu)
         library_sizes = max.(vec(sum(gpu_counts, dims=1)), eps(Float32))
         normalized = gpu_counts ./ reshape(library_sizes, 1, :) .* Float32(scale_factor)
         log_transform && (normalized = log1p.(normalized))
@@ -267,7 +275,7 @@ function _projection_feature_ids(experiment::SingleCellExperiment; use_variable_
 end
 
 function _normalized_projection_matrix(experiment::SingleCellExperiment, feature_ids::AbstractVector{<:String}; scale_factor::Real=1e4, log_transform::Bool=true)
-    counts = experiment.counts isa CUDA.CuArray ? Array(experiment.counts) : experiment.counts
+    counts = _is_cuda_backed_array(experiment.counts) ? Array(experiment.counts) : experiment.counts
     library_sizes = vec(sum(counts, dims=1))
     library_sizes = max.(Float64.(library_sizes), eps(Float64))
     feature_lookup = Dict(feature => index for (index, feature) in pairs(feature_ids))
@@ -441,8 +449,8 @@ function run_pca(experiment::SingleCellExperiment; normalized::Union{Nothing,Abs
         feature_indices = _variable_feature_indices(experiment)
         isempty(feature_indices) || (matrix = matrix[feature_indices, :])
     end
-    centered = if use_cuda
-        CUDA.CuArray{Float32}(Array(permutedims(matrix)))
+    centered = if use_cuda && resolve_backend(backend=:gpu) == :gpu
+        maybe_to_device(Float32.(Array(permutedims(matrix))); backend=:gpu)
     else
         Matrix{Float64}(permutedims(matrix))
     end
@@ -1074,9 +1082,6 @@ function _expression_for_cells(matrix::AbstractMatrix{<:Real}, row::Int, columns
     return values
 end
 
-function _expression_for_cells(matrix::CUDA.CuArray{<:Real,2}, row::Int, columns::AbstractVector{Int})
-    return _expression_for_cells(Array(matrix), row, columns)
-end
 
 function _pseudobulk_count_matrix(experiment::SingleCellExperiment, labels::AbstractVector{<:Integer}, ident_1::Integer, ident_2::Integer; sample_labels::AbstractVector{<:String})
     length(labels) == length(sample_labels) || throw(ArgumentError("sample_labels must match labels"))
@@ -1166,7 +1171,7 @@ function _deseq2_markers(experiment::SingleCellExperiment, labels::AbstractVecto
 
     subset = [index for (index, label) in enumerate(labels) if label == ident_1 || label == ident_2]
     isempty(subset) && return DEResult[]
-    subset_matrix = experiment.counts isa CUDA.CuArray ? Array(experiment.counts[:, subset]) : experiment.counts[:, subset]
+    subset_matrix = _is_cuda_backed_array(experiment.counts) ? Array(experiment.counts[:, subset]) : experiment.counts[:, subset]
     subset_counts = CountMatrix(subset_matrix, experiment.gene_ids, experiment.cell_ids[subset])
     design = Symbol[label == ident_1 ? :ident_1 : :ident_2 for label in labels[subset]]
     return differential_expression(subset_counts, design; min_total=min_total, shrink=shrink, normalization_method=normalization_method, dispersion_workflow=dispersion_workflow, modelMatrixType=modelMatrixType)
@@ -1427,9 +1432,9 @@ function materialize_singlecell_experiment(experiment::SingleCellExperiment)
 end
 
 function gpu_singlecell_experiment(experiment::SingleCellExperiment)
-    CUDA.functional() || throw(ArgumentError("CUDA is not available"))
-    counts = experiment.counts isa CUDA.CuArray ? experiment.counts : CUDA.CuArray{Int}(Array(experiment.counts))
-    metadata = _singlecell_metadata_with_provenance(experiment.metadata; source="gpu_singlecell_experiment", notes=["moved counts to CUDA"], parameters=(n_genes=length(experiment.gene_ids), n_cells=length(experiment.cell_ids)))
+    resolve_backend(backend=:gpu) == :gpu || throw(ArgumentError("GPU acceleration is not available"))
+    counts = _is_cuda_backed_array(experiment.counts) ? experiment.counts : maybe_to_device(Int.(Array(experiment.counts)); backend=:gpu)
+    metadata = _singlecell_metadata_with_provenance(experiment.metadata; source="gpu_singlecell_experiment", notes=["moved counts to GPU"], parameters=(n_genes=length(experiment.gene_ids), n_cells=length(experiment.cell_ids)))
     return SingleCellExperiment{typeof(counts)}(counts, copy(experiment.gene_ids), copy(experiment.cell_ids), experiment.spatial_coords === nothing ? nothing : copy(experiment.spatial_coords), metadata, Dict{String,Matrix{Float64}}(), Dict{String,Vector{Int}}(), Dict{String,Vector{String}}(), Dict{String,Vector{Vector{Int}}}())
 end
 
@@ -1488,7 +1493,7 @@ struct SingleCellArchive
 end
 
 function _archive_backend(value)
-    value isa CUDA.CuArray && return Array(value)
+    _is_cuda_backed_array(value) && return Array(value)
     value isa CountMatrix && return CountMatrix(_archive_backend(value.counts), copy(value.gene_ids), copy(value.sample_ids))
     value isa AbstractMatrix && return copy(value)
     return value
@@ -1708,13 +1713,13 @@ function calculate_rna_velocity(experiment::SingleCellExperiment; spliced=nothin
     end
 
     if use_cuda
-        CUDA.functional() || throw(ArgumentError("CUDA is not available"))
-        spliced_gpu = CUDA.CuArray{Float32}(Array(spliced_matrix))
-        unspliced_gpu = CUDA.CuArray{Float32}(Array(unspliced_matrix))
+        resolve_backend(backend=:gpu) == :gpu || throw(ArgumentError("GPU acceleration is not available"))
+        spliced_gpu = maybe_to_device(Float32.(Array(spliced_matrix)); backend=:gpu)
+        unspliced_gpu = maybe_to_device(Float32.(Array(unspliced_matrix)); backend=:gpu)
         gene_power = vec(sum(spliced_gpu .* spliced_gpu, dims=2))
         gene_cross = vec(sum(spliced_gpu .* unspliced_gpu, dims=2))
         slopes = Array(gene_cross ./ max.(gene_power, eps(Float32)))
-        slope_gpu = reshape(CUDA.CuArray{Float32}(slopes), :, 1)
+        slope_gpu = reshape(maybe_to_device(Float32.(slopes); backend=:gpu), :, 1)
         velocity = Array(unspliced_gpu .- slope_gpu .* spliced_gpu)
     else
         spliced_dense = _velocity_dense(spliced_matrix)
@@ -2412,38 +2417,40 @@ function _velocity_quiver_vectors(coords::AbstractMatrix{<:Real}, latent_time::A
 end
 
 function plot_trajectory(experiment::SingleCellExperiment; root_cell=nothing, embedding::Union{Nothing,AbstractMatrix}=nothing, reduction::String="umap", graph_name::String="neighbors", k::Int=15, pseudotime_result=nothing, title::String="Trajectory", show_edges::Bool=true, show_root::Bool=true, kwargs...)
+    P = _get_plots_mod()
     result = pseudotime_result === nothing ? calculate_pseudotime(experiment; root_cell=root_cell, embedding=embedding, reduction=reduction, graph_name=graph_name, k=k) : pseudotime_result
     coords = _embedding_for_plot(experiment; embedding=embedding, reduction=reduction, k=k)
     colors = result.pseudotime
-    plt = scatter(coords[:, 1], coords[:, 2]; marker_z=colors, color=:viridis, legend=false, title=title, xlabel="Dim 1", ylabel="Dim 2", colorbar_title="Pseudotime", kwargs...)
+    plt = P.scatter(coords[:, 1], coords[:, 2]; marker_z=colors, color=:viridis, legend=false, title=title, xlabel="Dim 1", ylabel="Dim 2", colorbar_title="Pseudotime", kwargs...)
     if show_edges
         for edge in edges(result.mst)
             source = src(edge)
             target = dst(edge)
-            plot!(plt, [coords[source, 1], coords[target, 1]], [coords[source, 2], coords[target, 2]]; color=:gray, alpha=0.3, label=false)
+            P.plot!(plt, [coords[source, 1], coords[target, 1]], [coords[source, 2], coords[target, 2]]; color=:gray, alpha=0.3, label=false)
         end
     end
     if show_root
-        scatter!(plt, [coords[result.root_index, 1]], [coords[result.root_index, 2]]; marker=:star5, color=:red, markersize=8, label="root")
+        P.scatter!(plt, [coords[result.root_index, 1]], [coords[result.root_index, 2]]; marker=:star5, color=:red, markersize=8, label="root")
     end
     return plt
 end
 
 function plot_rna_velocity(experiment::SingleCellExperiment; velocity_result=nothing, embedding::Union{Nothing,AbstractMatrix}=nothing, reduction::String="umap", title::String="RNA velocity", root_cell=nothing, k::Int=15, show_root::Bool=true, color::Symbol=:latent_time, show_arrows::Bool=true, arrow_scale::Real=0.4, arrow_neighbors::Int=5, kwargs...)
+    P = _get_plots_mod()
     result = velocity_result === nothing ? calculate_rna_velocity(experiment) : velocity_result
     coords = _embedding_for_plot(experiment; embedding=embedding, reduction=reduction, k=k)
     color_values = color == :cell_scores ? result.cell_scores : result.latent_time
     velocity_magnitude = vec(mean(abs.(result.velocity), dims=1))
     size_range = maximum(velocity_magnitude) - minimum(velocity_magnitude)
     marker_sizes = size_range > 0 ? 4 .+ 8 .* ((velocity_magnitude .- minimum(velocity_magnitude)) ./ size_range) : fill(6.0, length(velocity_magnitude))
-    plt = scatter(coords[:, 1], coords[:, 2]; marker_z=color_values, markersize=marker_sizes, color=:plasma, legend=false, title=title, xlabel="Dim 1", ylabel="Dim 2", colorbar_title=String(color), kwargs...)
+    plt = P.scatter(coords[:, 1], coords[:, 2]; marker_z=color_values, markersize=marker_sizes, color=:plasma, legend=false, title=title, xlabel="Dim 1", ylabel="Dim 2", colorbar_title=String(color), kwargs...)
     if show_arrows
         u, v = _velocity_quiver_vectors(coords, result.latent_time; k=arrow_neighbors, scale=arrow_scale)
-        quiver!(plt, coords[:, 1], coords[:, 2], quiver=(u, v); color=:black, alpha=0.45, linewidth=1, label=false)
+        P.quiver!(plt, coords[:, 1], coords[:, 2], quiver=(u, v); color=:black, alpha=0.45, linewidth=1, label=false)
     end
     if show_root && root_cell !== nothing
         root_index = _resolve_root_cell(experiment, root_cell)
-        scatter!(plt, [coords[root_index, 1]], [coords[root_index, 2]]; marker=:star5, color=:white, markerstrokecolor=:black, markersize=8, label="root")
+        P.scatter!(plt, [coords[root_index, 1]], [coords[root_index, 2]]; marker=:star5, color=:white, markerstrokecolor=:black, markersize=8, label="root")
     end
     return plt
 end
@@ -2451,16 +2458,18 @@ end
 plot_rna_velocity_quiver(experiment::SingleCellExperiment; kwargs...) = plot_rna_velocity(experiment; show_arrows=true, kwargs...)
 
 function plot_communication_network(network::CellCommunicationNetwork; title::String="Cell-cell communication network", kwargs...)
-    return heatmap(network.cluster_ids, network.cluster_ids, network.score_matrix; xlabel="Receiver", ylabel="Sender", title=title, color=:magma, colorbar_title="Score", kwargs...)
+    P = _get_plots_mod()
+    return P.heatmap(network.cluster_ids, network.cluster_ids, network.score_matrix; xlabel="Receiver", ylabel="Sender", title=title, color=:magma, colorbar_title="Score", kwargs...)
 end
 
 function plot_communication_pathways(summary::AbstractVector{<:CommunicationPathwaySummary}; top_n::Int=10, title::String="Communication pathways", kwargs...)
+    P = _get_plots_mod()
     ranked = sort(collect(summary); by = item -> item.total_score, rev=true)
-    isempty(ranked) && return bar(String[], Float64[]; title=title, legend=false, xlabel="Pathway", ylabel="Total score", kwargs...)
+    isempty(ranked) && return P.bar(String[], Float64[]; title=title, legend=false, xlabel="Pathway", ylabel="Total score", kwargs...)
     top = ranked[1:min(top_n, length(ranked))]
     labels = [item.pathway for item in top]
     scores = [item.total_score for item in top]
-    return bar(labels, scores; title=title, legend=false, xlabel="Pathway", ylabel="Total score", color=:steelblue, kwargs...)
+    return P.bar(labels, scores; title=title, legend=false, xlabel="Pathway", ylabel="Total score", color=:steelblue, kwargs...)
 end
 
 plot_communication_pathways(network::CellCommunicationNetwork; top_n::Int=10, title::String="Communication pathways", kwargs...) = plot_communication_pathways(communication_pathway_summary(network); top_n=top_n, title=title, kwargs...)
@@ -2468,11 +2477,12 @@ plot_communication_pathways(network::CellCommunicationNetwork; top_n::Int=10, ti
 plot_communication_pathways(experiment::SingleCellExperiment, labels::AbstractVector{<:Integer}; top_n::Int=10, title::String="Communication pathways", kwargs...) = plot_communication_pathways(communication_pathway_summary(experiment, labels); top_n=top_n, title=title, kwargs...)
 
 function plot_ligand_receptor_report(report::LigandReceptorReport; title::String="Ligand-receptor report", top_n::Int=10, kwargs...)
+    P = _get_plots_mod()
     ranked = report.interactions[1:min(top_n, length(report.interactions))]
-    isempty(ranked) && return bar(String[], Float64[]; title=title, legend=false, xlabel="Interaction", ylabel="Score", kwargs...)
+    isempty(ranked) && return P.bar(String[], Float64[]; title=title, legend=false, xlabel="Interaction", ylabel="Score", kwargs...)
     labels = [string(interaction.pathway, ":", interaction.ligand, "->", interaction.receptor, " ", interaction.sender, "->", interaction.receiver) for interaction in ranked]
     scores = [interaction.score for interaction in ranked]
-    return bar(labels, scores; title=title, legend=false, xlabel="Interaction", ylabel="Score", color=:darkorange, xrotation=45, kwargs...)
+    return P.bar(labels, scores; title=title, legend=false, xlabel="Interaction", ylabel="Score", color=:darkorange, xrotation=45, kwargs...)
 end
 
 plot_ligand_receptor_report(network::CellCommunicationNetwork; kwargs...) = plot_ligand_receptor_report(rank_ligand_receptor_report(network); kwargs...)
@@ -3148,6 +3158,54 @@ function spatial_lr_permutation_test(experiment::SingleCellExperiment, labels::A
     return out
 end
 
+import ..BlenderIntegrator: to_blender_payload, BlenderMaterial, BlenderSpatialPayload
+
+"""
+    to_blender_payload(experiment::SingleCellExperiment; reduction="pca", name="SingleCell_Scene", glyph_scale=0.3)
+
+Convert a `SingleCellExperiment` into a 3D `BlenderSpatialPayload` for Blender visualization.
+"""
+function to_blender_payload(experiment::SingleCellExperiment; reduction::String="pca", name::String="SingleCell_Scene", glyph_scale::Real=0.3)
+    n_cells = length(experiment.cell_ids)
+    coords = if haskey(experiment.reductions, reduction)
+        red = experiment.reductions[reduction]
+        size(red, 2) >= 3 ? red[:, 1:3] : (size(red, 2) == 2 ? hcat(red, zeros(n_cells)) : hcat(red, zeros(n_cells, 3 - size(red, 2))))
+    elseif experiment.spatial_coords !== nothing
+        sp = experiment.spatial_coords
+        size(sp, 2) >= 3 ? sp[:, 1:3] : hcat(sp[:, 1:min(2, size(sp, 2))], zeros(n_cells, 3 - min(2, size(sp, 2))))
+    else
+        run_pca(experiment; n_components=min(3, max(1, n_cells)))
+        red = experiment.reductions["pca"]
+        size(red, 2) >= 3 ? red[:, 1:3] : hcat(red, zeros(n_cells, 3 - size(red, 2)))
+    end
+
+    cluster_labels = if haskey(experiment.clusters, "leiden")
+        string.("Cluster_", experiment.clusters["leiden"])
+    elseif haskey(experiment.clusters, "louvain")
+        string.("Cluster_", experiment.clusters["louvain"])
+    elseif !isempty(experiment.clusters)
+        string.("Cluster_", first(values(experiment.clusters)))
+    else
+        fill("Cell", n_cells)
+    end
+
+    unique_clusters = unique(cluster_labels)
+    cluster_map = Dict(c => i for (i, c) in enumerate(unique_clusters))
+    colors = [begin
+        idx = get(cluster_map, c, 1)
+        hue = (idx - 1) / max(length(unique_clusters), 1)
+        r = abs(hue * 6 - 3) - 1
+        g = 2 - abs(hue * 6 - 2)
+        b = 2 - abs(hue * 6 - 4)
+        (clamp(r, 0.0, 1.0), clamp(g, 0.0, 1.0), clamp(b, 0.0, 1.0))
+    end for c in cluster_labels]
+
+    mat = BlenderMaterial(name=name * "_mat")
+    return BlenderSpatialPayload(name, Matrix{Float64}(coords), cluster_labels, colors, Float64(glyph_scale), mat)
+end
+
+
 include("singlecell_interop.jl")
+
 
 end

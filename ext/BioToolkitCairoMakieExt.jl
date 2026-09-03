@@ -5,6 +5,8 @@ using CairoMakie
 
 import BioToolkit: export_figure, render!, _render_axis!, GenomeBrowser, GenomeViewport, GeneTrack, CoverageTrack, AlignmentTrack
 
+
+
 function _browser_figure(browser::GenomeBrowser)
     rows = max(length(browser.tracks), 1)
     height = max(1, sum(track -> track.height, browser.tracks) + browser.gap * max(rows - 1, 0))

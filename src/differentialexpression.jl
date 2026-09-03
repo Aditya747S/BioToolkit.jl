@@ -15,13 +15,15 @@ using Printf
 using Optim
 using Dates
 using SHA
+using Base.Threads
 
 using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, analysis_result_summary, container_provenance_summary, ensure_provenance_id!, metadata_provenance, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_container_provenance!, register_provenance!, stamp_provenance!, update_provenance!, with_provenance
 
 # -----------------------------------------------------------------------------
 # Exports
 # -----------------------------------------------------------------------------
-export CountMatrix, DEResult, GLMSolver, DESeqDataSet, DESeqDataSetFromMatrix, HurdleDEResult, mast_hurdle_test, pseudobulk_by_donor_celltype, pseudobulk_de,
+export CountMatrix, DEResult, AbstractGLMSolver, GLMSolver, NativeIRLSSolver, GLMjlAdapterSolver, DESeqDataSet, DESeqDataSetFromMatrix, HurdleDEResult, mast_hurdle_test, pseudobulk_by_donor_celltype, pseudobulk_de,
+  coefficients, stderror, pvalue, padj,
   # Normalization
   calc_tmm_factors, calc_norm_factors, estimateSizeFactorsForMatrix,
   estimateSizeFactors, sizeFactors, sizeFactors!,
@@ -166,12 +168,25 @@ end
 
 Base.show(io::IO, r::DEResult) = print(io, analysis_result_summary(r))
 
+coefficients(r::DEResult) = r.log2_fold_change
+stderror(r::DEResult) = r.lfc_se
+pvalue(r::DEResult) = r.pvalue
+padj(r::DEResult) = r.padj
+
+"""
+    AbstractGLMSolver
+
+Abstract supertype for all Negative Binomial Generalized Linear Model (NB-GLM) solvers in BioToolkit.
+"""
+abstract type AbstractGLMSolver end
+
 """
     GLMSolver(X; max_step_halvings=10)
 
-Mutable workspace for IRLS fitting of NB-GLMs. Pre-allocates all buffers.
+Mutable workspace for IRLS fitting of NB-GLMs. Pre-allocates all buffers for zero-allocation multi-threaded fits.
+Alias: `NativeIRLSSolver`.
 """
-mutable struct GLMSolver
+mutable struct GLMSolver <: AbstractGLMSolver
   X::Matrix{Float64}
   xtwx::Matrix{Float64}
   xtwz::Vector{Float64}
@@ -203,6 +218,24 @@ mutable struct GLMSolver
       0,
       max_step_halvings,
       zeros(Float64, ncoef, ncoef))
+  end
+end
+
+const NativeIRLSSolver = GLMSolver
+
+"""
+    GLMjlAdapterSolver(X; backend=:native)
+
+Adapter type facilitating interoperability between BioToolkit's pre-allocated IRLS workspace and standard Julia GLM.jl solver semantics.
+"""
+struct GLMjlAdapterSolver <: AbstractGLMSolver
+  X::Matrix{Float64}
+  native_solver::GLMSolver
+  backend::Symbol
+
+  function GLMjlAdapterSolver(X::AbstractMatrix{<:Real}; backend::Symbol=:native)
+    Xf = Matrix{Float64}(X)
+    new(Xf, GLMSolver(Xf), backend)
   end
 end
 
@@ -394,13 +427,18 @@ function _design_model_matrix(design; modelMatrixType::Symbol=:standard)
     # Pre-count columns to avoid O(n²) hcat allocations
     col_list = Vector{Float64}[]  # each element is a column vector
     cnames = String[]
+    intercept_added = false
     if modelMatrixType != :expanded
       push!(col_list, ones(Float64, n))
       push!(cnames, "Intercept")
+      intercept_added = true
     end
     for cname in names(design)
       vals = design[!, cname]
       if eltype(vals) <: Number
+        if cname == "Intercept" && intercept_added
+          continue
+        end
         push!(col_list, Float64.(vals))
         push!(cnames, String(cname))
       else
@@ -1037,12 +1075,15 @@ function kde_spline(x::AbstractVector{<:Real}, grid::AbstractVector{<:Real}; df:
   inv_h2 = -0.5 / (h * h)
   norm_const = 1.0 / (n * h * sqrt(2π))
 
-  density = zeros(Float64, length(grid))
-  @inbounds for i in eachindex(grid)
-    gi = Float64(grid[i])
+  xf = Float64.(x)
+  gridf = Float64.(grid)
+
+  density = zeros(Float64, length(gridf))
+  @inbounds for i in eachindex(gridf)
+    gi = gridf[i]
     s = 0.0
     @simd for j in 1:n
-      diff = gi - Float64(x[j])
+      diff = gi - xf[j]
       s += exp(diff * diff * inv_h2)
     end
     density[i] = s * norm_const
@@ -1080,6 +1121,11 @@ function estimateSizeFactorsForMatrix(counts::AbstractMatrix{<:Integer};
   geoMeans=nothing,
   controlGenes=nothing,
   fallback::Symbol=:library_size)
+
+  if issparse(counts) && size(counts, 1) * size(counts, 2) > 1_000_000
+    @warn "Converting large sparse matrix to dense for size factor estimation. " *
+          "Consider using type=:poscounts for sparse count data to avoid dense conversion."
+  end
 
   Y = Matrix{Float64}(counts)
   ng, ns = size(Y)
@@ -1942,7 +1988,8 @@ function estimate_dispersions_prior(cm::CountMatrix,
       means[g] = max(mean(yn), 1e-8)
     end
     # Pre-allocate one GLMSolver per thread for zero-allocation reuse
-    nthreads = max(Threads.nthreads(), Threads.maxthreadid())
+    nthreads = Threads.nthreads()
+    nthreads = max(1, min(nthreads, ng))
     solver_pool = [GLMSolver(X) for _ in 1:nthreads]
     offset_shared = log.(nf)
     # Thread-safe accumulators
@@ -1950,6 +1997,9 @@ function estimate_dispersions_prior(cm::CountMatrix,
     error_counts = zeros(Int, nthreads)
     Threads.@threads for g in 1:ng
       tid = Threads.threadid()
+      if tid > nthreads
+        tid = 1
+      end
       row = @view counts_dense[g, :]
       alpha_g = try
         _fit_gene_dispersion_mle(row, nf, X;
@@ -2121,8 +2171,13 @@ end
 """
     fit_gene_fast!(solver, y, offset, dispersion; ...)
 
-Fit NB-GLM by IRLS. Returns (beta, se, stat) or (beta, cov, se, stat) if return_covariance=true.
+Fit NB-GLM by IRLS algorithm using an `AbstractGLMSolver` engine (`GLMSolver` / `NativeIRLSSolver` or `GLMjlAdapterSolver`).
+Returns (beta, se, stat) or (beta, cov, se, stat) if return_covariance=true.
 """
+function fit_gene_fast!(solver::GLMjlAdapterSolver, y::AbstractVector{<:Real}, offset::AbstractVector{<:Real}, dispersion::Real; kwargs...)
+  return fit_gene_fast!(solver.native_solver, y, offset, dispersion; kwargs...)
+end
+
 function fit_gene_fast!(solver::GLMSolver,
   y::AbstractVector{<:Real},
   offset::AbstractVector{<:Real},
@@ -2416,6 +2471,12 @@ function replace_outliers(cm::CountMatrix, design_vec;
   cooks = zeros(Float64, ng, ns)
 
   labels = String.(design_vec)
+  # Precompute group → sample indices mapping for O(1) lookup
+  label_to_idx = Dict{String,Vector{Int}}()
+  for (i, lab) in enumerate(labels)
+    push!(get!(label_to_idx, lab, Int[]), i)
+  end
+
   solver = GLMSolver(X)
   offset = log.(nf)
 
@@ -2444,7 +2505,7 @@ function replace_outliers(cm::CountMatrix, design_vec;
 
     for s in outlier_idx
       grp = labels[s]
-      grp_idx = findall(labels .== grp)
+      grp_idx = get(label_to_idx, grp, Int[])
       if length(grp_idx) < min_replicates
         continue
       end
@@ -2802,7 +2863,7 @@ function _fit_dds_wald(dds::DESeqDataSet;
   end
 
   offset = log.(nf)
-  nthreads = max(Threads.nthreads(), Threads.maxthreadid())
+  nthreads = max(1, min(Threads.nthreads(), ng))
   solver_pool = [GLMSolver(X) for _ in 1:nthreads]
   solver_alt_pool = [GLMSolver(X) for _ in 1:nthreads]
   cooks_disp = zeros(Float64, ng)
@@ -2811,6 +2872,9 @@ function _fit_dds_wald(dds::DESeqDataSet;
   counts_dense = Matrix{Float64}(wc.counts)
   Threads.@threads for g in 1:ng
     tid = Threads.threadid()
+    if tid > nthreads
+      tid = 1
+    end
     solver = solver_pool[tid]
     solver_alt = solver_alt_pool[tid]
 
@@ -3059,7 +3123,7 @@ function nbinomLRT(dds::DESeqDataSet;
 
   counts_dense = Matrix{Float64}(wc.counts)
   Threads.@threads for g in 1:ng
-    tid = Threads.threadid()
+    tid = mod1(Threads.threadid(), nthreads)
     solver_full = solver_full_pool[tid]
     solver_red = solver_red_pool[tid]
 
@@ -4804,7 +4868,7 @@ function combat_correction(data::AbstractMatrix{<:Real}, batch;
       n_b == 0 && continue
 
       a_prior, b_prior = _combat_inv_gamma_moments(view(delta_hat, b, :); eps=eps)
-      for g in 1:ng
+      @threads for g in 1:ng
         g_star, d_star = _combat_posterior_gamma_delta(
           view(s_data, idx, g),
           gamma_hat[b, g],
@@ -5321,7 +5385,7 @@ function time_series_de(cm::CountMatrix, timepoints, condition;
   solver_red_pool = [GLMSolver(X_reduced) for _ in 1:nthreads]
 
   Threads.@threads for g in 1:ng
-    tid = Threads.threadid()
+    tid = mod1(Threads.threadid(), nthreads)
     solver_full = solver_full_pool[tid]
     solver_reduced = solver_red_pool[tid]
 
@@ -5418,7 +5482,7 @@ function dge_mixedmodel(cm::CountMatrix, fixed_design, random_design;
   solver_pool = [GLMSolver(X) for _ in 1:nthreads]
 
   Threads.@threads for g in 1:ng
-    tid = Threads.threadid()
+    tid = mod1(Threads.threadid(), nthreads)
     solver = solver_pool[tid]
     y = Y[g, :]
     base_mean = mean(y ./ nf)
@@ -5665,10 +5729,10 @@ function bootstrap_lfc(cm::CountMatrix, design;
 
   nthreads = max(Threads.nthreads(), Threads.maxthreadid())
   solver_pool = [GLMSolver(X) for _ in 1:nthreads]
-  rng_pool = [MersenneTwister(seed + tid) for tid in 1:nthreads]
+  rng_pool = [MersenneTwister(seed + i) for i in 1:nthreads]
 
   Threads.@threads for g in 1:ng
-    tid = Threads.threadid()
+    tid = mod1(Threads.threadid(), nthreads)
     solver = solver_pool[tid]
     local_rng = rng_pool[tid]
 

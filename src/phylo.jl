@@ -4447,3 +4447,199 @@ function max_clade_credibility(trees::Vector{PhyloTree})
   _ctx = active_provenance_context()
   return provenance_result!(_ctx, best_tree, "max_clade_credibility")
 end
+
+# Native generic molecular-evolution API.  These types intentionally live in
+# phylo.jl so the package has one coherent phylogenetics surface.
+abstract type Partition end
+abstract type MultiSitePartition <: Partition end
+abstract type DiscretePartition <: MultiSitePartition end
+abstract type ContinuousPartition <: Partition end
+abstract type BranchModel end
+abstract type DiscreteStateModel <: BranchModel end
+abstract type PMatrixModel <: DiscreteStateModel end
+abstract type SimulationModel <: BranchModel end
+
+mutable struct FelNode <: AbstractPhyloTree
+    name::String
+    branch_length::Float64
+    children::Vector{FelNode}
+    parent::Union{Nothing,FelNode}
+    message::Vector{Any}
+end
+FelNode(name::AbstractString=""; branch_length::Real=0.0, children=FelNode[]) = begin
+    node = FelNode(String(name), Float64(branch_length), collect(children), nothing, Any[])
+    for child in node.children
+        child.parent = node
+    end
+    node
+end
+FelNode(children::Vector{FelNode}; name::AbstractString="", branch_length::Real=0.0) = FelNode(name; branch_length=branch_length, children=children)
+
+struct NucleotidePartition <: DiscretePartition
+    likelihoods::Matrix{Float64}
+    scaling::Vector{Float64}
+end
+NucleotidePartition() = NucleotidePartition(ones(4, 1) ./ 4, [0.0])
+function NucleotidePartition(sequence::AbstractString)
+    states = Vector{Int}(undef, ncodeunits(sequence))
+    @inbounds for (i, base) in enumerate(codeunits(sequence))
+        states[i] = base == UInt8('A') || base == UInt8('a') ? 1 :
+                    base == UInt8('C') || base == UInt8('c') ? 2 :
+                    base == UInt8('G') || base == UInt8('g') ? 3 :
+                    base == UInt8('T') || base == UInt8('t') ? 4 : 0
+    end
+    NucleotidePartition(states)
+end
+NucleotidePartition(states::AbstractVector{<:Integer}) = NucleotidePartition(hcat([begin
+    v = zeros(4)
+    if s == 0
+        v .= 1.0 / 4.0
+    else
+        1 <= s <= 4 || throw(ArgumentError("nucleotide states must be 0:4"))
+        v[s] = 1.0
+    end
+    v
+end for s in states]...), zeros(length(states)))
+
+struct AminoAcidPartition <: DiscretePartition
+    likelihoods::Matrix{Float64}
+    scaling::Vector{Float64}
+end
+AminoAcidPartition() = AminoAcidPartition(ones(20, 1) ./ 20, [0.0])
+struct CustomDiscretePartition <: DiscretePartition
+    likelihoods::Matrix{Float64}
+    scaling::Vector{Float64}
+end
+struct GaussianPartition <: ContinuousPartition
+    mean::Float64
+    variance::Float64
+end
+GaussianPartition() = GaussianPartition(0.0, 1.0)
+
+struct GeneralCTMC <: PMatrixModel
+    Q::Matrix{Float64}
+    pi::Vector{Float64}
+end
+function GeneralCTMC(Q::AbstractMatrix{<:Real}, pi::AbstractVector{<:Real})
+    size(Q, 1) == size(Q, 2) == length(pi) || throw(DimensionMismatch("Q and pi dimensions differ"))
+    frequencies = Float64.(pi); total = sum(frequencies)
+    total > 0 || throw(ArgumentError("stationary frequencies must be positive"))
+    GeneralCTMC(Matrix{Float64}(Q), frequencies ./ total)
+end
+struct DiagonalizedCTMC <: PMatrixModel
+    Q::Matrix{Float64}
+    pi::Vector{Float64}
+end
+function DiagonalizedCTMC(Q::AbstractMatrix{<:Real}, pi::AbstractVector{<:Real})
+    size(Q, 1) == size(Q, 2) == length(pi) || throw(DimensionMismatch("Q and pi dimensions differ"))
+    frequencies = Float64.(pi)
+    total = sum(frequencies)
+    total > 0 || throw(ArgumentError("stationary frequencies must be positive"))
+    return DiagonalizedCTMC(Matrix{Float64}(Q), frequencies ./ total)
+end
+struct PModel{M<:PMatrixModel} <: DiscreteStateModel
+    model::M
+end
+struct BrownianMotion <: SimulationModel
+    drift::Float64
+    variance::Float64
+end
+BrownianMotion(drift::Real=0.0, variance::Real=1.0) = BrownianMotion(Float64(drift), Float64(variance))
+
+function _fel_collect_leaves!(buffer::Vector{FelNode}, node::FelNode)
+    isempty(node.children) && return push!(buffer, node)
+    for child in node.children
+        _fel_collect_leaves!(buffer, child)
+    end
+    buffer
+end
+getleaflist(node::FelNode) = _fel_collect_leaves!(FelNode[], node)
+function _fel_collect!(buffer::Vector{FelNode}, node::FelNode)
+    push!(buffer, node)
+    for child in node.children
+        _fel_collect!(buffer, child)
+    end
+    buffer
+end
+getnodelist(node::FelNode) = _fel_collect!(FelNode[], node)
+getnonleaflist(node::FelNode) = filter(n -> !isempty(n.children), getnodelist(node))
+isleafnode(node::FelNode) = isempty(node.children)
+isrootnode(node::FelNode) = node.parent === nothing
+isinternalnode(node::FelNode) = !isleafnode(node)
+leaf_names(node::FelNode) = [n.name for n in getleaflist(node)]
+node_names(node::FelNode) = [n.name for n in getnodelist(node)]
+leaves(node::FelNode) = getleaflist(node)
+nodes(node::FelNode) = getnodelist(node)
+internal_nodes(node::FelNode) = getnonleaflist(node)
+
+eq_freq(model::PMatrixModel) = model.pi
+eq_freq(model::PModel) = eq_freq(model.model)
+function _ctmc_p(model::PMatrixModel, t::Real)
+    t >= 0 || throw(DomainError(t, "branch lengths must be non-negative"))
+    raw = exp(model.Q * Float64(t))
+    # Roundoff can create tiny negative entries.  Clamp those and normalize
+    # each row so the result remains a valid stochastic transition matrix.
+    P = max.(raw, 0.0)
+    row_sums = vec(sum(P, dims=2))
+    row_sums .= max.(row_sums, eps(Float64))
+    P ./= reshape(row_sums, :, 1)
+end
+_ctmc_p(model::PModel, t::Real) = _ctmc_p(model.model, t)
+internal_message_init!(tree::FelNode, template::Partition) = (foreach(n -> n.message = [deepcopy(template)], getnodelist(tree)); tree)
+allocate!(tree::FelNode, template::Partition) = internal_message_init!(tree, template)
+
+function obs2partition!(node::FelNode, sequence::AbstractString)
+    isleafnode(node) || throw(ArgumentError("observations can only be assigned to leaf nodes"))
+    node.message = [NucleotidePartition(sequence)]
+    node
+end
+partition2obs(partition::NucleotidePartition) = partition.likelihoods
+
+function forward!(destination::NucleotidePartition, source::NucleotidePartition, model::PMatrixModel, branch_length::Real)
+    propagated = _ctmc_p(model, branch_length) * source.likelihoods
+    destination.likelihoods .= propagated
+    destination.scaling .= source.scaling
+    destination
+end
+function backward!(destination::NucleotidePartition, source::NucleotidePartition, model::PMatrixModel, branch_length::Real)
+    forward!(destination, source, model, branch_length)
+end
+
+function felsenstein!(tree::FelNode, model::PMatrixModel)
+    function visit(node)
+        isleafnode(node) && return node.message[1]
+        child_parts = map(visit, node.children)
+        firstpart = child_parts[1]
+        firstpart isa NucleotidePartition || throw(ArgumentError("only NucleotidePartition is currently supported"))
+        result = ones(size(firstpart.likelihoods))
+        for (child, part) in zip(node.children, child_parts)
+            result .*= _ctmc_p(model, child.branch_length) * part.likelihoods
+        end
+        node.message = [NucleotidePartition(result, zeros(size(result, 2)))]
+        node.message[1]
+    end
+    visit(tree); tree
+end
+function log_likelihood!(tree::FelNode, model::PMatrixModel)
+    felsenstein!(tree, model)
+    root = tree.message[1]::NucleotidePartition
+    sum(log.(max.(eq_freq(model)' * root.likelihoods, eps(Float64))))
+end
+log_likelihood(tree::FelNode, model::PMatrixModel) = log_likelihood!(tree, model)
+felsenstein_down!(tree::FelNode, model::PMatrixModel; kwargs...) = felsenstein!(tree, model)
+felsenstein_roundtrip!(tree::FelNode, model::PMatrixModel; kwargs...) = felsenstein!(tree, model)
+combine!(a::NucleotidePartition, b::NucleotidePartition) = NucleotidePartition(a.likelihoods .* b.likelihoods, a.scaling .+ b.scaling)
+marginal_state_dict(tree::FelNode, model::PMatrixModel) = (felsenstein!(tree, model); Dict(n.name => n.message[1] for n in getnodelist(tree)))
+
+function sim_tree(; n::Integer=10, branch_length::Real=1.0)
+    n > 0 || throw(ArgumentError("n must be positive"))
+    active = [FelNode("taxon_$i"; branch_length=branch_length) for i in 1:n]
+    while length(active) > 1
+        a, b = sort(randperm(length(active))[1:2], rev=true)
+        left, right = active[a], active[b]; deleteat!(active, a); deleteat!(active, b)
+        push!(active, FelNode(""; branch_length=branch_length, children=[left, right]))
+    end
+    active[1]
+end
+standard_tree_sim(n::Integer) = sim_tree(n=n)
+ladder_tree_sim(n::Integer) = sim_tree(n=n)

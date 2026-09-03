@@ -2,7 +2,6 @@ module BioPlotting
 
 using Statistics
 using LinearAlgebra
-using Plots
 using Distributions
 using DataFrames
 
@@ -17,6 +16,23 @@ export AnnotatedHeatmapResult, UpsetPlotResult, CircosPlotResult
 export volcano_data, volcano_plot, ma_data, ma_plot, clustered_heatmap, export_plot
 export manhattan_data, manhattan_plot, qq_data, qq_plot, gwas_forest_plot
 export annotated_heatmap, upset_plot, oncoprint_from_matrix, circos_plot
+
+function _get_plots()
+    if isdefined(Main, :Plots)
+        return getfield(Main, :Plots)
+    end
+    return nothing
+end
+
+function _make_figure(builder::Function)
+    P = _get_plots()
+    P === nothing && return nothing
+    try
+        return builder(P)
+    catch
+        return nothing
+    end
+end
 
 
 struct VolcanoPoint
@@ -401,20 +417,23 @@ end
 
 function volcano_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, label_top::Integer=10, title::String="Volcano plot", size=(980, 700), save_path::Union{Nothing,String}=nothing, kwargs...)
     points, summary = volcano_data(results; lfc_cutoff=lfc_cutoff, fdr_cutoff=fdr_cutoff, label_top=label_top)
-    figure = plot(; title=title, xlabel="log2 fold change", ylabel="-log10 p-value", size=size, legend=:outerright, background_color=:white, left_margin=15Plots.mm, bottom_margin=15Plots.mm, top_margin=10Plots.mm, right_margin=28Plots.mm, kwargs...)
-    palette = Dict(:up => :firebrick, :down => :royalblue, :neutral => :gray)
-    labels = Dict(:up => "Upregulated", :down => "Downregulated", :neutral => "Neutral")
-    for category in (:neutral, :up, :down)
-        selected = [point for point in points if point.category == category]
-        isempty(selected) && continue
-        scatter!(figure, [point.log2_fold_change for point in selected], [point.negative_log10_pvalue for point in selected]; color=palette[category], markersize=7, markerstrokewidth=0, label=labels[category])
-    end
-    vline!(figure, [-Float64(lfc_cutoff), Float64(lfc_cutoff)]; color=:gray, linestyle=:dash, label=false)
-    hline!(figure, [-log10(_safe_probability(fdr_cutoff))]; color=:gray, linestyle=:dash, label=false)
-    labeled = sort([point for point in points if point.labeled]; by = point -> point.negative_log10_pvalue, rev=true)
-    for (index, point) in enumerate(Iterators.take(labeled, 8))
-        offset_y = 0.28 + 0.16 * ((index - 1) % 3)
-        annotate!(figure, point.log2_fold_change, point.negative_log10_pvalue + offset_y, text(point.gene_id, 7, :black, :center, :bottom; rotation=90))
+    figure = _make_figure() do P
+        fig = P.plot(; title=title, xlabel="log2 fold change", ylabel="-log10 p-value", size=size, legend=:outerright, background_color=:white, left_margin=15P.mm, bottom_margin=15P.mm, top_margin=10P.mm, right_margin=28P.mm, kwargs...)
+        palette = Dict(:up => :firebrick, :down => :royalblue, :neutral => :gray)
+        labels = Dict(:up => "Upregulated", :down => "Downregulated", :neutral => "Neutral")
+        for category in (:neutral, :up, :down)
+            selected = [point for point in points if point.category == category]
+            isempty(selected) && continue
+            P.scatter!(fig, [point.log2_fold_change for point in selected], [point.negative_log10_pvalue for point in selected]; color=palette[category], markersize=7, markerstrokewidth=0, label=labels[category])
+        end
+        P.vline!(fig, [-Float64(lfc_cutoff), Float64(lfc_cutoff)]; color=:gray, linestyle=:dash, label=false)
+        P.hline!(fig, [-log10(_safe_probability(fdr_cutoff))]; color=:gray, linestyle=:dash, label=false)
+        labeled = sort([point for point in points if point.labeled]; by = point -> point.negative_log10_pvalue, rev=true)
+        for (index, point) in enumerate(Iterators.take(labeled, 8))
+            offset_y = 0.28 + 0.16 * ((index - 1) % 3)
+            P.annotate!(fig, point.log2_fold_change, point.negative_log10_pvalue + offset_y, P.text(point.gene_id, 7, :black, :center, :bottom; rotation=90))
+        end
+        fig
     end
     _save_plots_figure(save_path, figure)
     result = VolcanoPlotResult(points, summary, figure)
@@ -430,15 +449,18 @@ end
 
 function ma_plot(results; lfc_cutoff::Real=1.0, fdr_cutoff::Real=0.05, title::String="MA plot", size=(900, 660), save_path::Union{Nothing,String}=nothing, kwargs...)
     points, summary = ma_data(results; lfc_cutoff=lfc_cutoff, fdr_cutoff=fdr_cutoff)
-    figure = plot(; title=title, xlabel="log2 abundance", ylabel="log2 fold change", size=size, legend=:topright, background_color=:white, left_margin=15Plots.mm, bottom_margin=15Plots.mm, top_margin=10Plots.mm, kwargs...)
-    palette = Dict(:significant => :darkmagenta, :background => :slategray)
-    labels = Dict(:significant => "Significant", :background => "Background")
-    for category in (:background, :significant)
-        selected = [point for point in points if point.category == category]
-        isempty(selected) && continue
-        scatter!(figure, [point.abundance for point in selected], [point.log2_fold_change for point in selected]; color=palette[category], markersize=7, markerstrokewidth=0, label=labels[category])
+    figure = _make_figure() do P
+        fig = P.plot(; title=title, xlabel="log2 abundance", ylabel="log2 fold change", size=size, legend=:topright, background_color=:white, left_margin=15P.mm, bottom_margin=15P.mm, top_margin=10P.mm, kwargs...)
+        palette = Dict(:significant => :darkmagenta, :background => :slategray)
+        labels = Dict(:significant => "Significant", :background => "Background")
+        for category in (:background, :significant)
+            selected = [point for point in points if point.category == category]
+            isempty(selected) && continue
+            P.scatter!(fig, [point.abundance for point in selected], [point.log2_fold_change for point in selected]; color=palette[category], markersize=7, markerstrokewidth=0, label=labels[category])
+        end
+        P.hline!(fig, [0.0]; color=:gray, linestyle=:dash, label=false)
+        fig
     end
-    hline!(figure, [0.0]; color=:gray, linestyle=:dash, label=false)
     _save_plots_figure(save_path, figure)
     result = MAPlotResult(points, summary, figure)
     provenance_parameters = Dict{Any,Any}(kwargs)
@@ -457,10 +479,13 @@ function clustered_heatmap(matrix::AbstractMatrix{<:Real}; row_labels=nothing, c
     reordered = scaled[row_order, column_order]
     row_names = _reorder_labels(row_labels, row_order)
     column_names = _reorder_labels(column_labels, column_order)
-    figure = heatmap(reordered; color=:balance, title=title, xlabel="Samples", ylabel="Features", size=size, colorbar=true, colorbar_title="Row-scaled z-score", clim=(-2.5, 2.5), left_margin=18Plots.mm, bottom_margin=18Plots.mm, top_margin=10Plots.mm, right_margin=28Plots.mm, kwargs...)
-    xticks!(figure, (1:length(column_names), column_names))
-    yticks!(figure, (1:length(row_names), row_names))
-    plot!(figure; xrotation=45)
+    figure = _make_figure() do P
+        fig = P.heatmap(reordered; color=:balance, title=title, xlabel="Samples", ylabel="Features", size=size, colorbar=true, colorbar_title="Row-scaled z-score", clim=(-2.5, 2.5), left_margin=18P.mm, bottom_margin=18P.mm, top_margin=10P.mm, right_margin=28P.mm, kwargs...)
+        P.xticks!(fig, (1:length(column_names), column_names))
+        P.yticks!(fig, (1:length(row_names), row_names))
+        P.plot!(fig; xrotation=45)
+        fig
+    end
     _save_plots_figure(save_path, figure)
     result = ClusteredHeatmapResult(reordered, row_order, column_order, row_names, column_names, figure)
     provenance_parameters = Dict{Any,Any}(kwargs)
@@ -565,21 +590,24 @@ end
 function manhattan_plot(result::GWASResult; pvalue_threshold::Real=5e-8, label_top::Integer=10)
     points, summary = manhattan_data(result; pvalue_threshold=pvalue_threshold, label_top=label_top)
     order, offsets, centers, total_span = _chromosome_layout(result)
-    figure = plot(; size=(1200, 620), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=6Plots.mm, right_margin=4Plots.mm, top_margin=5Plots.mm, bottom_margin=6Plots.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10)
-    xs = [point.cumulative_position for point in points]
-    ys = [point.negative_log10_pvalue for point in points]
-    alternating = Dict(order[index] => (isodd(index) ? "#4f6d7a" : "#9fb3c8") for index in eachindex(order))
-    colors = [point.category == :significant ? "#d1495b" : alternating[point.chromosome] for point in points]
-    scatter!(figure, xs, ys; color=colors, markersize=4.8, markerstrokewidth=0, xlabel="genomic position", ylabel="-log10(p)", title="Manhattan plot")
-    xticks!(figure, ([get(centers, chromosome, 0.0) for chromosome in order], order))
-    xlims!(figure, (0.0, max(total_span, 1.0)))
-    ypeak = isempty(ys) ? 0.0 : maximum(ys)
-    ylims!(figure, (0.0, max(ypeak * 1.08, -log10(clamp(Float64(pvalue_threshold), eps(Float64), 1.0)) * 1.15)))
-    if any(point.labeled for point in points)
-        labeled = [point for point in points if point.labeled]
-        annotate!(figure, [(point.cumulative_position, point.negative_log10_pvalue, text(point.snp_id, 7, "#000000", halign=:left)) for point in labeled])
+    figure = _make_figure() do P
+        fig = P.plot(; size=(1200, 620), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=6P.mm, right_margin=4P.mm, top_margin=5P.mm, bottom_margin=6P.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10)
+        xs = [point.cumulative_position for point in points]
+        ys = [point.negative_log10_pvalue for point in points]
+        alternating = Dict(order[index] => (isodd(index) ? "#4f6d7a" : "#9fb3c8") for index in eachindex(order))
+        colors = [point.category == :significant ? "#d1495b" : alternating[point.chromosome] for point in points]
+        P.scatter!(fig, xs, ys; color=colors, markersize=4.8, markerstrokewidth=0, xlabel="genomic position", ylabel="-log10(p)", title="Manhattan plot")
+        P.xticks!(fig, ([get(centers, chromosome, 0.0) for chromosome in order], order))
+        P.xlims!(fig, (0.0, max(total_span, 1.0)))
+        ypeak = isempty(ys) ? 0.0 : maximum(ys)
+        P.ylims!(fig, (0.0, max(ypeak * 1.08, -log10(clamp(Float64(pvalue_threshold), eps(Float64), 1.0)) * 1.15)))
+        if any(point.labeled for point in points)
+            labeled = [point for point in points if point.labeled]
+            P.annotate!(fig, [(point.cumulative_position, point.negative_log10_pvalue, P.text(point.snp_id, 7, "#000000", halign=:left)) for point in labeled])
+        end
+        P.hline!(fig, [-log10(clamp(Float64(pvalue_threshold), eps(Float64), 1.0))]; linestyle=:dash, color="#7d1f2f", linewidth=1.5)
+        fig
     end
-    hline!(figure, [-log10(clamp(Float64(pvalue_threshold), eps(Float64), 1.0))]; linestyle=:dash, color="#7d1f2f", linewidth=1.5)
     result_plot = ManhattanPlotResult(points, summary, figure)
     _ctx = active_provenance_context()
 
@@ -616,21 +644,24 @@ end
 
 function qq_plot(result::GWASResult)
     points, summary = qq_data(result)
-    figure = plot(; size=(840, 760), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=6Plots.mm, right_margin=4Plots.mm, top_margin=5Plots.mm, bottom_margin=6Plots.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10, aspect_ratio=:equal)
-    xs = [point.expected for point in points]
-    ys = [point.observed for point in points]
-    if !isempty(points)
-        n = length(points)
-        step_sz = max(1, n ÷ 500)
-        grid_indices = unique(vcat(1:step_sz:n, n))
-        confidence_x = xs[grid_indices]
-        confidence_low = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.025)), 0.0) for idx in grid_indices]
-        confidence_high = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.975)), 0.0) for idx in grid_indices]
-        plot!(figure, confidence_x, confidence_high; fillrange=confidence_low, fillalpha=0.18, linecolor=:transparent, fillcolor="#9db4c0")
+    figure = _make_figure() do P
+        fig = P.plot(; size=(840, 760), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=6P.mm, right_margin=4P.mm, top_margin=5P.mm, bottom_margin=6P.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10, aspect_ratio=:equal)
+        xs = [point.expected for point in points]
+        ys = [point.observed for point in points]
+        if !isempty(points)
+            n = length(points)
+            step_sz = max(1, n ÷ 500)
+            grid_indices = unique(vcat(1:step_sz:n, n))
+            confidence_x = xs[grid_indices]
+            confidence_low = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.025)), 0.0) for idx in grid_indices]
+            confidence_high = [max(-log10(quantile(Beta(idx, n - idx + 1), 0.975)), 0.0) for idx in grid_indices]
+            P.plot!(fig, confidence_x, confidence_high; fillrange=confidence_low, fillalpha=0.18, linecolor=:transparent, fillcolor="#9db4c0")
+        end
+        P.scatter!(fig, xs, ys; color="#173f5f", markersize=4.2, markerstrokewidth=0, xlabel="expected -log10(p)", ylabel="observed -log10(p)", title="QQ plot")
+        max_value = isempty(points) ? 1.0 : max(maximum(xs), maximum(ys))
+        P.plot!(fig, [0.0, max_value], [0.0, max_value]; color="#7a7a7a", linestyle=:dash, linewidth=1.4)
+        fig
     end
-    scatter!(figure, xs, ys; color="#173f5f", markersize=4.2, markerstrokewidth=0, xlabel="expected -log10(p)", ylabel="observed -log10(p)", title="QQ plot")
-    max_value = isempty(points) ? 1.0 : max(maximum(xs), maximum(ys))
-    plot!(figure, [0.0, max_value], [0.0, max_value]; color="#7a7a7a", linestyle=:dash, linewidth=1.4)
     result_plot = QQPlotResult(points, summary, figure)
     _ctx = active_provenance_context()
 
@@ -659,17 +690,20 @@ function gwas_forest_plot(result::MetaAnalysisResult; threaded::Bool=true)
     end
     order = sortperm([point.qvalue for point in points])
     selected = points[order]
-    figure = plot(; size=(920, max(320, 42 * max(length(selected), 1))), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=7Plots.mm, right_margin=5Plots.mm, top_margin=6Plots.mm, bottom_margin=6Plots.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10)
-    if !isempty(selected)
-        y_positions = collect(length(selected):-1:1)
-        scatter!(figure, [point.beta for point in selected], y_positions; xerror=[1.96 * point.standard_error for point in selected], color="#173f5f", markersize=5.5, markerstrokewidth=0)
-        for (index, point) in enumerate(selected)
-            plot!(figure, [point.lower, point.upper], [y_positions[index], y_positions[index]]; color="#173f5f", linewidth=2.2)
+    figure = _make_figure() do P
+        fig = P.plot(; size=(920, max(320, 42 * max(length(selected), 1))), dpi=180, background_color=:white, foreground_color=:black, legend=false, grid=false, left_margin=7P.mm, right_margin=5P.mm, top_margin=6P.mm, bottom_margin=6P.mm, titlefontsize=14, guidefontsize=12, tickfontsize=10)
+        if !isempty(selected)
+            y_positions = collect(length(selected):-1:1)
+            P.scatter!(fig, [point.beta for point in selected], y_positions; xerror=[1.96 * point.standard_error for point in selected], color="#173f5f", markersize=5.5, markerstrokewidth=0)
+            for (index, point) in enumerate(selected)
+                P.plot!(fig, [point.lower, point.upper], [y_positions[index], y_positions[index]]; color="#173f5f", linewidth=2.2)
+            end
+            P.yticks!(fig, (y_positions, [point.label for point in selected]))
+            P.vline!(fig, [0.0]; color="#7d1f2f", linestyle=:dash, linewidth=1.3)
+            P.xlims!(fig, (minimum([point.lower for point in selected]) - 0.1, maximum([point.upper for point in selected]) + 0.1))
+            P.ylims!(fig, (0.5, length(selected) + 0.5))
         end
-        yticks!(figure, (y_positions, [point.label for point in selected]))
-        vline!(figure, [0.0]; color="#7d1f2f", linestyle=:dash, linewidth=1.3)
-        xlims!(figure, (minimum([point.lower for point in selected]) - 0.1, maximum([point.upper for point in selected]) + 0.1))
-        ylims!(figure, (0.5, length(selected) + 0.5))
+        fig
     end
     summary = (
         total = length(selected),
@@ -726,8 +760,9 @@ function annotated_heatmap(matrix::AbstractMatrix{<:Real}; row_annotations=DataF
     
     reordered_row_annot = isempty(row_annotations) ? DataFrame() : row_annotations[row_order, :]
     reordered_col_annot = isempty(col_annotations) ? DataFrame() : col_annotations[col_order, :]
-    
-    figure = heatmap(clustered_matrix; color=:balance, title="Annotated Heatmap", colorbar=true)
+        figure = _make_figure() do P
+        P.heatmap(clustered_matrix; color=:balance, title="Annotated Heatmap", colorbar=true)
+    end
     
     result = AnnotatedHeatmapResult(clustered_matrix, row_order, col_order, reordered_row_annot, reordered_col_annot, figure, provenance_record("AnnotatedHeatmapResult", "bioplotting"))
     return provenance_result!(_ctx, result, "annotated_heatmap"; parents=String[])
@@ -772,7 +807,9 @@ function upset_plot(sets::Dict{String,Vector{String}})
         intersection_sizes[i] = sz
     end
     
-    figure = bar(intersection_sizes; xlabel="Intersection", ylabel="Intersection Size", title="Upset Plot", legend=false)
+    figure = _make_figure() do P
+        P.bar(intersection_sizes; xlabel="Intersection", ylabel="Intersection Size", title="Upset Plot", legend=false)
+    end
     
     result = UpsetPlotResult(set_names, intersection_sizes, intersection_matrix, figure, provenance_record("UpsetPlotResult", "bioplotting"))
     return provenance_result!(_ctx, result, "upset_plot"; parents=String[])
@@ -792,7 +829,9 @@ function oncoprint_from_matrix(alteration_matrix::AbstractMatrix{<:AbstractStrin
     ordered_matrix = String.(alteration_matrix[gene_order, sample_order])
     altered = ordered_matrix .!= ""
 
-    figure = heatmap(altered; title=title, colorbar=false)
+    figure = _make_figure() do P
+        P.heatmap(altered; title=title, colorbar=false)
+    end
     genes = ["Gene$(i)" for i in gene_order]
     samples = ["Sample$(i)" for i in sample_order]
     result = OncoprintResult(genes, samples, Int.(altered), ordered_matrix, provenance_record("OncoprintResult", "bioplotting"))
@@ -838,13 +877,16 @@ function circos_plot(chromosomes::Vector{String}, links::AbstractVector; chrom_s
         end
     end
     
-    figure = plot(proj=:polar, title="Circos Plot")
-    for (c, (s, e)) in chrom_coords
-        theta = range(s, e, length=50)
-        plot!(figure, theta, fill(1.0, length(theta)), linewidth=4, label=c)
-    end
-    for ((a1, r1), (a2, r2)) in link_coords
-        plot!(figure, [a1, a2], [r1, r2], color=:red, linewidth=1, label=false)
+    figure = _make_figure() do P
+        fig = P.plot(proj=:polar, title="Circos Plot")
+        for (c, (s, e)) in chrom_coords
+            theta = range(s, e, length=50)
+            P.plot!(fig, theta, fill(1.0, length(theta)), linewidth=4, label=c)
+        end
+        for ((a1, r1), (a2, r2)) in link_coords
+            P.plot!(fig, [a1, a2], [r1, r2], color=:red, linewidth=1, label=false)
+        end
+        fig
     end
     
     result = CircosPlotResult(chromosomes, chrom_coords, link_coords, figure, provenance_record("CircosPlotResult", "bioplotting"))

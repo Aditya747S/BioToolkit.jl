@@ -2733,7 +2733,7 @@ function read_abif(io::IO)
 
     @inline function read_tag_bytes(size::UInt32, data_offset::UInt32, data_pos::Int)
         if size <= 4
-            seek(io, data_pos - 4)
+            seek(io, data_pos - 8)
             data = read(io, 4)[1:size]
         else
             seek(io, data_offset)

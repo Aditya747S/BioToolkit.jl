@@ -258,4 +258,193 @@ using DataFrames
         @test hasproperty(convergent, :n_samples)
         @test any(n >= 2 for n in convergent.n_samples)
     end
+
+    @testset "Advanced Overlap & Divergence Metrics" begin
+        contigs1 = [
+            BioToolkit.RepertoireContig("c1", "cell1", :TRB, "V1", "", "J1", "", "", "", "", "", "", "C1", "ATGGCC", 6, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c2", "cell2", :TRB, "V2", "", "J2", "", "", "", "", "", "", "C2", "ATGTT", 5, 5, 10, 0.85, true, true, Dict{String,Any}()),
+        ]
+        contigs2 = [
+            BioToolkit.RepertoireContig("c3", "cell3", :TRB, "V1", "", "J1", "", "", "", "", "", "", "C1", "ATGGCC", 6, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c4", "cell4", :TRB, "V3", "", "J3", "", "", "", "", "", "", "C3", "ATGCAG", 6, 2, 4, 0.8, true, true, Dict{String,Any}()),
+        ]
+        sample1 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs1, "sample1"))
+        sample2 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs2, "sample2"))
+
+        set_a = Set{String}(sample1.clonotypes.clonotype_id)
+        set_b = Set{String}(sample2.clonotypes.clonotype_id)
+
+        dice = BioToolkit.overlap_sorensen_dice(set_a, set_b)
+        @test 0.0 <= dice <= 1.0
+
+        oc = BioToolkit.overlap_overlap_coefficient(set_a, set_b)
+        @test 0.0 <= oc <= 1.0
+
+        cos_sim = BioToolkit.overlap_cosine(sample1, sample2)
+        @test 0.0 <= cos_sim <= 1.0
+
+        heatmap_df = BioToolkit.repertoire_heatmap([sample1, sample2])
+        @test nrow(heatmap_df) == 4
+        @test hasproperty(heatmap_df, :value)
+
+        venn_df = BioToolkit.clonotype_venn([sample1, sample2])
+        @test nrow(venn_df) > 0
+        @test hasproperty(venn_df, :count)
+    end
+
+    @testset "TCRdist & Hamming Matrix" begin
+        seqs = ["CAVSGYNQGGTSGCSYTLTF", "CAVSGANQGGTSGCSYTLTF", "CAVSGYNQGGTSGCSYTLTT"]
+        H = BioToolkit.cdr3_hamming_distance(seqs)
+        @test size(H) == (3, 3)
+        @test H[1, 2] == 1.0
+
+        T = BioToolkit.tcrdist_matrix(seqs)
+        @test size(T) == (3, 3)
+        @test T[1, 1] == 0.0
+        @test T[1, 2] > 0.0
+    end
+
+    @testset "Clonotype Network Graph" begin
+        contigs = [
+            BioToolkit.RepertoireContig("c1", "cell1", :TRB, "V1", "", "J1", "", "", "", "", "", "", "CAVSGYNQGGTSGCSYTLTF", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c2", "cell2", :TRB, "V1", "", "J1", "", "", "", "", "", "", "CAVSGANQGGTSGCSYTLTF", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c3", "cell3", :TRB, "V2", "", "J2", "", "", "", "", "", "", "CVVGGGGGGGGGGGGGGGGG", "ATG", 3, 2, 4, 0.8, true, true, Dict{String,Any}()),
+        ]
+        sample = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs, "sample1"))
+        net = BioToolkit.clonotype_network(sample; threshold=2)
+
+        @test haskey(net, :adjacency)
+        @test haskey(net, :nodes)
+        @test haskey(net, :edges)
+        @test haskey(net, :components)
+        @test nrow(net.nodes) == 3
+    end
+
+    @testset "Public Clonotype & VJ Divergence" begin
+        contigs1 = [BioToolkit.RepertoireContig("c1", "cell1", :TRB, "TRBV12-1*01", "", "TRBJ1-1*01", "", "", "", "", "", "", "C1", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}())]
+        contigs2 = [BioToolkit.RepertoireContig("c2", "cell2", :TRB, "TRBV12-1*01", "", "TRBJ1-1*01", "", "", "", "", "", "", "C1", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}())]
+        sample1 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs1, "sample1"))
+        sample2 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs2, "sample2"))
+
+        pub = BioToolkit.public_clonotype_analysis([sample1, sample2]; min_samples=2)
+        @test nrow(pub) == 1
+        @test pub.prevalence[1] == 2
+
+        jsd = BioToolkit.vj_usage_divergence(sample1, sample2; metric=:jsd)
+        @test jsd >= 0.0
+
+        diff_vj = BioToolkit.differential_vj_usage([sample1], [sample2])
+        @test hasproperty(diff_vj, :v_gene)
+        @test hasproperty(diff_vj, :pvalue)
+    end
+
+    @testset "BCR SHM Rate & Isotype Summary" begin
+        bcr_contigs = [
+            BioToolkit.RepertoireContig("c1", "cell1", :IGH, "IGHV1-2*01", "IGHD2-2*01", "IGHJ4*01", "IGHM", "", "", "", "", "", "CAR", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}("shm_rate" => 0.03)),
+            BioToolkit.RepertoireContig("c2", "cell2", :IGH, "IGHV1-2*01", "IGHD2-2*01", "IGHJ4*01", "IGHG1", "", "", "", "", "", "CAR", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}("shm_rate" => 0.05)),
+        ]
+        shm_res = BioToolkit.bcr_shm_rate(bcr_contigs)
+        @test shm_res.mean_shm > 0.0
+        @test nrow(shm_res.shm_df) == 2
+
+        iso_res = BioToolkit.isotype_usage_summary(bcr_contigs)
+        @test nrow(iso_res) == 2
+        @test hasproperty(iso_res, :isotype)
+        @test hasproperty(iso_res, :frequency)
+    end
+
+    @testset "BKTree Metric Search" begin
+        seqs = ["CAVSGYNQGGTSGCSYTLTF", "CAVSGANQGGTSGCSYTLTF", "CAVSGYNQGGTSG", "CVVGGGGGGGGGGGGGGGGG"]
+        tree = BioToolkit.BKTree(seqs)
+        res = BioToolkit.bktree_range_query(tree, "CAVSGYNQGGTSGCSYTLTF", 2)
+        @test 1 in res
+        @test 2 in res
+        @test !(4 in res)
+    end
+
+    @testset "Multi-Chain Pairing Analysis" begin
+        contigs = [
+            BioToolkit.RepertoireContig("c1", "cell1", :TRA, "TRAV1", "", "TRAJ1", "", "", "", "", "", "", "C1", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c2", "cell1", :TRB, "TRBV1", "", "TRBJ1", "", "", "", "", "", "", "C2", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c3", "cell2", :TRA, "TRAV2", "", "TRAJ2", "", "", "", "", "", "", "C3", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c4", "cell2", :TRA, "TRAV3", "", "TRAJ3", "", "", "", "", "", "", "C4", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c5", "cell2", :TRB, "TRBV2", "", "TRBJ2", "", "", "", "", "", "", "C5", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+        ]
+        data = BioToolkit.ContigData(contigs, "sample1")
+        pairing = BioToolkit.multi_chain_pairing_analysis(data)
+        @test nrow(pairing) == 5
+        @test pairing.cell_count[1] == 1 # Canonical
+        @test pairing.cell_count[2] == 1 # Dual Alpha
+    end
+
+    @testset "Bootstrap Diversity CIs & Permutation Overlap Test" begin
+        contigs1 = [
+            BioToolkit.RepertoireContig("c1", "cell1", :TRB, "V1", "", "J1", "", "", "", "", "", "", "C1", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c2", "cell2", :TRB, "V2", "", "J2", "", "", "", "", "", "", "C2", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+        ]
+        contigs2 = [
+            BioToolkit.RepertoireContig("c3", "cell3", :TRB, "V1", "", "J1", "", "", "", "", "", "", "C1", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c4", "cell4", :TRB, "V3", "", "J3", "", "", "", "", "", "", "C3", "ATG", 3, 2, 4, 0.8, true, true, Dict{String,Any}()),
+        ]
+        sample1 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs1, "sample1"))
+        sample2 = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs2, "sample2"))
+
+        ci_df = BioToolkit.bootstrap_diversity_ci(sample1; n_bootstraps=50)
+        @test nrow(ci_df) == 4
+        @test hasproperty(ci_df, :ci_lower)
+        @test hasproperty(ci_df, :ci_upper)
+
+        perm_test = BioToolkit.repertoire_overlap_permutation_test(sample1, sample2; n_permutations=100)
+        @test haskey(perm_test, :observed_overlap)
+        @test haskey(perm_test, :pvalue)
+        @test 0.0 <= perm_test.pvalue <= 1.0
+    end
+
+    @testset "GLIPH2 Motif Enrichment & Positional Logos" begin
+        cdr3s = ["CAVSGYNQGGTSGCSYTLTF", "CAVSGANQGGTSGCSYTLTF", "CAVSGYNQGGTSGCSYTLTT", "CAVSGYNQGGTSGCSYTLTA"]
+        motifs = BioToolkit.gliph2_motif_enrichment(cdr3s; k_range=3:3, p_cutoff=1.0)
+        @test nrow(motifs) > 0
+        @test hasproperty(motifs, :motif)
+        @test hasproperty(motifs, :pvalue)
+
+        logo = BioToolkit.positional_motif_logo(cdr3s)
+        @test nrow(logo) == 20
+        @test hasproperty(logo, :information_bits)
+    end
+
+    @testset "CDR3 Biophysical & Atchley Factors" begin
+        cdr3s = ["CAVSGYNQGGTSGCSYTLTF", "CVVGGGGGGGGGGGGGGGGG"]
+        props = BioToolkit.repertoire_cdr3_physicochemical_properties(cdr3s)
+        @test nrow(props) == 2
+        @test hasproperty(props, :gravy_hydrophobicity)
+        @test hasproperty(props, :net_charge)
+        @test hasproperty(props, :atchley_polarity)
+        @test hasproperty(props, :atchley_charge)
+    end
+
+    @testset "Spectratyping & Lineage Trees" begin
+        contigs = [
+            BioToolkit.RepertoireContig("c1", "cell1", :TRB, "V1", "", "J1", "", "", "", "", "", "", "CAVSGYNQGGTSGCSYTLTF", "ATG", 3, 10, 20, 0.9, true, true, Dict{String,Any}()),
+            BioToolkit.RepertoireContig("c2", "cell2", :TRB, "V1", "", "J1", "", "", "", "", "", "", "CAVSGANQGGTSGCSYTLTF", "ATG", 3, 5, 10, 0.9, true, true, Dict{String,Any}()),
+        ]
+        sample = BioToolkit.RepertoireSample(BioToolkit.ContigData(contigs, "sample1"))
+
+        spec = BioToolkit.spectratype_analysis(sample)
+        @test haskey(spec, :spectratype)
+        @test haskey(spec, :spectratype_entropy)
+        @test spec.spectratype_entropy >= 0.0
+
+        tree = BioToolkit.clonotype_lineage_tree(sample, sample.clonotypes.clonotype_id[1])
+        @test haskey(tree, :tree_nodes)
+        @test haskey(tree, :tree_edges)
+    end
+
+    @testset "BCR Mutation Hotspot Profile" begin
+        seqs = ["AGCTACAAAGCTACAA", "CCCCCCCCCCCCCCCC"]
+        hotspots = BioToolkit.bcr_mutation_hotspot_profile(seqs)
+        @test nrow(hotspots) == 2
+        @test hasproperty(hotspots, :hotspot_count)
+        @test hotspots.hotspot_count[1] > hotspots.hotspot_count[2]
+    end
 end
+

@@ -1,7 +1,10 @@
 module BioToolkitPlotsExt
 
-using BioToolkit
+import BioToolkit
 using Plots
+
+
+
 
 import Plots: plot
 
@@ -13,6 +16,8 @@ import BioToolkit.Clinical: KaplanMeierResult, CoxResult, ROCResult, CIFResult, 
 import BioToolkit.GWAS: GWASResult, MetaAnalysisResult
 
 const BioPlotting = BioToolkit.BioPlotting
+
+
 
 function _save_plot(path::Union{Nothing,AbstractString}, figure)
     path === nothing && return nothing

@@ -25,7 +25,9 @@ using Arrow
 using Downloads
 using JSON
 
-using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!
+using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!, BlenderIntegrator
+using ..BlenderIntegrator: BlenderGWASPayload, BlenderMaterial, to_blender_payload
+
 
 @inline function _register_gwas_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -291,6 +293,27 @@ struct GWASResult <: AbstractAnalysisResult
     method::String
     provenance::ResultProvenance
 end
+
+function BlenderIntegrator.to_blender_payload(gwas::GWASResult; name::String="GWAS_Terrain")
+    chroms = sort(unique(String.(gwas.chromosomes)))
+    n_chroms = max(length(chroms), 1)
+    n_snps_per_chrom = 10
+    h_mat = zeros(Float64, n_chroms, n_snps_per_chrom)
+    
+    for (i, chr) in enumerate(chroms)
+        idx = findall(==(chr), String.(gwas.chromosomes))
+        pvals = gwas.pvalue[idx]
+        logp = -log10.(clamp.(pvals, 1e-30, 1.0))
+        take_n = min(length(logp), n_snps_per_chrom)
+        top_logp = sort(logp, rev=true)[1:take_n]
+        h_mat[i, 1:take_n] .= top_logp
+    end
+    
+    traits = ["SNP_$j" for j in 1:n_snps_per_chrom]
+    mat = BlenderMaterial(name=name * "_mat", color=(0.1, 0.7, 0.9, 1.0), roughness=0.2)
+    return BlenderGWASPayload(name, h_mat, chroms, traits, mat)
+end
+
 
 GWASResult(snp_ids, chromosomes, positions, alleles, gene_ids, beta, standard_error, zscore, pvalue, sample_size, covariate_names, phenotype_name, method) =
     GWASResult(snp_ids, chromosomes, positions, alleles, gene_ids, beta, standard_error, zscore, pvalue, sample_size, covariate_names, phenotype_name, method, provenance_record("GWASResult", "gwas"))
@@ -565,19 +588,35 @@ function _decode_plink_code(byte::UInt8)
     return 2.0
 end
 
+const PLINK_DECODE_LUT = let
+    lut = Matrix{Float64}(undef, 4, 256)
+    for b in 0:255
+        for s in 0:3
+            code = (b >> (2*s)) & 0x03
+            lut[s+1, b+1] = code == 0x00 ? 0.0 : code == 0x01 ? NaN : code == 0x02 ? 1.0 : 2.0
+        end
+    end
+    lut
+end
+
 function _decode_bed(raw::Vector{UInt8}, nsamples::Int, nsnps::Int)
     length(raw) >= 3 || throw(ArgumentError("invalid .bed file"))
     raw[1:3] == UInt8[0x6c, 0x1b, 0x01] || throw(ArgumentError("invalid PLINK .bed header"))
-    bytes = raw[4:end]
+    bytes = @view raw[4:end]
     bytes_per_snp = cld(nsamples, 4)
     length(bytes) >= nsnps * bytes_per_snp || throw(ArgumentError("bed file too short for declared dimensions"))
-    decoded = fill(NaN, nsamples, nsnps)
-    for snp in 1:nsnps
-        base = (snp - 1) * bytes_per_snp
-        for sample in 1:nsamples
-            byte_index = base + cld(sample, 4)
-            shift = 2 * ((sample - 1) % 4)
-            decoded[sample, snp] = _decode_plink_code((bytes[byte_index] >> shift) & 0x03)
+    decoded = Matrix{Float64}(undef, nsamples, nsnps)
+    
+    Threads.@threads for snp in 1:nsnps
+        base_byte = (snp - 1) * bytes_per_snp
+        for b_idx in 1:bytes_per_snp
+            byte_val = bytes[base_byte + b_idx]
+            s_start = (b_idx - 1) * 4 + 1
+            s_end = min(s_start + 3, nsamples)
+            count = s_end - s_start + 1
+            for k in 1:count
+                @inbounds decoded[s_start + k - 1, snp] = PLINK_DECODE_LUT[k, UInt32(byte_val) + 1]
+            end
         end
     end
     return decoded
@@ -2149,13 +2188,16 @@ function gwas_linear_scan(
 
     design, covariate_names = _covariate_matrix(covariates, nobs)
     X = Matrix{Float64}(design)
+    K = size(X, 2)
     design_qr = qr(X)
+    Q = design_qr.Q * Matrix{Float64}(I, nobs, K)
 
     y_res = Vector{Float64}(phenotype)
-    coeff_y = design_qr \ y_res
-    mul!(y_res, X, coeff_y, -1.0, 1.0)
+    y_tmp = Vector{Float64}(undef, K)
+    mul!(y_tmp, Q', y_res)
+    mul!(y_res, Q, y_tmp, -1.0, 1.0)
 
-    dof = dof_override === nothing ? max(nobs - size(design, 2) - 1, 1) : max(Int(dof_override), 1)
+    dof = dof_override === nothing ? max(nobs - K - 1, 1) : max(Int(dof_override), 1)
     beta = zeros(Float64, nsnps)
     se = fill(Inf, nsnps)
     z = zeros(Float64, nsnps)
@@ -2165,10 +2207,15 @@ function gwas_linear_scan(
 
     y_norm2 = dot(y_res, y_res)
     t_dist = TDist(dof)
-    thread_buffers = [Vector{Float64}(undef, nobs) for _ in 1:Threads.nthreads()]
+    n_threads = Threads.nthreads()
+    thread_buffers = [Vector{Float64}(undef, nobs) for _ in 1:n_threads]
+    thread_q_tmp = [Vector{Float64}(undef, K) for _ in 1:n_threads]
 
     @inline function _scan_one_snp!(snp::Int)
-        g = thread_buffers[Threads.threadid()]
+        tid = Threads.threadid()
+        g = thread_buffers[tid]
+        q_tmp = thread_q_tmp[tid]
+
         @inbounds for i in 1:nobs
             g[i] = Float64(G[i, snp])
         end
@@ -2189,14 +2236,15 @@ function gwas_linear_scan(
             isfinite(g[i]) || (g[i] = mean_value)
         end
 
-        coeff_g = design_qr \ g
-        mul!(g, X, coeff_g, -1.0, 1.0)
+        mul!(q_tmp, Q', g)
+        mul!(g, Q, q_tmp, -1.0, 1.0)
+
         denom = dot(g, g)
         (!isfinite(denom) || denom <= eps(Float64)) && return nothing
 
         dotxy = dot(g, y_res)
         b = dotxy / denom
-        rss = y_norm2 - 2 * b * dotxy + b * b * denom
+        rss = max(y_norm2 - b * dotxy, eps(Float64))
         sigma2 = max(rss / dof, eps(Float64))
         stderr = sqrt(sigma2 / denom)
         beta[snp] = b

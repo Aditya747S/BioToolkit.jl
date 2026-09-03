@@ -5,6 +5,8 @@ using Makie
 
 import BioToolkit: render!, _render_axis!, GenomeBrowser, GenomeViewport, GeneTrack, CoverageTrack, AlignmentTrack, SingleCellViewer, interactive_singlecell_viewer, cell_hover_text, recluster_singlecell_viewer!
 
+
+
 function _browser_figure(browser::GenomeBrowser)
     rows = max(length(browser.tracks), 1)
     height = max(1, sum(track -> track.height, browser.tracks) + browser.gap * max(rows - 1, 0))

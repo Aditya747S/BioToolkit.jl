@@ -270,7 +270,7 @@ end
     end
     @test archive isa BioToolkit.SingleCellArchive
 
-    if CUDA.functional()
+    if isdefined(Main, :CUDA) && CUDA.functional() && BioToolkit.resolve_backend(backend=:gpu) == :gpu
         gpu_experiment = BioToolkit.gpu_singlecell_experiment(experiment)
         @test gpu_experiment.counts isa CUDA.CuArray
         gpu_normalized = BioToolkit.normalize_counts(gpu_experiment; use_cuda=true)

@@ -1,5 +1,7 @@
 using DataFrames
-using Turing
+if Base.find_package("Turing") !== nothing
+    using Turing
+end
 
 @testset "Microbiome" begin
     counts = [10 0 3;
@@ -85,12 +87,14 @@ using Turing
     network_plot = BioToolkit.network_plot(network; layout=:spring, edge_scale=3.0, show_labels=false)
     @test network_plot !== nothing
 
-    source_profiles = [0.7 0.1; 0.2 0.7; 0.1 0.2]
-    source_model = BioToolkit.source_tracking_model([10, 6, 4], source_profiles)
-    @test source_model !== nothing
-    source_result = BioToolkit.source_tracking([10, 6, 4], source_profiles; draws=2)
-    @test source_result isa BioToolkit.SourceTrackingResult
-    @test length(source_result.mean_proportions) == 2
-    @test length(source_result.median_proportions) == 2
-    @test all((0 .<= source_result.mean_proportions) .& (source_result.mean_proportions .<= 1))
+    if Base.get_extension(BioToolkit, :BioToolkitTuringExt) !== nothing || isdefined(Main, :Turing)
+        source_profiles = [0.7 0.1; 0.2 0.7; 0.1 0.2]
+        source_model = BioToolkit.source_tracking_model([10, 6, 4], source_profiles)
+        @test source_model !== nothing
+        source_result = BioToolkit.source_tracking([10, 6, 4], source_profiles; draws=2)
+        @test source_result isa BioToolkit.SourceTrackingResult
+        @test length(source_result.mean_proportions) == 2
+        @test length(source_result.median_proportions) == 2
+        @test all((0 .<= source_result.mean_proportions) .& (source_result.mean_proportions .<= 1))
+    end
 end

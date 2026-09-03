@@ -141,7 +141,7 @@ function _pairhmm_transition_logs(scoring::PairHMMScoring)
   )
 end
 
-function _pairhmm_forward(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
+@inline function _pairhmm_forward_matrix(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
   _validate_pairhmm_scoring(scoring)
   n = length(left)
   m = length(right)
@@ -170,7 +170,7 @@ function _pairhmm_forward(left::AbstractVector{UInt8}, right::AbstractVector{UIn
   return M, Ix, Iy
 end
 
-function _pairhmm_backward(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
+@inline function _pairhmm_backward_matrix(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
   _validate_pairhmm_scoring(scoring)
   n = length(left)
   m = length(right)
@@ -182,36 +182,44 @@ function _pairhmm_backward(left::AbstractVector{UInt8}, right::AbstractVector{UI
   BM[n+1, m+1] = 0.0
   BIx[n+1, m+1] = 0.0
   BIy[n+1, m+1] = 0.0
-  @inbounds for i in n:-1:0
-    for j in m:-1:0
+  @inbounds for j in m:-1:0
+    for i in n:-1:0
       ii = i + 1
       jj = j + 1
       if i == n && j == m
         continue
       end
-      vals_m = Float64[]
-      vals_ix = Float64[]
-      vals_iy = Float64[]
+      m_m = neg
+      m_ix = neg
+      m_iy = neg
       if i < n && j < m
         emit = _pairhmm_emit_log(left[i+1], right[j+1], scoring)
-        push!(vals_m, T.mm + emit + BM[ii+1, jj+1])
-        push!(vals_ix, T.ixm + emit + BM[ii+1, jj+1])
-        push!(vals_iy, T.iym + emit + BM[ii+1, jj+1])
+        m_m = _logaddexp(m_m, T.mm + emit + BM[ii+1, jj+1])
+        m_ix = _logaddexp(m_ix, T.ixm + emit + BM[ii+1, jj+1])
+        m_iy = _logaddexp(m_iy, T.iym + emit + BM[ii+1, jj+1])
       end
       if i < n
-        push!(vals_m, T.mix + BIx[ii+1, jj])
-        push!(vals_ix, T.ixx + BIx[ii+1, jj])
+        m_m = _logaddexp(m_m, T.mix + BIx[ii+1, jj])
+        m_ix = _logaddexp(m_ix, T.ixx + BIx[ii+1, jj])
       end
       if j < m
-        push!(vals_m, T.miy + BIy[ii, jj+1])
-        push!(vals_iy, T.iyy + BIy[ii, jj+1])
+        m_m = _logaddexp(m_m, T.miy + BIy[ii, jj+1])
+        m_iy = _logaddexp(m_iy, T.iyy + BIy[ii, jj+1])
       end
-      !isempty(vals_m) && (BM[ii, jj] = reduce(_logaddexp, vals_m))
-      !isempty(vals_ix) && (BIx[ii, jj] = reduce(_logaddexp, vals_ix))
-      !isempty(vals_iy) && (BIy[ii, jj] = reduce(_logaddexp, vals_iy))
+      BM[ii, jj] = m_m
+      BIx[ii, jj] = m_ix
+      BIy[ii, jj] = m_iy
     end
   end
   return BM, BIx, BIy
+end
+
+function _pairhmm_forward(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
+  return _pairhmm_forward_matrix(left, right, scoring)
+end
+
+function _pairhmm_backward(left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, scoring::PairHMMScoring)
+  return _pairhmm_backward_matrix(left, right, scoring)
 end
 
 function _posterior_consensus_alignment(::Type{A}, left::AbstractVector{UInt8}, right::AbstractVector{UInt8}, posterior::Array{Float32,3}) where {A<:BioAlphabet}
@@ -282,9 +290,11 @@ function _pairhmm_posterior(::Type{A}, left::AbstractVector{UInt8}, right::Abstr
   m = length(right)
   logz = _logsumexp3(F[1][n+1, m+1], F[2][n+1, m+1], F[3][n+1, m+1])
   posterior = zeros(Float32, n + 1, m + 1, 3)
-  @inbounds for k in 1:3, i in 1:(n+1), j in 1:(m+1)
-    value = F[k][i, j] + B[k][i, j] - logz
-    posterior[i, j, k] = isfinite(value) ? Float32(clamp(exp(value), 0.0, 1.0)) : 0.0f0
+  @inbounds for j in 1:(m+1), i in 1:(n+1)
+    for k in 1:3
+      value = F[k][i, j] + B[k][i, j] - logz
+      posterior[i, j, k] = isfinite(value) ? Float32(clamp(exp(value), 0.0, 1.0)) : 0.0f0
+    end
   end
   expected_accuracy = mean(Float64.(posterior[:, :, 1]))
   consensus = _posterior_consensus_alignment(A, left, right, posterior)
@@ -540,23 +550,29 @@ function align_profiles(profile_a::AlignmentProfileHMM, profile_b::AlignmentProf
   conf = Float64[]
   i = n + 1;
   j = m + 1
+  # Pre-allocate for efficiency, then reverse at end
+  path_rev = Tuple{Int,Int}[]
+  conf_rev = Float64[]
   while i > 1 || j > 1
     t = trace[i, j]
     if t == 0x01
-      pushfirst!(path, (i - 1, j - 1))
-      pushfirst!(conf, clamp(_profile_column_score(view(profile_a.match_emissions, i - 1, :), view(profile_b.match_emissions, j - 1, :)), 0.0, 1.0))
+      push!(path_rev, (i - 1, j - 1))
+      push!(conf_rev, clamp(_profile_column_score(view(profile_a.match_emissions, i - 1, :), view(profile_b.match_emissions, j - 1, :)), 0.0, 1.0))
       i -= 1;
       j -= 1
     elseif t == 0x02
-      pushfirst!(path, (i - 1, 0));
-      pushfirst!(conf, 0.0);
+      push!(path_rev, (i - 1, 0));
+      push!(conf_rev, 0.0);
       i -= 1
     else
-      pushfirst!(path, (0, j - 1));
-      pushfirst!(conf, 0.0);
+      push!(path_rev, (0, j - 1));
+      push!(conf_rev, 0.0);
       j -= 1
     end
   end
+  # Reverse to get correct order
+  path = reverse!(path_rev)
+  conf = reverse!(conf_rev)
   metadata = Dict{Symbol,Any}(:method => :profile_profile_dp, :gap => Float64(gap))
   ensure_provenance_id!(metadata)
   result = ProfileAlignmentResult(path, dp[n+1, m+1], conf, metadata)
@@ -784,22 +800,10 @@ const _STANDARD_SUBSTITUTION_MATRIX_CACHE = let cache = Dict{String,Substitution
     try
       cache[normalized_name] = _parse_standard_substitution_matrix(matrix_spec; threaded=false)
     catch err
-      err isa ArgumentError || rethrow()
+      @warn "Failed to parse built-in substitution matrix $matrix_name" exception=err
     end
   end
   cache
-end
-
-const _CODON_DECODE_TABLE = let table = Vector{String}(undef, 64)
-  for first in 0:3
-    for second in 0:3
-      for third in 0:3
-        code = (first << 4) | (second << 2) | third
-        table[code+1] = String(UInt8[_kmer_base_from_code(first), _kmer_base_from_code(second), _kmer_base_from_code(third)])
-      end
-    end
-  end
-  table
 end
 
 """
@@ -838,16 +842,12 @@ function _encode_codon_sequence(bytes::AbstractVector{UInt8})
     tokens[token_index] = _pack_codon_token(bytes[byte_index], bytes[byte_index+1], bytes[byte_index+2])
   end
 
+  # Validate no invalid codon tokens were produced
+  for (i, token) in enumerate(tokens)
+    token == 255 && throw(ArgumentError("invalid codon at position $i: contains non-DNA characters"))
+  end
+
   return tokens
-end
-
-"""
-    _decode_codon_token(token)
-
-Convert a packed codon token back into a three-character codon string.
-"""
-function _decode_codon_token(token::UInt8)
-  return token > 63 ? "NNN" : _CODON_DECODE_TABLE[Int(token)+1]
 end
 
 """
@@ -907,6 +907,37 @@ end
 const _STANDARD_CODON_SUBSTITUTION_MATRIX_CACHE = Dict{String,CodonSubstitutionMatrix}(
   "SCHNEIDER" => _parse_codon_substitution_matrix(_STANDARD_SUBSTITUTION_MATRIX_TEXT["SCHNEIDER"]; threaded=false),
 )
+
+# Precomputed codon byte triplets for fast traceback without string allocation
+# Index by codon token (0-63), each entry is a 3-tuple of UInt8
+const _CODON_BYTES_TABLE = let table = Vector{NTuple{3,UInt8}}(undef, 64)
+  for first in 0:3
+    for second in 0:3
+      for third in 0:3
+        code = (first << 4) | (second << 2) | third
+        b1 = _2BIT_TO_BYTE[first + 1]
+        b2 = _2BIT_TO_BYTE[second + 1]
+        b3 = _2BIT_TO_BYTE[third + 1]
+        table[code + 1] = (b1, b2, b3)
+      end
+    end
+  end
+  table
+end
+
+# Gap codon bytes
+const _GAP_CODON_BYTES = (UInt8('-'), UInt8('-'), UInt8('-'))
+
+@inline function _write_codon_bytes!(buffer::Vector{UInt8}, write_index::Int, bytes::NTuple{3,UInt8})
+  buffer[write_index-2] = bytes[1]
+  buffer[write_index-1] = bytes[2]
+  buffer[write_index] = bytes[3]
+  return write_index - 3
+end
+
+@inline function _get_codon_bytes(token::UInt8)
+  return token > 63 ? _GAP_CODON_BYTES : _CODON_BYTES_TABLE[Int(token)+1]
+end
 
 const _PAIRWISE_STATE_MATCH = UInt8(0x01)
 const _PAIRWISE_STATE_GAP_LEFT = UInt8(0x02)
@@ -1146,8 +1177,9 @@ Score a nucleotide pair using a substitution matrix lookup.
 @inline function _pairwise_score(scoring::MatrixPairwiseScoring, left_byte::UInt8, right_byte::UInt8)
   left_index = scoring.matrix.lookup_table[Int(left_byte)+1]
   right_index = scoring.matrix.lookup_table[Int(right_byte)+1]
-  left_index == 0 && throw(ArgumentError("unknown symbol in substitution-matrix alignment: '$(Char(left_byte))' (code $(Int(left_byte)))"))
-  right_index == 0 && throw(ArgumentError("unknown symbol in substitution-matrix alignment: '$(Char(right_byte))' (code $(Int(right_byte)))"))
+  if left_index == 0 || right_index == 0
+    return scoring.matrix.default
+  end
   return scoring.matrix.scores[left_index, right_index]
 end
 
@@ -1159,8 +1191,9 @@ Score a codon pair using a codon substitution matrix lookup.
 @inline function _pairwise_score(scoring::CodonMatrixPairwiseScoring, left_token::UInt8, right_token::UInt8)
   left_index = left_token > 63 ? 0 : scoring.matrix.lookup_table[Int(left_token)+1]
   right_index = right_token > 63 ? 0 : scoring.matrix.lookup_table[Int(right_token)+1]
-  left_index == 0 && throw(ArgumentError("unknown codon token in substitution-matrix alignment: $(Int(left_token))"))
-  right_index == 0 && throw(ArgumentError("unknown codon token in substitution-matrix alignment: $(Int(right_token))"))
+  if left_index == 0 || right_index == 0
+    return scoring.matrix.default
+  end
   return scoring.matrix.scores[left_index, right_index]
 end
 
@@ -1222,15 +1255,11 @@ end
   parents::AbstractVector{<:AbstractString},
   parameters)
   _ctx = active_provenance_context()
-  _ctx !== nothing && register_provenance!(_ctx, "pairwise_align";
-    parents=parents,
-    parameters=(score=result.score, identity=round(result.identity; digits=4),
-      n_left=length(result.left), n_right=length(result.right)))
   return provenance_result!(_ctx, result, "pairwise_align";
     parents=parents, parameters=parameters)
 end
 
-function _pairwise_align_dispatch(
+@inline function _pairwise_align_dispatch(
   ::Type{A},
   left_bytes::AbstractVector{UInt8},
   right_bytes::AbstractVector{UInt8};
@@ -1265,24 +1294,12 @@ function pairwise_align(left::FastqRecord, right::FastqRecord; kwargs...)
 end
 
 """
-    _write_codon_token!(buffer, write_index, codon)
-
-Write a three-character codon into a preallocated byte buffer from the back.
-"""
-@inline function _write_codon_token!(buffer::Vector{UInt8}, write_index::Int, codon::String)
-  codon_bytes = codeunits(codon)
-  buffer[write_index-2] = codon_bytes[1]
-  buffer[write_index-1] = codon_bytes[2]
-  buffer[write_index] = codon_bytes[3]
-  return write_index - 3
-end
-
-"""
     _pairwise_traceback_codon(...)
 
 Reconstruct a codon alignment from a standard traceback matrix.
 """
 function _pairwise_traceback_codon(
+  ::Type{A},
   left_tokens::AbstractVector{UInt8},
   right_tokens::AbstractVector{UInt8},
   scores::Union{Nothing,Matrix{Int}},
@@ -1290,7 +1307,7 @@ function _pairwise_traceback_codon(
   i::Int,
   j::Int,
   best_score::Int,
-)
+) where {A<:BioAlphabet}
   aligned_left = Vector{UInt8}(undef, 3 * (length(left_tokens) + length(right_tokens)))
   aligned_right = Vector{UInt8}(undef, 3 * (length(left_tokens) + length(right_tokens)))
   left_write_index = length(aligned_left)
@@ -1312,18 +1329,18 @@ function _pairwise_traceback_codon(
     if direction == 0x01
       left_token = left_tokens[current_i-1]
       right_token = right_tokens[current_j-1]
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, _decode_codon_token(left_token))
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, _decode_codon_token(right_token))
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _get_codon_bytes(left_token))
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _get_codon_bytes(right_token))
       matches += left_token == right_token ? 1 : 0
       current_i -= 1
       current_j -= 1
     elseif direction == 0x02
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, _decode_codon_token(left_tokens[current_i-1]))
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, "---")
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _get_codon_bytes(left_tokens[current_i-1]))
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _GAP_CODON_BYTES)
       current_i -= 1
     else
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, "---")
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, _decode_codon_token(right_tokens[current_j-1]))
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _GAP_CODON_BYTES)
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _get_codon_bytes(right_tokens[current_j-1]))
       current_j -= 1
     end
 
@@ -1332,8 +1349,8 @@ function _pairwise_traceback_codon(
 
   left_start_index = left_write_index + 1
   right_start_index = right_write_index + 1
-  final_left = BioSequence{DNAAlphabet}(aligned_left[left_start_index:end]; validate=false)
-  final_right = BioSequence{DNAAlphabet}(aligned_right[right_start_index:end]; validate=false)
+  final_left = BioSequence{A}(aligned_left[left_start_index:end]; validate=false)
+  final_right = BioSequence{A}(aligned_right[right_start_index:end]; validate=false)
   identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
   return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
@@ -1345,6 +1362,7 @@ end
 Reconstruct a codon alignment from affine-gap traceback matrices.
 """
 function _pairwise_traceback_codon_affine(
+  ::Type{A},
   left_tokens::AbstractVector{UInt8},
   right_tokens::AbstractVector{UInt8},
   match_trace::Matrix{UInt8},
@@ -1354,7 +1372,7 @@ function _pairwise_traceback_codon_affine(
   j::Int,
   start_state::UInt8,
   best_score::Int,
-)
+) where {A<:BioAlphabet}
   aligned_left = Vector{UInt8}(undef, 3 * (length(left_tokens) + length(right_tokens)))
   aligned_right = Vector{UInt8}(undef, 3 * (length(left_tokens) + length(right_tokens)))
   left_write_index = length(aligned_left)
@@ -1370,20 +1388,20 @@ function _pairwise_traceback_codon_affine(
     if current_state == _PAIRWISE_STATE_MATCH
       left_token = left_tokens[current_i-1]
       right_token = right_tokens[current_j-1]
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, _decode_codon_token(left_token))
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, _decode_codon_token(right_token))
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _get_codon_bytes(left_token))
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _get_codon_bytes(right_token))
       matches += left_token == right_token ? 1 : 0
       current_state = match_trace[current_i, current_j]
       current_i -= 1
       current_j -= 1
     elseif current_state == _PAIRWISE_STATE_GAP_LEFT
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, _decode_codon_token(left_tokens[current_i-1]))
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, "---")
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _get_codon_bytes(left_tokens[current_i-1]))
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _GAP_CODON_BYTES)
       current_state = gap_left_trace[current_i, current_j]
       current_i -= 1
     else
-      left_write_index = _write_codon_token!(aligned_left, left_write_index, "---")
-      right_write_index = _write_codon_token!(aligned_right, right_write_index, _decode_codon_token(right_tokens[current_j-1]))
+      left_write_index = _write_codon_bytes!(aligned_left, left_write_index, _GAP_CODON_BYTES)
+      right_write_index = _write_codon_bytes!(aligned_right, right_write_index, _get_codon_bytes(right_tokens[current_j-1]))
       current_state = gap_right_trace[current_i, current_j]
       current_j -= 1
     end
@@ -1393,8 +1411,8 @@ function _pairwise_traceback_codon_affine(
 
   left_start_index = left_write_index + 1
   right_start_index = right_write_index + 1
-  final_left = BioSequence{DNAAlphabet}(aligned_left[left_start_index:end]; validate=false)
-  final_right = BioSequence{DNAAlphabet}(aligned_right[right_start_index:end]; validate=false)
+  final_left = BioSequence{A}(aligned_left[left_start_index:end]; validate=false)
+  final_right = BioSequence{A}(aligned_right[right_start_index:end]; validate=false)
   identity = aligned_length == 0 ? 0.0 : matches / aligned_length
 
   return PairwiseAlignmentResult(final_left, final_right, best_score, matches, identity)
@@ -1405,7 +1423,7 @@ end
 
 Run global codon alignment with a linear gap model.
 """
-function _pairwise_align_codon_global(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
+@inline function _pairwise_align_codon_global(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
   left_length = length(left_tokens)
   right_length = length(right_tokens)
 
@@ -1453,7 +1471,7 @@ function _pairwise_align_codon_global(left_tokens::AbstractVector{UInt8}, right_
     end
   end
 
-  return _pairwise_traceback_codon(left_tokens, right_tokens, nothing, trace, left_length + 1, right_length + 1, previous_scores[left_length+1])
+  return _pairwise_traceback_codon(DNAAlphabet, left_tokens, right_tokens, nothing, trace, left_length + 1, right_length + 1, previous_scores[left_length+1])
 end
 
 """
@@ -1461,7 +1479,7 @@ end
 
 Run local codon alignment with a linear gap model.
 """
-function _pairwise_align_codon_local(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
+@inline function _pairwise_align_codon_local(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int)
   left_length = length(left_tokens)
   right_length = length(right_tokens)
 
@@ -1523,7 +1541,7 @@ function _pairwise_align_codon_local(left_tokens::AbstractVector{UInt8}, right_t
     end
   end
 
-  return _pairwise_traceback_codon(left_tokens, right_tokens, scores, trace, best_i, best_j, best_score)
+  return _pairwise_traceback_codon(DNAAlphabet, left_tokens, right_tokens, scores, trace, best_i, best_j, best_score)
 end
 
 """
@@ -1531,7 +1549,7 @@ end
 
 Run global codon alignment with an affine gap model.
 """
-function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap_open::Int, gap_extend::Int)
+@inline function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap_open::Int, gap_extend::Int)
   left_length = length(left_tokens)
   right_length = length(right_tokens)
   negative_infinity = typemin(Int) ÷ 4
@@ -1634,6 +1652,7 @@ function _pairwise_align_codon_affine_global(left_tokens::AbstractVector{UInt8},
   end
 
   return _pairwise_traceback_codon_affine(
+    DNAAlphabet,
     left_tokens,
     right_tokens,
     match_trace,
@@ -1651,7 +1670,7 @@ end
 
 Run local codon alignment with an affine gap model.
 """
-function _pairwise_align_codon_affine_local(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap_open::Int, gap_extend::Int)
+@inline function _pairwise_align_codon_affine_local(left_tokens::AbstractVector{UInt8}, right_tokens::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap_open::Int, gap_extend::Int)
   left_length = length(left_tokens)
   right_length = length(right_tokens)
 
@@ -1770,6 +1789,7 @@ function _pairwise_align_codon_affine_local(left_tokens::AbstractVector{UInt8}, 
   end
 
   return _pairwise_traceback_codon_affine(
+    DNAAlphabet,
     left_tokens,
     right_tokens,
     match_trace,
@@ -1816,12 +1836,11 @@ function pairwise_align_codons(
   end
 
   _ctx = active_provenance_context()
-  _ctx !== nothing && register_provenance!(_ctx, "pairwise_align_codons";
+  return provenance_result!(_ctx, result, "pairwise_align_codons";
     parents=provenance_parent_ids(left, right),
     parameters=(match=match, mismatch=mismatch, gap=gap,
       affine=gap_open !== nothing || gap_extend !== nothing,
       is_local=is_local))
-  return result
 end
 
 # Removed pairwise_align_codons(::AbstractString, ::AbstractString) - use DNASeq instead
@@ -1876,7 +1895,7 @@ local_align(left, right; kwargs...) = smith_waterman(left, right; kwargs...)
 
 Run global pairwise alignment with a linear gap model.
 """
-function _pairwise_align_global(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A<:BioAlphabet}
+@inline function _pairwise_align_global(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A<:BioAlphabet}
   left_length = length(left_bytes)
   right_length = length(right_bytes)
 
@@ -1935,7 +1954,7 @@ end
 
 Run local pairwise alignment with a linear gap model.
 """
-function _pairwise_align_local(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A<:BioAlphabet}
+@inline function _pairwise_align_local(::Type{A}, left_bytes::AbstractVector{UInt8}, right_bytes::AbstractVector{UInt8}, scoring::AbstractPairwiseScoring, gap::Int) where {A<:BioAlphabet}
   left_length = length(left_bytes)
   right_length = length(right_bytes)
 
@@ -2005,7 +2024,7 @@ end
 
 Run global pairwise alignment with an affine gap model.
 """
-function _pairwise_align_affine_global(
+@inline function _pairwise_align_affine_global(
   ::Type{A},
   left_bytes::AbstractVector{UInt8},
   right_bytes::AbstractVector{UInt8},
@@ -2132,7 +2151,7 @@ end
 
 Run local pairwise alignment with an affine gap model.
 """
-function _pairwise_align_affine_local(
+@inline function _pairwise_align_affine_local(
   ::Type{A},
   left_bytes::AbstractVector{UInt8},
   right_bytes::AbstractVector{UInt8},
@@ -2285,7 +2304,7 @@ end
 
 Reconstruct a nucleotide alignment from standard traceback data.
 """
-function _pairwise_traceback(
+@inline function _pairwise_traceback(
   ::Type{A},
   left_bytes::AbstractVector{UInt8},
   right_bytes::AbstractVector{UInt8},
@@ -2347,7 +2366,7 @@ end
 
 Reconstruct a nucleotide alignment from affine-gap traceback data.
 """
-function _pairwise_traceback_affine(
+@inline function _pairwise_traceback_affine(
   ::Type{A},
   left_bytes::AbstractVector{UInt8},
   right_bytes::AbstractVector{UInt8},
@@ -3288,12 +3307,20 @@ function banded_needleman_wunsch(seq1::BioSequence{A}, seq2::BioSequence{A}; k::
     I_mat = fill(INF, m + 1, n + 1)
     D_mat = fill(INF, m + 1, n + 1)
     
+    # Traceback matrices to record which state transition was taken
+    M_trace = zeros(UInt8, m + 1, n + 1)
+    I_trace = zeros(UInt8, m + 1, n + 1)
+    D_trace = zeros(UInt8, m + 1, n + 1)
+    
     M_mat[1, 1] = 0
+    M_trace[1, 1] = 0x00
     for i in 1:min(m, k)
         I_mat[i+1, 1] = gap_open + (i - 1) * gap_extend
+        I_trace[i+1, 1] = (i == 1) ? 0x01 : 0x02  # from M or from I
     end
     for j in 1:min(n, k)
         D_mat[1, j+1] = gap_open + (j - 1) * gap_extend
+        D_trace[1, j+1] = (j == 1) ? 0x01 : 0x03  # from M or from D
     end
     
     for i in 1:m
@@ -3304,22 +3331,27 @@ function banded_needleman_wunsch(seq1::BioSequence{A}, seq2::BioSequence{A}; k::
             prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
             if prev_best != INF
                 M_mat[i+1, j+1] = prev_best + s_match
+                M_trace[i+1, j+1] = (prev_best == M_mat[i, j]) ? 0x01 : ((prev_best == I_mat[i, j]) ? 0x02 : 0x03)
             end
             
             from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + gap_open : INF
             from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + gap_extend : INF
-            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + gap_open : INF
-            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            I_mat[i+1, j+1] = max(from_m, from_i)
+            if I_mat[i+1, j+1] != INF
+                I_trace[i+1, j+1] = (I_mat[i+1, j+1] == from_m) ? 0x01 : 0x02
+            end
             
             from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + gap_open : INF
             from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + gap_extend : INF
-            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + gap_open : INF
-            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d)
+            if D_mat[i+1, j+1] != INF
+                D_trace[i+1, j+1] = (D_mat[i+1, j+1] == from_m_d) ? 0x01 : 0x03
+            end
         end
     end
     
     val = max(M_mat[m+1, n+1], I_mat[m+1, n+1], D_mat[m+1, n+1])
-    state = val == M_mat[m+1, n+1] ? :M : (val == I_mat[m+1, n+1] ? :I : :D)
+    state = val == M_mat[m+1, n+1] ? 0x01 : (val == I_mat[m+1, n+1] ? 0x02 : 0x03)
     
     i, j = m, n
     al1 = UInt8[]
@@ -3327,36 +3359,24 @@ function banded_needleman_wunsch(seq1::BioSequence{A}, seq2::BioSequence{A}; k::
     matches = 0
     
     while i > 0 || j > 0
-        if state == :M && i > 0 && j > 0
+        if state == 0x01 && i > 0 && j > 0  # M state
             push!(al1, s1[i])
             push!(al2, s2[j])
             s1[i] == s2[j] && (matches += 1)
-            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
-            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            state = M_trace[i+1, j+1]
             i -= 1; j -= 1
-        elseif state == :I && i > 0
+        elseif state == 0x02 && i > 0  # I state (gap in seq2)
             push!(al1, s1[i])
             push!(al2, UInt8('-'))
-            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + gap_extend : INF)
-                state = :I
-            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + gap_open : INF)
-                state = :M
-            else
-                state = :D
-            end
+            state = I_trace[i+1, j+1]
             i -= 1
-        elseif state == :D && j > 0
+        elseif state == 0x03 && j > 0  # D state (gap in seq1)
             push!(al1, UInt8('-'))
             push!(al2, s2[j])
-            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + gap_extend : INF)
-                state = :D
-            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + gap_open : INF)
-                state = :M
-            else
-                state = :I
-            end
+            state = D_trace[i+1, j+1]
             j -= 1
         else
+            # Fallback for edge cases
             if i > 0
                 push!(al1, s1[i]); push!(al2, UInt8('-')); i -= 1
             elseif j > 0
@@ -3399,9 +3419,20 @@ function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::In
     I_mat = fill(INF, m + 1, n + 1)
     D_mat = fill(INF, m + 1, n + 1)
     
+    M_trace = zeros(UInt8, m + 1, n + 1)
+    I_trace = zeros(UInt8, m + 1, n + 1)
+    D_trace = zeros(UInt8, m + 1, n + 1)
+    
     M_mat[1, 1] = 0
-    for i in 1:m; I_mat[i+1, 1] = 0; end
-    for j in 1:n; D_mat[1, j+1] = 0; end
+    M_trace[1, 1] = 0x00
+    for i in 1:m
+        I_mat[i+1, 1] = 0
+        I_trace[i+1, 1] = 0x00  # free start gap
+    end
+    for j in 1:n
+        D_mat[1, j+1] = 0
+        D_trace[1, j+1] = 0x00  # free start gap
+    end
     
     for i in 1:m
         for j in 1:n
@@ -3409,33 +3440,38 @@ function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::In
             prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
             if prev_best != INF
                 M_mat[i+1, j+1] = prev_best + s_match
+                M_trace[i+1, j+1] = (prev_best == M_mat[i, j]) ? 0x01 : ((prev_best == I_mat[i, j]) ? 0x02 : 0x03)
             end
             
             cost_open = (i == m) ? 0 : gap_open
             cost_ext  = (i == m) ? 0 : gap_extend
             from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF
             from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext  : INF
-            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + cost_open : INF
-            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            I_mat[i+1, j+1] = max(from_m, from_i)
+            if I_mat[i+1, j+1] != INF
+                I_trace[i+1, j+1] = (I_mat[i+1, j+1] == from_m) ? 0x01 : 0x02
+            end
             
             cost_open_d = (j == n) ? 0 : gap_open
             cost_ext_d  = (j == n) ? 0 : gap_extend
             from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF
             from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d  : INF
-            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + cost_open_d : INF
-            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d)
+            if D_mat[i+1, j+1] != INF
+                D_trace[i+1, j+1] = (D_mat[i+1, j+1] == from_m_d) ? 0x01 : 0x03
+            end
         end
     end
     
     max_score = INF
     best_i, best_j = m, n
-    state = :M
+    state = 0x01
     for j in 0:n
         val = max(M_mat[m+1, j+1], I_mat[m+1, j+1], D_mat[m+1, j+1])
         if val > max_score
             max_score = val
             best_i, best_j = m, j
-            state = val == M_mat[m+1, j+1] ? :M : (val == I_mat[m+1, j+1] ? :I : :D)
+            state = val == M_mat[m+1, j+1] ? 0x01 : (val == I_mat[m+1, j+1] ? 0x02 : 0x03)
         end
     end
     for i in 0:m
@@ -3443,7 +3479,7 @@ function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::In
         if val > max_score
             max_score = val
             best_i, best_j = i, n
-            state = val == M_mat[i+1, n+1] ? :M : (val == I_mat[i+1, n+1] ? :I : :D)
+            state = val == M_mat[i+1, n+1] ? 0x01 : (val == I_mat[i+1, n+1] ? 0x02 : 0x03)
         end
     end
     
@@ -3451,6 +3487,7 @@ function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::In
     al2 = UInt8[]
     matches = 0
     
+    # Add trailing gaps for free end-gaps
     for i in m:-1:best_i+1
         push!(al1, s1[i]); push!(al2, UInt8('-'))
     end
@@ -3460,35 +3497,18 @@ function semi_global_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::In
     
     i, j = best_i, best_j
     while i > 0 || j > 0
-        if state == :M && i > 0 && j > 0
+        if state == 0x01 && i > 0 && j > 0
             push!(al1, s1[i]); push!(al2, s2[j])
             s1[i] == s2[j] && (matches += 1)
-            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
-            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            state = M_trace[i+1, j+1]
             i -= 1; j -= 1
-        elseif state == :I && i > 0
+        elseif state == 0x02 && i > 0
             push!(al1, s1[i]); push!(al2, UInt8('-'))
-            cost_open = (i == m) ? 0 : gap_open
-            cost_ext  = (i == m) ? 0 : gap_extend
-            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext : INF)
-                state = :I
-            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF)
-                state = :M
-            else
-                state = :D
-            end
+            state = I_trace[i+1, j+1]
             i -= 1
-        elseif state == :D && j > 0
+        elseif state == 0x03 && j > 0
             push!(al1, UInt8('-')); push!(al2, s2[j])
-            cost_open_d = (j == n) ? 0 : gap_open
-            cost_ext_d  = (j == n) ? 0 : gap_extend
-            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d : INF)
-                state = :D
-            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF)
-                state = :M
-            else
-                state = :I
-            end
+            state = D_trace[i+1, j+1]
             j -= 1
         else
             if i > 0
@@ -3530,9 +3550,20 @@ function overlap_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2,
     I_mat = fill(INF, m + 1, n + 1)
     D_mat = fill(INF, m + 1, n + 1)
     
+    M_trace = zeros(UInt8, m + 1, n + 1)
+    I_trace = zeros(UInt8, m + 1, n + 1)
+    D_trace = zeros(UInt8, m + 1, n + 1)
+    
     M_mat[1, 1] = 0
-    for i in 1:m; I_mat[i+1, 1] = 0; end
-    for j in 1:n; D_mat[1, j+1] = 0; end
+    M_trace[1, 1] = 0x00
+    for i in 1:m
+        I_mat[i+1, 1] = 0
+        I_trace[i+1, 1] = 0x00
+    end
+    for j in 1:n
+        D_mat[1, j+1] = 0
+        D_trace[1, j+1] = 0x00
+    end
     
     for i in 1:m
         for j in 1:n
@@ -3540,34 +3571,38 @@ function overlap_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2,
             prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
             if prev_best != INF
                 M_mat[i+1, j+1] = prev_best + s_match
+                M_trace[i+1, j+1] = (prev_best == M_mat[i, j]) ? 0x01 : ((prev_best == I_mat[i, j]) ? 0x02 : 0x03)
             end
             
-            # Free end-gap logic for terminal overhangs
             cost_open = (i == m) ? 0 : gap_open
             cost_ext  = (i == m) ? 0 : gap_extend
             from_m = M_mat[i, j+1] != INF ? M_mat[i, j+1] + cost_open : INF
             from_i = I_mat[i, j+1] != INF ? I_mat[i, j+1] + cost_ext  : INF
-            from_d = D_mat[i, j+1] != INF ? D_mat[i, j+1] + cost_open : INF
-            I_mat[i+1, j+1] = max(from_m, from_i, from_d)
+            I_mat[i+1, j+1] = max(from_m, from_i)
+            if I_mat[i+1, j+1] != INF
+                I_trace[i+1, j+1] = (I_mat[i+1, j+1] == from_m) ? 0x01 : 0x02
+            end
             
             cost_open_d = (j == n) ? 0 : gap_open
             cost_ext_d  = (j == n) ? 0 : gap_extend
             from_m_d = M_mat[i+1, j] != INF ? M_mat[i+1, j] + cost_open_d : INF
             from_d_d = D_mat[i+1, j] != INF ? D_mat[i+1, j] + cost_ext_d  : INF
-            from_i_d = I_mat[i+1, j] != INF ? I_mat[i+1, j] + cost_open_d : INF
-            D_mat[i+1, j+1] = max(from_m_d, from_d_d, from_i_d)
+            D_mat[i+1, j+1] = max(from_m_d, from_d_d)
+            if D_mat[i+1, j+1] != INF
+                D_trace[i+1, j+1] = (D_mat[i+1, j+1] == from_m_d) ? 0x01 : 0x03
+            end
         end
     end
     
     max_score = INF
     best_i, best_j = m, n
-    state = :M
+    state = 0x01
     for j in 1:n
         val = max(M_mat[m+1, j+1], I_mat[m+1, j+1], D_mat[m+1, j+1])
         if val > max_score
             max_score = val
             best_i, best_j = m, j
-            state = val == M_mat[m+1, j+1] ? :M : (val == I_mat[m+1, j+1] ? :I : :D)
+            state = val == M_mat[m+1, j+1] ? 0x01 : (val == I_mat[m+1, j+1] ? 0x02 : 0x03)
         end
     end
     for i in 1:m
@@ -3575,7 +3610,7 @@ function overlap_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2,
         if val > max_score
             max_score = val
             best_i, best_j = i, n
-            state = val == M_mat[i+1, n+1] ? :M : (val == I_mat[i+1, n+1] ? :I : :D)
+            state = val == M_mat[i+1, n+1] ? 0x01 : (val == I_mat[i+1, n+1] ? 0x02 : 0x03)
         end
     end
     
@@ -3592,35 +3627,18 @@ function overlap_align(seq1::BioSequence{A}, seq2::BioSequence{A}; match::Int=2,
     
     i, j = best_i, best_j
     while i > 0 || j > 0
-        if state == :M && i > 0 && j > 0
+        if state == 0x01 && i > 0 && j > 0
             push!(al1, s1[i]); push!(al2, s2[j])
             s1[i] == s2[j] && (matches += 1)
-            prev_best = max(M_mat[i, j], I_mat[i, j], D_mat[i, j])
-            state = (prev_best == M_mat[i, j]) ? :M : ((prev_best == I_mat[i, j]) ? :I : :D)
+            state = M_trace[i+1, j+1]
             i -= 1; j -= 1
-        elseif state == :I && i > 0
+        elseif state == 0x02 && i > 0
             push!(al1, s1[i]); push!(al2, UInt8('-'))
-            c_open = (i == m) ? 0 : gap_open
-            c_ext  = (i == m) ? 0 : gap_extend
-            if I_mat[i+1, j+1] == (I_mat[i, j+1] != INF ? I_mat[i, j+1] + c_ext : INF)
-                state = :I
-            elseif I_mat[i+1, j+1] == (M_mat[i, j+1] != INF ? M_mat[i, j+1] + c_open : INF)
-                state = :M
-            else
-                state = :D
-            end
+            state = I_trace[i+1, j+1]
             i -= 1
-        elseif state == :D && j > 0
+        elseif state == 0x03 && j > 0
             push!(al1, UInt8('-')); push!(al2, s2[j])
-            c_open = (j == n) ? 0 : gap_open
-            c_ext  = (j == n) ? 0 : gap_extend
-            if D_mat[i+1, j+1] == (D_mat[i+1, j] != INF ? D_mat[i+1, j] + c_ext : INF)
-                state = :D
-            elseif D_mat[i+1, j+1] == (M_mat[i+1, j] != INF ? M_mat[i+1, j] + c_open : INF)
-                state = :M
-            else
-                state = :I
-            end
+            state = D_trace[i+1, j+1]
             j -= 1
         else
             if i > 0
@@ -3650,9 +3668,13 @@ overlap_align(seq1::AbstractString, seq2::AbstractString; kwargs...) =
     differentiable_align(seq1::BioSequence, seq2::BioSequence; kwargs...)
 
 Differentiable dynamic programming alignment wrapper.
+Returns the soft alignment score. Note: this computes the objective value only.
+For hard alignment, use `pairwise_align` with standard scoring.
 """
 function differentiable_align(seq1::BioSequence{A}, seq2::BioSequence{A}; scoring::DifferentiableScoring=DifferentiableScoring([1.0, -1.0, -1.0])) where {A<:BioAlphabet}
     score = soft_alignment_score(seq1, seq2, scoring)
+    # Soft alignment computes a differentiable objective but doesn't produce a traceback.
+    # Return the input sequences with the computed soft score.
     return PairwiseAlignmentResult(seq1, seq2, round(Int, score), 0, 0.0)
 end
 differentiable_align(seq1::AbstractString, seq2::AbstractString; kwargs...) =

@@ -13,7 +13,9 @@ using SpecialFunctions: digamma, trigamma, polygamma, erfc
 using ..DifferentialExpression: CountMatrix, DEResult, benjamini_hochberg, calc_norm_factors
 using ..Enrichment: EnrichmentDatabase, EnrichmentResult
 using ..BioToolkit: PhyloTree, get_terminals, maybe_to_device, maybe_to_host, resolve_backend, threaded_foreach
-using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!
+using ..BioToolkit: AbstractAnalysisResult, ProvenanceContext, ProvenanceParams, ResultProvenance, ThreadSafeProvenanceContext, active_provenance_context, new_provenance_id, provenance_parent_ids, provenance_record, provenance_result!, register_provenance!, BlenderIntegrator
+using ..BlenderIntegrator: BlenderRNAVelocityPayload, BlenderMaterial, to_blender_payload
+
 
 @inline function _register_systemsbio_result!(_ctx::Union{Nothing,ProvenanceContext,ThreadSafeProvenanceContext}, result, operation::AbstractString; parents::AbstractVector{<:AbstractString}=String[], parameters=NamedTuple())
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
@@ -33,6 +35,23 @@ struct GeneNetwork
     connectivity::Vector{Float64}
     modules::Vector{Int}
 end
+
+function BlenderIntegrator.to_blender_payload(net::GeneNetwork; name::String="GeneNetwork")
+    n_nodes = length(net.node_to_gene)
+    coords = zeros(Float64, n_nodes, 3)
+    vectors = zeros(Float64, n_nodes, 3)
+    for i in 1:n_nodes
+        t = (2π * i) / max(n_nodes, 1)
+        r = 5.0 + net.connectivity[i]
+        coords[i, 1] = r * cos(t)
+        coords[i, 2] = r * sin(t)
+        coords[i, 3] = Float64(net.modules[i])
+        vectors[i, :] .= (coords[i, :] ./ max(r, 1e-3)) .* 0.5
+    end
+    mat = BlenderMaterial(name=name * "_mat", color=(0.2, 0.9, 0.5, 1.0), roughness=0.3)
+    return BlenderRNAVelocityPayload(name, coords, vectors, 1.0, mat)
+end
+
 
 struct SoftThresholdResult <: AbstractAnalysisResult
     powers::Vector{Int}

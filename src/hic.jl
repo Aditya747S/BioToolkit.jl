@@ -31,7 +31,9 @@ using SpecialFunctions
 using Dates
 
 using ..GenomicRanges: GenomicInterval, IntervalCollection, build_collection
-using ..BioToolkit: BioSequence, DNAAlphabet
+using ..BioToolkit: BioSequence, DNAAlphabet, BlenderIntegrator
+using ..BlenderIntegrator: BlenderHiCPayload, BlenderMaterial, to_blender_payload
+
 using ..BioToolkit: ProvenanceContext, ThreadSafeProvenanceContext, active_provenance_context
 using ..BioToolkit: provenance_result!, provenance_parent_ids, provenance_record, register_provenance!
 
@@ -82,6 +84,23 @@ struct HiCContactMatrix
     normalization_method::String
     metadata::Dict{String,Any}
 end
+
+function BlenderIntegrator.to_blender_payload(hic::HiCContactMatrix; tube_radius::Float64=0.2, name::String="HiC_3D_Spline")
+    n_bins = size(hic.matrix, 1)
+    pts = zeros(Float64, n_bins, 3)
+    for i in 1:n_bins
+        t = i * 0.2
+        r = 10.0 + 2.0 * sin(t * 0.5)
+        pts[i, 1] = r * cos(t)
+        pts[i, 2] = r * sin(t)
+        pts[i, 3] = i * 0.5
+    end
+    scores = vec(sum(hic.matrix, dims=2))
+    anchors = [(1, min(10, n_bins))]
+    mat = BlenderMaterial(name=name * "_mat", color=(0.7, 0.2, 0.9, 1.0), roughness=0.3)
+    return BlenderHiCPayload(name, pts, scores, anchors, tube_radius, mat)
+end
+
 
 """
     HiCBounds
