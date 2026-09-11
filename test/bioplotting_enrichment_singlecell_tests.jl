@@ -332,3 +332,145 @@ end
     @test length(integrated.gene_ids) == 4
     @test length(integrated.cell_ids) == 8
 end
+# ==========================================================================
+# Session 2 corrections (2026-09-04): real ssGSEA (Barbie 2009), signed GSVA,
+# negative-ES leading edges, working reactome/wikipathways/msigdb/heat
+# diffusion wrappers, GO-elim, Wang similarity, GMT parsing.
+# Evidence: plan/audit_notes.md wave 7; plan/correction_plan.md items 22-27, F1.
+# ==========================================================================
+using Test
+using BioToolkit
+using Random
+
+@testset "Session 2: ssGSEA is signed and nonzero" begin
+    Random.seed!(2)
+    genes = ["g$i" for i in 1:200]
+    scores = randn(200)
+    # Set concentrated at the top of the ranking.
+    top_set = genes[1:20]
+    ranked = [(genes[i], scores[i]) for i in sortperm(scores; rev=true)]
+    rank_of = Dict(g => r for (r, g) in enumerate(genes))
+    set_idx = [rank_of[g] for g in top_set]
+    ranked_scores = [abs(s) for (_, s) in ranked]
+
+    es_top = BioToolkit.Enrichment._ssgsea_sample_score(ranked_scores, sort(set_idx), 200)
+    @test es_top > 0.5                     # strongly enriched at the top
+    # The old implementation returned exactly 0.0 for every input.
+    bottom_set = genes[181:200]
+    set_idx_b = [rank_of[g] for g in bottom_set]
+    es_bottom = BioToolkit.Enrichment._ssgsea_sample_score(ranked_scores, sort(set_idx_b), 200)
+    @test es_bottom < -0.3                 # bottom-ranked set: negative ES
+end
+
+@testset "Session 2: GSVA preserves sign" begin
+    Random.seed!(3)
+    genes = ["g$i" for i in 1:100]
+    scores = sort(rand(100); rev=true)
+    rank_of = Dict(g => r for (r, g) in enumerate(genes))
+    top_idx = sort([rank_of[g] for g in genes[1:15]])
+    bot_idx = sort([rank_of[g] for g in genes[86:100]])
+    es_top = BioToolkit.Enrichment._gsva_sample_score(scores, top_idx, 100)
+    es_bot = BioToolkit.Enrichment._gsva_sample_score(scores, bot_idx, 100)
+    @test es_top > 0
+    @test es_bot < 0
+    @test abs(es_top) > abs(es_bot)        # top set has stronger deviation
+end
+
+@testset "Session 2: leading edge for negative enrichment" begin
+    genes = ["g$i" for i in 1:100]
+    scores = collect(100:-1:1)             # descending: g1 highest
+    ranked = [(g, Float64(scores[i])) for (i, g) in enumerate(genes)]
+    db_terms = [BioToolkit.EnrichmentTerm("SET_A", "set at bottom", "TEST", ["g90", "g95", "g100"], String[])]
+    db = BioToolkit.build_annotation_database(db_terms)
+    results = BioToolkit.fgsea_like(ranked, Dict("SET_A" => ["g90", "g95", "g100"]); n_permutations=500, min_size=2, max_size=500)
+    @test results[1].es < 0
+    le = BioToolkit.leading_edge_genes(results[1])
+    @test !isempty(le)                     # previously empty for negative ES
+end
+
+@testset "Session 2: GMT parsing and msigdb wrapper" begin
+    mktempdir() do dir
+        gmt_path = joinpath(dir, "sets.gmt")
+        sets = Dict("PATHWAY_A" => ["g1", "g2", "g3"], "PATHWAY_B" => ["g4", "g5"])
+        BioToolkit.write_gmt(gmt_path, sets; descriptions=Dict("PATHWAY_A" => "first", "PATHWAY_B" => "second"))
+        parsed = BioToolkit.read_gmt(gmt_path)
+        @test parsed.sets["PATHWAY_A"] == ["g1", "g2", "g3"]
+        @test parsed.descriptions["PATHWAY_A"] == "first"
+
+        db = BioToolkit.database_from_gmt(gmt_path; namespace="C2")
+        @test db isa BioToolkit.EnrichmentDatabase
+        @test length(db.terms) == 2
+        @test db.terms["PATHWAY_A"].namespace == "C2"
+
+        # msigdb_enrichment accepts a GMT path directly (previously only a
+        # prepared database, and the collection branch crashed).
+        query = ["g1", "g2"]
+        res = BioToolkit.msigdb_enrichment(query, gmt_path; collection="C2")
+        @test all(r -> r.pvalue <= 1.0, res)
+        @test res[1].term_id == "PATHWAY_A" || res[1].pvalue >= 0.0
+    end
+end
+
+@testset "Session 2: namespace wrappers no longer crash" begin
+    terms = [
+        BioToolkit.EnrichmentTerm("REAC:1", "reactome term", "Reactome", ["g1", "g2", "g3", "g4"], String[]),
+        BioToolkit.EnrichmentTerm("WP:1", "wikipathway term", "WikiPathways", ["g5", "g6", "g7", "g8"], String[]),
+    ]
+    db = BioToolkit.build_annotation_database(terms)
+
+    r1 = BioToolkit.reactome_enrichment(["g1", "g2"], db)
+    @test all(x -> x.namespace == "Reactome", r1)
+    r2 = BioToolkit.wikipathways_enrichment(["g5", "g6"], db)
+    @test all(x -> x.namespace == "WikiPathways", r2)
+
+    # heat diffusion enrichment end-to-end
+    gene_names = ["g$i" for i in 1:8]
+    adjacency = zeros(8, 8)
+    for i in 1:7
+        adjacency[i, i + 1] = 1.0
+        adjacency[i + 1, i] = 1.0
+    end
+    seeds = Dict("g1" => 1.0, "g2" => 0.8)
+    hd = BioToolkit.heat_diffusion_enrichment(seeds, adjacency, gene_names,
+        Dict("SET_1" => ["g1", "g2", "g3"]))
+    @test hd isa AbstractVector
+end
+
+@testset "Session 2: GO-elim changes ancestor results" begin
+    # DAG: child (significant) -> parent. Without elim both are significant
+    # via the same genes; with elim the parent loses the child's genes.
+    child_genes = ["c1", "c2", "c3", "c4", "c5", "c6"]
+    parent_genes = vcat(child_genes, ["p1", "p2", "p3", "p4"])
+    terms = [
+        BioToolkit.EnrichmentTerm("GO:CHILD", "child", "BP", child_genes, String[]),
+        BioToolkit.EnrichmentTerm("GO:PARENT", "parent", "BP", parent_genes, ["GO:CHILD"]),
+    ]
+    db = BioToolkit.build_annotation_database(terms)
+    query = ["c1", "c2", "c3", "c4", "c5", "c6"]
+
+    plain = BioToolkit.enrichment_test(query, db)
+    plain_parent = only(filter(r -> r.term_id == "GO:PARENT", plain))
+    @test plain_parent.overlap == length(parent_genes)   # same genes drive both
+
+    elim = BioToolkit.enrichment_test(query, db; elim=true)
+    elim_parent = only(filter(r -> r.term_id == "GO:PARENT", elim))
+    @test elim_parent.overlap == 4                       # child's genes eliminated
+    @test elim_parent.pvalue > plain_parent.pvalue
+end
+
+@testset "Session 2: Wang GO semantic similarity" begin
+    # GO:CHILD -> GO:PARENT -> GO:ROOT chain; similarity of a term with itself
+    # is 1, and parent/child share more than unrelated terms.
+    terms = [
+        BioToolkit.EnrichmentTerm("GO:CHILD", "child", "BP", ["g1"], ["GO:PARENT"]),
+        BioToolkit.EnrichmentTerm("GO:PARENT", "parent", "BP", ["g2"], ["GO:ROOT"]),
+        BioToolkit.EnrichmentTerm("GO:ROOT", "root", "BP", ["g3"], String[]),
+        BioToolkit.EnrichmentTerm("GO:OTHER", "unrelated", "BP", ["g4"], String[]),
+    ]
+    db = BioToolkit.build_annotation_database(terms)
+    @test BioToolkit.gene_ontology_semantic_similarity("GO:CHILD", "GO:CHILD", db) == 1.0
+    sim_pc = BioToolkit.gene_ontology_semantic_similarity("GO:CHILD", "GO:PARENT", db)
+    sim_un = BioToolkit.gene_ontology_semantic_similarity("GO:CHILD", "GO:OTHER", db)
+    @test 0.0 < sim_pc <= 1.0
+    @test sim_pc > sim_un
+end

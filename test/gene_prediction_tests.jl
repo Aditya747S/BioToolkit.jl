@@ -43,3 +43,15 @@ using BioToolkit
         @test isempty(genes)
     end
 end
+
+# ==========================================================================
+# Session 2 corrections: detect_splice_sites no longer crashes (PWM scoring
+# works on plain strings, and Dict iteration destructuring was fixed).
+# ==========================================================================
+@testset "Session 2: splice site detection runs" begin
+    seq = BioToolkit.BioSequence{BioToolkit.DNAAlphabet}("AGGTAAAG" * "GTAAGT" * repeat("ACGT", 10))
+    sites = BioToolkit.detect_splice_sites(seq; min_score=0.25)
+    @test length(sites) >= 1
+    @test all(sp -> sp.site_type in (:donor, :acceptor), sites)
+    @test all(sp -> sp.consensus in ("GT", "AG"), sites)
+end

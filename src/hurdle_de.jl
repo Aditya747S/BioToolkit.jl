@@ -214,12 +214,21 @@ function pseudobulk_de(sce; group_by=[:donor, :celltype], contrast::Symbol, meth
     
     for idx in 1:n_samples
         sample_id = cm.sample_ids[idx]
-        cell_idx = findfirst(i -> "$(donor_vec[i])_$(celltype_vec[i])" == sample_id, 1:length(sce.cell_ids))
-        if cell_idx !== nothing
-            design_vec[idx] = Symbol(contrast_vec[cell_idx])
-        else
+        # Collect ALL cells in the (donor, celltype) pseudo-sample and verify
+        # the contrast variable is constant within it. Taking the first
+        # matching cell silently produced a wrong design whenever the
+        # contrast varied within the group (e.g. donor × condition cross).
+        member_idx = findall(i -> "$(donor_vec[i])_$(celltype_vec[i])" == sample_id, 1:length(sce.cell_ids))
+        if isempty(member_idx)
             design_vec[idx] = :unknown
+            continue
         end
+        contrast_values = unique(String(contrast_vec[j]) for j in member_idx)
+        length(contrast_values) == 1 ||
+            throw(ArgumentError("pseudobulk sample '$sample_id' mixes contrast values " *
+                                join(contrast_values, ", ") *
+                                " — the contrast must be constant within each (donor, celltype) group"))
+        design_vec[idx] = Symbol(contrast_values[1])
     end
     
     if method == :deseq2

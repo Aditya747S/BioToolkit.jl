@@ -1189,7 +1189,7 @@ function disulfide_bonds(structure::Structure; model_index::Int=1, cutoff::Real=
   for chain in model.chains
     for residue in chain.residues
       uppercase(residue.name) == "CYS" || continue
-      uppercase(atom.name) == "SG" || continue
+      any(uppercase(atom.name) == "SG" for atom in residue.atoms) || continue
       push!(cysteines, (chain=chain, residue=residue))
     end
   end
@@ -3207,7 +3207,7 @@ function _structure_input_path(input::Structure)
   return _structure_to_temp_pdb(input)
 end
 
-function run_dssp(input::Union{String,Structure}; command::String="mkdssp", args::AbstractVector{<:String}=String[])
+function run_dssp(input::Union{String,Structure}; command::String="mkdssp", args::AbstractVector{<:String}=String[], prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
   input_path = _structure_input_path(input)
   try
     cmd = Cmd(vcat(String(command), String.(collect(args)), String(input_path)))

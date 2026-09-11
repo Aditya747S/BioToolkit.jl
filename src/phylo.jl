@@ -319,7 +319,7 @@ function trace(tree::PhyloTree, start_name::String, end_name::String)
   return vcat(left_segment, right_segment)
 end
 
-function split(tree::PhyloTree, parent_name::String; child_names::AbstractVector{<:String}=String[], branch_length::Real=0.0, support::Real=0.0)
+function split_tree(tree::PhyloTree, parent_name::String; child_names::AbstractVector{<:String}=String[], branch_length::Real=0.0, support::Real=0.0)
   target = String(parent_name)
   path = _phylo_path_to_named_node(tree, target)
   path === nothing && throw(ArgumentError("unknown node: $(parent_name)"))

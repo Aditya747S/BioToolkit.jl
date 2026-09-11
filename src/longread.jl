@@ -764,10 +764,10 @@ end
 
 Greedy overlap-layout-consensus assembly from long reads.
 """
-function overlap_layout_consensus(reads::AbstractVector; min_overlap::Int=30)
+function overlap_layout_consensus(reads::AbstractVector; min_overlap::Int=30, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     seqs = [uppercase(_record_sequence(r)) for r in reads]
     if isempty(seqs)
-        _register_longread_result!(_ctx, nothing, "overlap_layout_consensus"; parameters=(n_reads=0, min_overlap=min_overlap))
+        return _register_longread_result!(_ctx, nothing, "overlap_layout_consensus"; parameters=(n_reads=0, min_overlap=min_overlap))
         return (consensus="", used_reads=Int[], unused_reads=Int[])
     end
 
@@ -808,10 +808,10 @@ end
 
 Compute N50 for read lengths.
 """
-function read_n50(reads::AbstractVector)
+function read_n50(reads::AbstractVector; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     lengths = sort(ncodeunits.(uppercase.(_record_sequence.(reads))); rev=true)
     if isempty(lengths)
-        _register_longread_result!(_ctx, 0, "read_n50"; parameters=(n_reads=0, n50=0))
+        return _register_longread_result!(_ctx, 0, "read_n50"; parameters=(n_reads=0, n50=0))
         return 0
     end
     target = sum(lengths) / 2
@@ -904,7 +904,7 @@ end
 
 Generate an intra-chromosomal contact matrix from long-range contacts.
 """
-function omnic_contact_matrix(contacts::DataFrame; chrom::AbstractString="chr1", bin_size::Int=100_000)
+function omnic_contact_matrix(contacts::DataFrame; chrom::AbstractString="chr1", bin_size::Int=100_000, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     hasproperty(contacts, :chrom1) || throw(ArgumentError("contacts must contain chrom1"))
     hasproperty(contacts, :pos1) || throw(ArgumentError("contacts must contain pos1"))
     hasproperty(contacts, :chrom2) || throw(ArgumentError("contacts must contain chrom2"))

@@ -1369,7 +1369,7 @@ function positional_covariation_matrix(alignment::MultipleSequenceAlignment;
         result = (covariation=cor_mat, positions=collect(1:l))
         return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     elseif metric in (:mi, :mutual_information)
-        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=min_separation, apc=apc, max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, identity_threshold=identity_threshold, weights=weights_vec, _ctx=_ctx)
+        mi_map = mutual_information_contacts(filtered; pseudocount=pseudocount, min_separation=5, apc=true, max_gap_fraction=max_gap_fraction, min_sequence_coverage=min_sequence_coverage, identity_threshold=identity_threshold, weights=weights_vec)
         result = (covariation=mi_map.scores, positions=collect(1:l))
         return _register_coevolution_result!(_ctx, result, "positional_covariation_matrix"; parents=provenance_parent_ids(alignment), parameters=(metric=metric, n_cols=l))
     else

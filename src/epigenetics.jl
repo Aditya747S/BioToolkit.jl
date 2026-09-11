@@ -295,13 +295,34 @@ function _tricube(weight::Real)
   return value^3
 end
 
+# Weighted local linear fit at `target`: minimise Σ w_i (y_i - a - b·(x_i-t))²
+# and return the fitted value a (the value at the target). Solves the 2×2
+# normal equations in closed form; degenerate systems (fewer than 2 points,
+# zero weight, or zero x-spread) fall back to the weighted mean of y.
+# The previous version returned element [1] of the design matrix without
+# solving anything, corrupting every caller (GC-bias correction).
 function _weighted_local_linear(x_values::Vector{Float64}, y_values::Vector{Float64}, target::Real, weights::Vector{Float64})
-  design = hcat(ones(length(x_values)), x_values .- Float64(target))
-  weighted_design = design .* sqrt.(weights)
-  weighted_response = y_values .* sqrt.(weights)
-  coefficients = weighted_design
-  weighted_response
-  return coefficients[1]
+  n = length(x_values)
+  (n == length(y_values) == length(weights)) || throw(DimensionMismatch("x, y, weights must have equal length"))
+  n == 0 && return 0.0
+  t = Float64(target)
+  sw = sum(weights)
+  sw <= 0 && return 0.0
+  if n == 1
+    return y_values[1]
+  end
+  dx = x_values .- t
+  swx = sum(w * dx_i for (w, dx_i) in zip(weights, dx))
+  swx2 = sum(w * dx_i^2 for (w, dx_i) in zip(weights, dx))
+  swy = sum(w * y for (w, y) in zip(weights, y_values))
+  swxy = sum(w * dx_i * y for (w, dx_i, y) in zip(weights, dx, y_values))
+  denom = sw * swx2 - swx^2
+  if abs(denom) < 1e-12 * max(sw * swx2, 1.0)
+    # degenerate: locally flat / single unique x
+    return swy / sw
+  end
+  a = (swx2 * swy - swx * swxy) / denom
+  return a
 end
 
 function _robust_lowess(x_values::AbstractVector{<:Real}, y_values::AbstractVector{<:Real}; span::Real=0.5, iterations::Int=2)
@@ -905,7 +926,10 @@ function differential_methylation(experiment::MethylationExperiment, design::Abs
     fit_group1 = _fit_beta_binomial(row_methylated[group1], row_total[group1])
     fit_group2 = _fit_beta_binomial(row_methylated[group2], row_total[group2])
     stat = max(2 * ((fit_group1.loglik + fit_group2.loglik) - fit_null.loglik), 0.0)
-    pvalue = ccdf(Chisq(1), stat)
+    # df: the alternative fits per-group mu AND per-group precision (4
+    # parameters) against the null's shared mu + shared precision (2), so the
+    # LRT reference is Chisq(2) — Chisq(1) made the test conservative.
+    pvalue = ccdf(Chisq(2), stat)
     group1_mean = (sum(row_methylated[group1]) + fit_null.mu * fit_null.precision) / (sum(row_total[group1]) + fit_null.precision)
     group2_mean = (sum(row_methylated[group2]) + fit_null.mu * fit_null.precision) / (sum(row_total[group2]) + fit_null.precision)
     region = experiment.regions.intervals[row]
@@ -1009,15 +1033,27 @@ end
 
 function calculate_coaccessibility(chromatin::SingleCellChromatinExperiment; min_correlation::Real=0.3, max_pairs::Int=5000)
   matrix = Matrix{Float64}(chromatin.open_peaks .> 0)
+  n_peaks = size(matrix, 1)
   edges = CoaccessibilityEdge[]
-  for left in 1:(size(matrix, 1)-1)
-    for right in (left+1):size(matrix, 1)
+  length(edges) >= max_pairs && return edges
+
+  # Compute all candidate pairs first, then keep the strongest max_pairs
+  # edges by |correlation|. The previous loop returned as soon as max_pairs
+  # edges accumulated, so the reported set depended on peak row order and
+  # systematically dropped later peaks.
+  candidates = Tuple{Float64,Int,Int}[]
+  for left in 1:(n_peaks-1)
+    for right in (left+1):n_peaks
       correlation = cor(matrix[left, :], matrix[right, :])
       isnan(correlation) && continue
-      correlation < min_correlation && continue
-      push!(edges, CoaccessibilityEdge(chromatin.peak_ids[left], chromatin.peak_ids[right], correlation))
-      length(edges) >= max_pairs && return edges
+      correlation >= min_correlation || continue   # co-accessibility is positive
+      push!(candidates, (correlation, left, right))
     end
+  end
+  sort!(candidates; by = x -> x[1], rev = true)
+  for (correlation, left, right) in candidates
+    length(edges) >= max_pairs && break
+    push!(edges, CoaccessibilityEdge(chromatin.peak_ids[left], chromatin.peak_ids[right], correlation))
   end
 
   return edges
@@ -1405,8 +1441,14 @@ end
     parse_bismark_coverage(lines)
 
 Parse Bismark-style coverage lines and summarize CpG/non-CpG methylation.
+Bismark coverage files do NOT record sequence context; it can only be derived
+from the reference sequence. When `genome` (a Dict of chromosome => sequence)
+is supplied, context is called from the reference bases after the C
+(CpG: next base G; CHG: next base not G but the one after G; CHH: otherwise).
+Without a genome the context column is "unknown" — the previous behaviour
+inferred "CpG" from coordinate parity, which was fabricated.
 """
-function parse_bismark_coverage(lines::AbstractVector{<:AbstractString})
+function parse_bismark_coverage(lines::AbstractVector{<:AbstractString}; genome::Union{Nothing,AbstractDict{<:AbstractString}}=nothing)
   chrom = String[]
   start = Int[]
   stop = Int[]
@@ -1424,7 +1466,7 @@ function parse_bismark_coverage(lines::AbstractVector{<:AbstractString})
     push!(methylation_pct, parse(Float64, s[4]))
     push!(meth_count, parse(Int, s[5]))
     push!(unmeth_count, parse(Int, s[6]))
-    push!(context, iseven(parse(Int, s[2])) ? "CpG" : "CHH")
+    push!(context, _bismark_context(String(s[1]), parse(Int, s[2]), genome))
   end
 
   df = DataFrame(
@@ -1443,6 +1485,24 @@ function parse_bismark_coverage(lines::AbstractVector{<:AbstractString})
 
   return (calls=df, summary=summary)
 end
+# Sequence-context calling for a cytosine at 1-based genomic position `pos`
+# on the given chromosome. CpG: next base G. CHG: next base not G but the one
+# after that G. CHH: otherwise. Without a genome the context is unknown.
+function _bismark_context(chrom::AbstractString, pos::Integer,
+                          genome::Union{Nothing,AbstractDict{<:AbstractString}})
+    genome === nothing && return "unknown"
+    seq = get(genome, String(chrom), nothing)
+    seq === nothing && return "unknown"
+    n = length(seq)
+    n == 0 && return "unknown"
+    base_at(p) = (1 <= p <= n) ? uppercase(seq[p]) : 'N'
+    b1 = base_at(pos + 1)
+    b2 = base_at(pos + 2)
+    b1 == 'G' && return "CpG"
+    b2 == 'G' && return "CHG"
+    return "CHH"
+end
+
 
 """
     insulation_score(contact; window=5)
@@ -1805,40 +1865,84 @@ const _TN5_INSERTION_MOTIFS = Dict(
   "Tn5_5prime" => r"CTGTCTCTTATACACATCT",
   "Tn5_3prime" => r"AGATGTGTATAAGAGACAG")
 
-function insertion_bias_correction(exp::ATACExperiment; motif_window::Int=10)
-  insertion_counts = Dict{String,Int}()
+"""
+    insertion_bias_correction(exp; genome=nothing, motif_window=10)
+
+Quantify Tn5 sequence-context insertion bias. Requires `genome` (a Dict of
+chromosome => sequence): the Tn5 recognition motifs defined in
+`_TN5_INSERTION_MOTIFS` are matched around each insertion site and the
+enrichment of each motif over background is reported. Without a genome the
+function throws — the previous stub counted insertions into a "background"
+bucket and returned empty profiles while implying Tn5 correction.
+
+Returns `(bias_profile, correction_factors, total_insertions)` where
+`bias_profile` maps motif names (and "background") to mean insertions per
+site matching that motif, and `correction_factors` maps each insertion site
+key to its motif enrichment factor (1.0 when unbiased).
+"""
+function insertion_bias_correction(exp::ATACExperiment; genome::Union{Nothing,AbstractDict{<:AbstractString}}=nothing,
+                                   motif_window::Int=10)
+  genome === nothing && throw(ArgumentError("insertion_bias_correction requires genome (Dict of chromosome => sequence) to score Tn5 sequence context"))
+
+  insertion_counts = Dict{Tuple{String,Int},Int}()
   for frag in exp.fragments
-    left_key = "$(frag.chrom):$(frag.left)"
-    right_key = "$(frag.chrom):$(frag.right)"
-    insertion_counts[left_key] = get(insertion_counts, left_key, 0) + 1
-    insertion_counts[right_key] = get(insertion_counts, right_key, 0) + 1
+    insertion_counts[(frag.chrom, frag.left)] = get(insertion_counts, (frag.chrom, frag.left), 0) + 1
+    insertion_counts[(frag.chrom, frag.right)] = get(insertion_counts, (frag.chrom, frag.right), 0) + 1
   end
 
   total_insertions = sum(values(insertion_counts))
   total_insertions == 0 && return (bias_profile=Dict{String,Float64}(), correction_factors=Dict{String,Float64}(), total_insertions=0)
 
-  motif_counts = Dict{String,Int}()
-  for motif_name in keys(_TN5_INSERTION_MOTIFS)
-    motif_counts[motif_name] = 0
+  motif_names = collect(keys(_TN5_INSERTION_MOTIFS))
+  motif_hits = Dict{String,Int}(name => 0 for name in motif_names)
+  site_motif = Dict{Tuple{String,Int},String}()
+
+  for ((chrom, pos), _) in insertion_counts
+    seq = get(genome, chrom, nothing)
+    seq === nothing && continue
+    lo = max(1, pos - motif_window)
+    hi = min(length(seq), pos + motif_window)
+    hi < lo && continue
+    window_seq = uppercase(String(seq[lo:hi]))
+    best = "background"
+    for name in motif_names
+      if occursin(_TN5_INSERTION_MOTIFS[name], window_seq)
+        best = name
+        motif_hits[name] += 1
+        break
+      end
+    end
+    site_motif[(chrom, pos)] = best
   end
 
-  for (pos_key, count) in insertion_counts
-    motif_counts["background"] = get(motif_counts, "background", 0) + count
+  n_sites = max(length(insertion_counts), 1)
+  bias_profile = Dict{String,Float64}()
+  for name in motif_names
+    bias_profile[name] = motif_hits[name] / n_sites
   end
+  background_sites = n_sites - sum(values(motif_hits))
+  bias_profile["background"] = background_sites / n_sites
 
-  expected_freq = 1.0 / max(length(insertion_counts), 1)
+  n_motif_sites = max(sum(values(motif_hits)), 1)
+  base_rate = n_motif_sites / n_sites
   correction_factors = Dict{String,Float64}()
-  for (pos_key, count) in insertion_counts
-    observed_freq = count / total_insertions
-    correction_factors[pos_key] = observed_freq / max(expected_freq, eps(Float64))
+  for ((chrom, pos), count) in insertion_counts
+    motif = get(site_motif, (chrom, pos), "background")
+    if motif == "background"
+      correction_factors[string(chrom) * ":" * string(pos)] = 1.0
+    else
+      motif_rate = motif_hits[motif] / n_sites
+      correction_factors[string(chrom) * ":" * string(pos)] = base_rate > 0 ? motif_rate / base_rate : 1.0
+    end
   end
 
   _ctx = active_provenance_context()
   if _ctx !== nothing
     register_provenance!(_ctx, "insertion_bias_correction";
-      parameters=(total_insertions=total_insertions, unique_sites=length(insertion_counts)))
+      parameters=(total_insertions=total_insertions, unique_sites=length(insertion_counts),
+                  motif_sites=sum(values(motif_hits))))
   end
-  return (bias_profile=motif_counts, correction_factors=correction_factors, total_insertions=total_insertions)
+  return (bias_profile=bias_profile, correction_factors=correction_factors, total_insertions=total_insertions)
 end
 
 function atac_qc_report(exp::ATACExperiment, peaks::PeakSet, tss_sites::AbstractVector{<:GenomicInterval}; flank::Int=1000)

@@ -42,7 +42,7 @@ import ..FlowCytometry
     return provenance_result!(_ctx, result, operation; parents=parents, parameters=parameters)
 end
 using ..DifferentialExpression: CountMatrix, benjamini_hochberg, differential_expression
-using ..Epigenetics: MethylationCall, PeakSet, bin_methylation, compute_motif_deviations, differential_binding, differential_methylation
+using ..Epigenetics: MethylationCall, PeakSet, bin_methylation, compute_motif_deviations, differential_binding, differential_methylation, diffbind_like_workflow
 using ..GWAS: ebi_lookup
 using ..Metabolomics: metabolomics_differential_abundance
 using ..Proteomics: MassSpecExperiment, align_samples, detect_peaks
@@ -673,8 +673,8 @@ end
 
 Compatibility wrapper that returns the gene-count matrix from `tximport`.
 """
-function tximport_counts(files::Vector{String}, tx2gene; kwargs...)
-    result = tximport(files, :salmon, tx2gene; kwargs...)
+function tximport_counts(files::Vector{String}, tx2gene; type::Symbol=:salmon, kwargs...)
+    result = tximport(files; type=type, tx2gene=tx2gene, kwargs...)
     return result.gene_counts
 end
 

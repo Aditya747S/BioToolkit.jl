@@ -174,9 +174,13 @@ using DataFrames
         @test frip >= 0.0
         @test frip <= 1.0
 
-        bias_result = BioToolkit.insertion_bias_correction(atac_exp)
+        # Tn5 bias now requires a genome (context scoring is real); provide a
+        # synthetic one covering all fragment coordinates.
+        test_genome = Dict("chr1" => "ACGT"^max(100, 8), "chr2" => "ACGT"^max(100, 8))
+        bias_result = BioToolkit.insertion_bias_correction(atac_exp; genome=test_genome)
         @test haskey(bias_result, :correction_factors)
         @test bias_result.total_insertions > 0
+        @test_throws ArgumentError BioToolkit.insertion_bias_correction(atac_exp)  # no genome: honest error
 
         atac_peaks = BioToolkit.atac_peak_calling(atac_exp; pvalue_threshold=1.0, min_depth=1)
         @test atac_peaks isa BioToolkit.PeakSet
@@ -190,4 +194,77 @@ using DataFrames
         @test 0.0 <= qc_result.fraction_nucleosome_free <= 1.0
         @test 0.0 <= qc_result.fraction_mono_nucleosome <= 1.0
     end
+end
+# ==========================================================================
+# Session 3 corrections (2026-09-06): weighted local linear actually solves
+# the fit, Bismark context from sequence, Tn5 motif scoring, deterministic
+# coaccessibility, Chisq(2) methylation LRT.
+# Evidence: plan/audit_notes.md wave 6; plan/correction_plan.md items 33-37.
+# ==========================================================================
+using Test
+using Random
+
+@testset "Session 3: weighted local linear solves the fit" begin
+    # y = 2x + 1 line; the fitted value at x=5 must be ~11 (was returning
+    # design-matrix element [1] before, i.e. sqrt(w1) garbage)
+    xs = Float64[1, 2, 3, 4, 5, 6, 7]
+    ys = 2 .* xs .+ 1
+    w = ones(7)
+    @test isapprox(BioToolkit.Epigenetics._weighted_local_linear(xs, ys, 5.0, w), 11.0; atol=1e-8)
+    # weighted: extra weight on a point pulls the fit toward it
+    w2 = Float64[1, 1, 1, 1, 100, 1, 1]
+    @test isapprox(BioToolkit.Epigenetics._weighted_local_linear(xs, ys, 5.0, w2), 11.0; atol=1e-8)
+    # noisy data: lowess fit now tracks the trend instead of returning garbage
+    Random.seed!(1)
+    xs2 = collect(1.0:50.0)
+    ys2 = 3 .* xs2 .+ 5 .+ randn(50)
+    fitted = BioToolkit.Epigenetics._robust_lowess(xs2, ys2; span=0.3)
+    @test length(fitted) == 50
+    @test fitted[end] > fitted[1]                      # increasing trend recovered
+    @test abs((fitted[end] - fitted[1]) / (xs2[end] - xs2[1]) - 3) < 1.0   # slope ≈ 3
+end
+
+@testset "Session 3: Bismark context from genome" begin
+    # genome: chr1 = "ACGT..." — C at position 2 is followed by G → CpG;
+    # C at position 6 (A C G T ...) also CpG. Build a sequence with all three.
+    #   pos 1: A, 2: C, 3: G, 4: T, 5: A, 6: C, 7: C, 8: G, 9: T, 10: T
+    #   C at 2 → next G → CpG; C at 6 → next C (not G), then G → CHG;
+    #   C at 7 → next G → CpG. Hmm, craft explicitly instead:
+    seq = "ACGTA CCG T"  # replace whitespace
+    genome = Dict("chr1" => replace(seq, " " => ""))
+    # positions: 1 A, 2 C(next G → CpG), 3 G, 4 T, 5 A, 6 C(next C, then G → CHG), 7 C(next G → CpG), 8 G, 9 T, 10 T
+    lines = ["chr1\t2\t2\t50.0\t2\t2",
+             "chr1\t6\t6\t50.0\t1\t1",
+             "chr1\t7\t7\t50.0\t3\t0"]
+    parsed = BioToolkit.parse_bismark_coverage(lines; genome=genome)
+    ctx = Dict{String,Int}(count for (count, c) in zip(parsed.calls.context, parsed.calls.context) if false)  # placeholder
+    ctx_map = Dict(parsed.calls.start[i] => parsed.calls.context[i] for i in 1:nrow(parsed.calls))
+    @test ctx_map[2] == "CpG"
+    @test ctx_map[6] == "CHG"
+    @test ctx_map[7] == "CpG"
+    # without genome: context is "unknown" (parity fabrication removed)
+    parsed_nog = BioToolkit.parse_bismark_coverage(lines)
+    @test all(==("unknown"), parsed_nog.calls.context)
+end
+
+@testset "Session 3: coaccessibility deterministic top-K" begin
+    Random.seed!(2)
+    n_peaks = 30
+    n_cells = 50
+    # Peak 1 and 2 strongly co-open; peak 30 anti-correlated with 1
+    base = randn(n_cells)
+    open_mat = rand(0:1, n_peaks, n_cells)
+    open_mat[1, :] .= base .> 0
+    open_mat[2, :] .= base .> 0
+    open_mat[30, :] .= base .< 0
+    base_sce = BioToolkit.SingleCellExperiment(spzeros(Int, n_peaks, n_cells),
+                                               ["gene$i" for i in 1:n_peaks], ["cell$i" for i in 1:n_cells])
+    chromatin = BioToolkit.SingleCellChromatinExperiment(base_sce, sparse(open_mat),
+                                                         ["peak$i" for i in 1:n_peaks],
+                                                         Dict{String,Matrix{Float64}}(), Dict{String,Any}())
+    edges = BioToolkit.calculate_coaccessibility(chromatin; min_correlation=0.5, max_pairs=5)
+    @test length(edges) <= 5
+    # the (1,2) edge must be present and be the strongest
+    @test any(e -> (e.peak1 == "peak1" && e.peak2 == "peak2"), edges)
+    @test issorted([abs(e.correlation) for e in edges]; rev=true)
 end

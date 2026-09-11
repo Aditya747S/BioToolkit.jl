@@ -916,7 +916,7 @@ function _compute_rsem_gene_level(files::Vector{String};
                             String[], nothing, nothing, diag,
                             provenance_record("TxImportResult", "TxImport/rsem-gene-level";
                                               parameters=(type="rsem", tx_in=false, gene_count=n_genes)))
-    return provenance_result!(ctx, result, "tximport"; parents=String[];
+    return provenance_result!(ctx, result, "tximport"; parents=String[],
                               parameters=(type="rsem", tx_in=false))
 end
 
@@ -1149,7 +1149,7 @@ function tximport(files::Vector{String};
             "samples"    => sample_list,
             "counts_from_abundance" => string(counts_from_abundance),
             "file_checksums" => file_checksums)
-        return provenance_result!(ctx, result, "tximport"; parents=String[];
+        return provenance_result!(ctx, result, "tximport"; parents=String[],
                                   parameters=(type=string(type), tx_out=true, sparse=true,
                                               counts_from_abundance=string(counts_from_abundance)))
     end
@@ -1303,7 +1303,7 @@ function tximport(files::Vector{String};
                                                 ignore_tx_version=ignore_tx_version,
                                                 ignore_after_bar=ignore_after_bar,
                                                 var_reduce=var_reduce)))
-        return provenance_result!(ctx, result, "tximport"; parents=String[];
+        return provenance_result!(ctx, result, "tximport"; parents=String[],
                                   parameters=(type=string(type), tx_out=true,
                                               counts_from_abundance=string(counts_from_abundance)))
     end
@@ -1363,7 +1363,7 @@ function tximport(files::Vector{String};
                                             ignore_tx_version=ignore_tx_version,
                                             ignore_after_bar=ignore_after_bar,
                                             var_reduce=var_reduce)))
-    return provenance_result!(ctx, result, "tximport"; parents=String[];
+    return provenance_result!(ctx, result, "tximport"; parents=String[],
                               parameters=(type=string(type),
                                           counts_from_abundance=string(counts_from_abundance)))
 end

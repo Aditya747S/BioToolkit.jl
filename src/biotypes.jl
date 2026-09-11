@@ -299,7 +299,13 @@ struct BitPackedVector{Bits} <: AbstractVector{UInt8}
     chunks::Vector{UInt64}
     len::Int
 
-    function BitPackedVector{2}(bytes::AbstractVector{UInt8})
+    function BitPackedVector{2}(bytes::AbstractVector{UInt8}; validate::Bool=true)
+        if validate
+            for (i, byte) in enumerate(bytes)
+                byte in (UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T')) ||
+                    throw(ArgumentError("BitPackedVector{2} stores only A/C/G/T; got '$(Char(byte))' at position $i — use BioSequence{DNAAlphabet, Vector{UInt8}} for ambiguity codes and gaps"))
+            end
+        end
         n = length(bytes)
         num_chunks = (n + 31) ÷ 32
         chunks = zeros(UInt64, num_chunks)
@@ -372,15 +378,17 @@ const PackedDNASeq = BioSequence{DNAAlphabet, BitPackedVector{2}}
 function PackedDNASeq(s::AbstractString; validate::Bool=true)
     bytes = Vector{UInt8}(undef, ncodeunits(s))
     @inbounds for (i, byte) in enumerate(codeunits(s))
-        bytes[i] = byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte)
+        byte_upper = byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte)
+        # U is accepted in a DNA context and stored explicitly as T.
+        bytes[i] = byte_upper == UInt8('U') ? UInt8('T') : byte_upper
     end
     if validate
         for b in bytes
-            b in (UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T'), UInt8('U')) ||
-                throw(ArgumentError("PackedDNASeq only supports A/C/G/T/U; got '$(Char(b))' — use BioSequence{DNAAlphabet} for ambiguity codes or gaps"))
+            b in (UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T')) ||
+                throw(ArgumentError("PackedDNASeq only supports A/C/G/T (U is stored as T); got '$(Char(b))' — use BioSequence{DNAAlphabet} for ambiguity codes or gaps"))
         end
     end
-    packed = BitPackedVector{2}(bytes)
+    packed = BitPackedVector{2}(bytes; validate=false)
     return BioSequence{DNAAlphabet}(packed; validate=false)
 end
 

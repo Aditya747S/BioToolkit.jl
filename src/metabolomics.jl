@@ -1,6 +1,7 @@
 module Metabolomics
 
 using DataFrames
+using SpecialFunctions: loggamma, lgamma
 using Statistics
 using LinearAlgebra
 using Random
@@ -299,22 +300,29 @@ end
 # Adduct annotation
 # ---------------------------------------------------------------------------
 
-# Common ESI adducts and their mass shifts (positive mode)
+# Common ESI adducts. Each entry maps the neutral monoisotopic mass M to the
+# observed m/z, so charge states and dimers are exact:
+#   [M+H]+   -> M + 1.007276          (proton mass)
+#   [M+2H]2+ -> (M + 2·1.007276) / 2
+#   [2M+H]+  -> 2M + 1.007276
+# The previous tables stored constant shifts, which put doubly charged and
+# dimer annotations off by ~M/2 and ~M respectively.
+const _PROTON = 1.007276
 const _ADDUCT_POS = Dict(
-    "[M+H]+"       =>   1.007276,
-    "[M+Na]+"      =>  22.989218,
-    "[M+K]+"       =>  38.963158,
-    "[M+NH4]+"     =>  18.034164,
-    "[M+2H]2+"     =>  (1.007276 * 2) / 2,   # doubly charged
-    "[M+H-H2O]+"   =>  1.007276 - 18.010565,
-    "[2M+H]+"      =>  1.007276,              # dimer (treated as same shift)
+    "[M+H]+"       => (M -> M + 1.007276),
+    "[M+Na]+"      => (M -> M + 22.989218),
+    "[M+K]+"       => (M -> M + 38.963158),
+    "[M+NH4]+"     => (M -> M + 18.034164),
+    "[M+2H]2+"     => (M -> (M + 2 * _PROTON) / 2),
+    "[M+H-H2O]+"   => (M -> M + _PROTON - 18.010565),
+    "[2M+H]+"      => (M -> 2 * M + _PROTON),
 )
 const _ADDUCT_NEG = Dict(
-    "[M-H]-"       =>  -1.007276,
-    "[M+Cl]-"      =>  34.969402,
-    "[M+FA-H]-"    =>  44.997655 - 1.007276,
-    "[M-2H]2-"     =>  (-1.007276 * 2) / 2,
-    "[M+Br]-"      =>  78.918885)
+    "[M-H]-"       => (M -> M - 1.007276),
+    "[M+Cl]-"      => (M -> M + 34.969402),
+    "[M+FA-H]-"    => (M -> M + 44.997655 - _PROTON),
+    "[M-2H]2-"     => (M -> (M - 2 * _PROTON) / 2),
+    "[M+Br]-"      => (M -> M + 78.918885))
 
 """
     annotate_adducts(observed_mzs, metabolite_db; ppm_tol=10.0, mode=:positive)
@@ -343,8 +351,9 @@ function annotate_adducts(
             kegg  = String(get(row, :kegg_id, ""))
             klass = String(get(row, :class, ""))
 
-            for (adduct, delta) in adducts
-                theo_mz = mass + delta
+            for (adduct, transform) in adducts
+                theo_mz = transform(mass)
+                theo_mz > 0 || continue
                 delta_ppm = abs(obs_mz - theo_mz) / theo_mz * 1e6
                 if delta_ppm <= Float64(ppm_tol)
                     score = 1.0 - delta_ppm / Float64(ppm_tol)
@@ -420,11 +429,20 @@ function isotope_tracer_analysis(
         excess = frac_lab .- frac_unl
         clamp!(excess, -1.0, 1.0)
 
-        nc = n_carbons !== nothing ? Int(n_carbons[i]) : n_samples
-        # Mean enrichment = weighted sum of isotopologue fractions
-        iso_indices = 0:(length(frac_lab)-1)
-        mean_enr = sum(frac_lab .* Float64.(iso_indices)) / max(sum(iso_indices), 1)
-        excess_enr = mean_enr - nat_13c * nc
+        # Carbon number: taken from n_carbons when given; otherwise inferred
+        # as the number of isotopologue channels minus one (M+0 … M+n), which
+        # is the maximum detectable label — never the sample count (the
+        # previous default made enrichment depend on how many samples were
+        # measured).
+        nc = n_carbons !== nothing ? Int(n_carbons[i]) : length(frac_lab) - 1
+        nc >= 1 || throw(ArgumentError("feature $(metabolite_ids[i]): isotope envelope must have at least 2 channels (M+0 and M+1)"))
+        # Mean enrichment = Σ fraction(M+k) · k / n_carbons: the fraction of
+        # carbon atoms that are 13C (correct denominator is the carbon count;
+        # the previous sum(iso_indices) denominator deflated enrichment by
+        # ~n/2 and made it depend on the number of measured channels).
+        iso_indices = 0:(length(frac_lab) - 1)
+        mean_enr = sum(frac_lab .* Float64.(iso_indices)) / nc
+        excess_enr = mean_enr - nat_13c
 
         push!(traces, IsotopeTrace(
             String(metabolite_ids[i]),
@@ -510,27 +528,44 @@ function metabolite_pathway_enrichment(
     return _register_metabolomics_result!(_ctx, result, "metabolite_pathway_enrichment"; parents=provenance_parent_ids(hit_metabolites), parameters=(hit_count=length(hit_metabolites), pathway_count=nrow(pathway_db), significant_count=count(r -> r.pvalue < 0.05, results)))
 end
 
+# One-tailed Fisher's exact test for overrepresentation: returns the
+# hypergeometric TAIL P(X >= a), where X counts pathway hits among the query
+# (table: a = hits, a+b = pathway size, a+c = query size, n = background).
+# The previous implementation returned the point probability P(X = a),
+# understating p-values for every enriched pathway.
 function _hypergeometric_pvalue(a::Int, b::Int, c::Int, d::Int)
-    # One-tailed Fisher's exact test (overrepresentation)
     n = a + b + c + d
     n <= 0 && return 1.0
-    # Log-hypergeometric P(X >= a)
-    function log_choose(n, k)
-        k < 0 || k > n && return -Inf
-        k == 0 || k == n && return 0.0
-        k = min(k, n - k)
+    K = a + b          # pathway (success) size
+    draws = a + c      # query size
+    (K <= 0 || draws <= 0 || a < 0) && return 1.0
+
+    function log_choose(m, k)
+        k < 0 || k > m && return -Inf
+        k == 0 || k == m && return 0.0
+        k = min(k, m - k)
         s = 0.0
         for i in 0:(k-1)
-            s += log(n - i) - log(i + 1)
+            s += log(m - i) - log(i + 1)
         end
         return s
     end
 
-    lc_ab   = log_choose(a + b, a)
-    lc_cd   = log_choose(c + d, c)
-    lc_n    = log_choose(n, a + c)
-    log_p   = lc_ab + lc_cd - lc_n
-    return min(exp(log_p), 1.0)
+    lc_n = log_choose(n, draws)
+    upper = min(K, draws)
+    # Sum the log pmf over the tail i = a .. upper with log-sum-exp for
+    # numerical stability; the pmf at i is C(K,i)·C(n-K, draws-i)/C(n, draws).
+    log_probs = Float64[]
+    for i in a:upper
+        (i < 0 || i > K) && continue
+        (draws - i < 0 || draws - i > n - K) && continue
+        lp = log_choose(K, i) + log_choose(n - K, draws - i) - lc_n
+        push!(log_probs, lp)
+    end
+    isempty(log_probs) && return 1.0
+    m = maximum(log_probs)
+    m == -Inf && return 1.0
+    return clamp(exp(m + log(sum(exp.(log_probs .- m)))), 0.0, 1.0)
 end
 
 # ---------------------------------------------------------------------------
@@ -853,14 +888,53 @@ function _normal_cdf(z::Float64)
     return 0.5 * (1 + erf(z / sqrt(2.0)))
 end
 
-function _ibeta(a::Float64, b::Float64, x::Float64; n_terms::Int=100)
-    # Continued fraction incomplete beta (Lentz method approximation)
+# Regularized incomplete beta I_x(a, b) via the Lentz continued fraction
+# (Numerical Recipes §6.4): the previous implementation returned only the
+# front factor bt/a, which is NOT I_x — every t-test p-value with df < 30
+# computed through it was wrong.
+function _ibeta(a::Float64, b::Float64, x::Float64; max_iter::Int=300)
+    (a <= 0 || b <= 0) && throw(ArgumentError("ibeta requires a, b > 0"))
     x = clamp(x, 0.0, 1.0)
     x == 0.0 && return 0.0
     x == 1.0 && return 1.0
-    log_beta = lgamma(a) + lgamma(b) - lgamma(a + b)
-    front = exp(a*log(x) + b*log(1-x) - log_beta) / a
-    return clamp(front, 0.0, 1.0)
+    bt = exp(loggamma(a + b) - lgamma(a) - lgamma(b) + a * log(x) + b * log1p(-x))
+    if x < (a + 1) / (a + b + 2)
+        return clamp(bt * _betacf(a, b, x; max_iter=max_iter) / a, 0.0, 1.0)
+    else
+        return clamp(1.0 - bt * _betacf(b, a, 1.0 - x; max_iter=max_iter) / b, 0.0, 1.0)
+    end
+end
+
+# Modified Lentz continued fraction for the incomplete beta.
+function _betacf(a::Float64, b::Float64, x::Float64; max_iter::Int=300)
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    abs(d) < 1e-300 && (d = 1e-300)
+    d = 1.0 / d
+    h = d
+    for m in 1:max_iter
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        abs(d) < 1e-300 && (d = 1e-300)
+        c = 1.0 + aa / c
+        abs(c) < 1e-300 && (c = 1e-300)
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        abs(d) < 1e-300 && (d = 1e-300)
+        c = 1.0 + aa / c
+        abs(c) < 1e-300 && (c = 1e-300)
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        abs(delta - 1.0) < 3e-16 && break
+    end
+    return h
 end
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1133,9 @@ Returns a corrected `Matrix{Float64}`.
 function batch_effect_correction_metabolomics(
     matrix::AbstractMatrix{<:Real},
     batches::AbstractVector;
-    method::Symbol=:combat_mean)
+    method::Symbol=:combat_mean,
+    prov_ctx=nothing,
+    _ctx=active_provenance_context(prov_ctx))
     X = Matrix{Float64}(matrix)
     n_features, n_samples = size(X)
     length(batches) == n_samples || throw(DimensionMismatch("batches must match columns"))

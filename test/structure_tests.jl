@@ -504,3 +504,25 @@ END
         @test annotated.models[1].chains[1].residues[1].accessibility == 12.0
     end
 end
+
+# ==========================================================================
+# Session 2 corrections: disulfide_bonds no longer crashes (missing atom
+# loop), run_dssp/run_pdb2pqr have working provenance binding.
+# ==========================================================================
+@testset "Session 2: disulfide detection runs" begin
+    pdb_text = """
+HEADER    TEST
+ATOM      1  SG  CYS A   1      10.000  10.000  10.000  1.00 20.00           S
+ATOM      2  SG  CYS A   2      10.500  10.100  10.200  1.00 20.00           S
+ATOM      3  CA  GLY A   3      50.000  50.000  50.000  1.00 20.00           C
+END
+"""
+    mktempdir() do dir
+        p = joinpath(dir, "ssb.pdb")
+        write(p, pdb_text)
+        st = BioToolkit.read_pdb(p)
+        bonds = BioToolkit.disulfide_bonds(st)
+        @test length(bonds) == 1
+        @test bonds[1].left_seqnum == 1 && bonds[1].right_seqnum == 2
+    end
+end

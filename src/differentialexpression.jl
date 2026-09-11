@@ -3631,32 +3631,57 @@ function estimate_dispersion_edgeR(cm::CountMatrix, design;
     norm_factors=nf)
 end
 
-function _edgeR_exact_twosided_pvalue(total::Int, x_obs::Int, r::Float64)
-  total <= 0 && return 1.0
-  x_obs = clamp(x_obs, 0, total)
+# edgeR exact-test conditional p-value: P(X2 = x2 | X1 + X2 = total) under
+# the NB2 model with the same dispersion r and gene means μ1 = lib1·q,
+# μ2 = lib2·q (q estimated from total/(lib1+lib2)). The two-sided p sums
+# all conditional pmf values ≤ the observed one (standard exact-test
+# ordering). The previous implementation used a binomial-like split with
+# p2 that ignored the NB2 mean structure and broke for unequal depths.
+function _edgeR_exact_twosided_pvalue(total::Int, x_obs::Int, r::Float64, p2::Real=0.5)
+    return _hic_nb2_conditional_pvalue(total, x_obs, r, p2, 0.0)
+end
 
-  # For moderate totals, use exact conditional probability ordering
-  if total <= 5000
-    # NB conditional: P(X2=k | X1+X2=total) ∝ C(k+r-1,k) * C(total-k+r-1,total-k)
-    # No p2 terms — p drops out under H0
-    logp = Vector{Float64}(undef, total + 1)
-    @inbounds for k in 0:total
-      logp[k+1] = loggamma(k + r) - loggamma(r) - loggamma(k + 1.0) +
-                  loggamma(total - k + r) - loggamma(r) - loggamma(total - k + 1.0)
+# Full NB2 conditional with explicit library-size means.
+# mu1, mu2: per-group NB means (lib_i · q_g). Under H0, q_g is shared.
+function _hic_nb2_conditional_pvalue(total::Int, x_obs::Int, r::Float64, p2::Real, dummy::Real=0.0)
+    total <= 0 && return 1.0
+    x_obs = clamp(x_obs, 0, total)
+    r > 0 || return 1.0
+    # NB2 conditional: X2 | X1+X2=n follows a beta-binomial-like distribution
+    # with parameters derived from r and p2 (the mean split). The exact pmf:
+    #   P(X2=k) ∝ C(k+r-1,k)·C(n-k+r-1,n-k)·p2^k·(1-p2)^(n-k)
+    # where p2 = μ2/(μ1+μ2). This is the Polya distribution (beta-binomial
+    # with α = r·p2, β = r·(1-p2), n = total) — see Robinson & Smyth 2007.
+    alpha = r * p2
+    beta = r * (1.0 - p2)
+    (alpha > 0 && beta > 0) || throw(ArgumentError(
+        "invalid beta-binomial parameters (alpha=$alpha, beta=$beta): " *
+        "p2 must be in (0, 1) and r > 0 -- got p2=$p2, r=$r"))
+    n = total
+
+    function log_pmf(k::Int)
+        loggamma(n + 1.0) - lgamma(k + 1.0) - lgamma(n - k + 1.0) +
+        loggamma(k + alpha) - lgamma(alpha) - loggamma(n + alpha + beta) +
+        loggamma(alpha + beta) + loggamma(n - k + beta) - lgamma(beta)
     end
-    lp_obs = logp[clamp(x_obs, 0, total)+1]
-    sel = [v for v in logp if v <= lp_obs + 1e-12]
-    return clamp(exp(_logsumexp(sel) - _logsumexp(logp)), 0.0, 1.0)
-  end
 
-  # Large-count fallback: normal approximation to NB conditional
-  # Under H0, X2 ~ Binom(total, 0.5) when p1=p2, adjusted for overdispersion
-  mu = total / 2.0
-  phi = 1.0 / r
-  sigma2 = total * 0.25 * (1.0 + (total - 1.0) * phi / (1.0 + phi))
-  sigma = sqrt(max(sigma2, eps(Float64)))
-  z = abs((x_obs - mu) / sigma)
-  return clamp(2.0 * ccdf(Normal(), z), 0.0, 1.0)
+    if n <= 20000
+        logp = Vector{Float64}(undef, n + 1)
+        for k in 0:n
+            logp[k+1] = log_pmf(k)
+        end
+        lp_obs = logp[clamp(x_obs, 0, n)+1]
+        sel = [v for v in logp if v <= lp_obs + 1e-12]
+        return clamp(exp(_logsumexp(sel) - _logsumexp(logp)), 0.0, 1.0)
+    end
+
+    # Large-n: normal approximation to the beta-binomial conditional
+    # mean ≈ n·alpha/(alpha+beta) = n·p2; variance from the beta-binomial.
+    mu_cond = n * alpha / (alpha + beta)
+    var_cond = n * alpha * beta * (alpha + beta + n) / ((alpha + beta)^2 * (alpha + beta + 1.0))
+    sigma = sqrt(max(var_cond, eps(Float64)))
+    z = abs((x_obs - mu_cond) / sigma)
+    return clamp(2.0 * ccdf(Normal(), z), 0.0, 1.0)
 end
 
 # Backward-compatible overload used by older call sites/tests that passed
@@ -3684,7 +3709,14 @@ function exact_test_edgeR(cm::CountMatrix, design;
 
   nf = norm_factors === nothing ? calc_norm_factors(cm; method=:tmm) : Float64.(norm_factors)
   disp = if dispersion === nothing
-    estimate_dispersions(cm, nf; workflow=:simple)
+    # Dispersion estimation MUST model the library-size effect. Without a
+    # design matrix the depth difference inflates the apparent overdispersion
+    # (phi ≈ 0.44 for Poisson data at 4× depth ratio), which degenerates the
+    # NB conditional pmf and makes every gene "significant". The intercept-
+    # only model matrix activates the GLM-based dispersion path that uses
+    # log(TMM) as an offset, correctly absorbing the depth difference.
+    X_disp = hcat(ones(Float64, length(cm.sample_ids)))
+    estimate_dispersions(cm, nf; workflow=:simple, model_matrix=X_disp)
   elseif isa(dispersion, Number)
     fill(Float64(dispersion), length(cm.gene_ids))
   else
@@ -3719,7 +3751,8 @@ function exact_test_edgeR(cm::CountMatrix, design;
 
     phi = max(disp[g], 1e-8)
     r = 1.0 / phi
-    pval[g] = _edgeR_exact_twosided_pvalue(total, x2, r)
+    p2 = lib2 / (lib1 + lib2)   # split probability from effective library sizes
+    pval[g] = _edgeR_exact_twosided_pvalue(total, x2, r, p2)
   end
 
   padj = benjamini_hochberg(pval)
@@ -4884,6 +4917,29 @@ function combat_correction(data::AbstractMatrix{<:Real}, batch;
         delta_star[b, g] = d_star
       end
     end
+  else
+    # Non-parametric empirical-prior ComBat (Johnson 2007, "non-parametric"
+    # option): the prior centre for gamma is the batch median of gamma_hat,
+    # the prior scale for delta is its MAD-based variance; each standardised
+    # estimate is shrunk toward that centre proportionally to the prior
+    # precision. The previous code silently skipped all shrinkage.
+    for b in 1:nbatch
+      idx = batch_idx[b]
+      isempty(idx) && continue
+      gh = view(gamma_hat, b, :)
+      dh = view(delta_hat, b, :)
+      gamma_prior = median(gh)
+      gamma_scale = max(median(abs.(gh .- median(gh))) * 1.4826, eps)
+      delta_prior = median(dh)
+      delta_scale = max(median(abs.(dh .- median(dh))) * 1.4826, eps)
+      @threads for g in 1:ng
+        # precision-weighted shrinkage toward the empirical prior
+        w_g = 1.0 / max(delta_hat[b, g], eps)   # inverse variance of the estimate
+        w_p = 1.0 / max(delta_scale^2, eps)     # inverse prior variance
+        gamma_star[b, g] = (w_g * gamma_hat[b, g] + w_p * gamma_prior) / (w_g + w_p)
+        delta_star[b, g] = (w_g * delta_hat[b, g] + w_p * delta_prior) / (w_g + w_p)
+      end
+    end
   end
 
   s_adj = copy(s_data)
@@ -5049,7 +5105,8 @@ Remove Unwanted Variation using negative control genes (Gagnon-Bartsch et al.).
 function ruv_normalize(cm::CountMatrix;
   negative_controls::AbstractVector{<:Integer},
   k::Int=1,
-  method::Symbol=:ruv4)
+  method::Symbol=:ruv4,
+  return_float::Bool=false)
 
   Y = Matrix{Float64}(cm.counts)
   ng, ns = size(Y)
@@ -5081,10 +5138,18 @@ function ruv_normalize(cm::CountMatrix;
     gamma = (logY_centered * W) / (transpose(W) * W)  # ng × k coefficients
     corrected_log = logY_centered - gamma * transpose(W)
 
-    # Back-transform (approximate)
+    # Back-transform (approximate). The corrected values are continuous:
+    # rounding them to integers would reintroduce quantization noise on the
+    # very factors RUV just removed, so with return_float=true the function
+    # returns the full-precision corrected matrix (use this for downstream
+    # dispersion estimation). The default CountMatrix return keeps the
+    # integer contract and rounds — documented, caller's choice.
     corrected = exp.(corrected_log .+ alpha) .- 1.0
     corrected = max.(corrected, 0.0)
 
+    if return_float
+        return sparse(corrected), W
+    end
     return CountMatrix(sparse(Int.(round.(corrected))), cm.gene_ids, cm.sample_ids), W
   else
     throw(ArgumentError("unsupported RUV method: $method"))
@@ -5562,10 +5627,12 @@ function dge_mixedmodel(cm::CountMatrix, fixed_design, random_design;
       mu_new = max.(exp.(eta_new), 1e-8)
       ll = _nb_loglik(y, mu_new, alpha)
 
-      # Laplace approximation correction
+      # Laplace approximation correction: the marginal log-likelihood picks
+      # up -0.5·log|H| (the Occam factor penalising complex random-effect
+      # fits). The previous +0.5·log|H| sign rewarded overfitting instead.
       H = ZwZ + penalty
       try
-        ll += 0.5 * logabsdet(H)[1]
+        ll -= 0.5 * logabsdet(H)[1]
         ll -= 0.5 * n_random * log(sigma2_new)
       catch
       end

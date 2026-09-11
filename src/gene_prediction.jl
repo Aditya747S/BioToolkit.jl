@@ -329,16 +329,18 @@ function detect_splice_sites(seq::BioSequence{DNAAlphabet}; min_score::Real=0.5,
     return _register_gene_prediction_result!(_ctx, sites, "detect_splice_sites"; parents=provenance_parent_ids(seq), parameters=(min_score=Float64(min_score), site_count=length(sites)))
 end
 
-function _score_site(s::BioSequence{DNAAlphabet}, pos::Int, pwm::Dict, n::Int)
+# Works on plain strings (the original BioSequence method returned tuple
+# elements from BioSequence getindex, so the String call path crashed).
+function _score_site(s::AbstractString, pos::Int, pwm::Dict, n::Int)
     score     = 0.0
     max_score = 0.0
-    for (offset, _) in pwm
+    for (key, _) in pwm
+        offset = key[1]        # pwm keys are (offset, base) pairs
         abs_pos = pos + offset
         1 <= abs_pos <= n || continue
-        c = s[abs_pos]
-        key = (offset, c)
-        score     += get(pwm, key, 0.0)
-        max_score += maximum(v for (k,v) in pwm if k[1] == offset; init=0.01)
+        c = uppercase(s[abs_pos])
+        score     += get(pwm, (offset, c), 0.0)
+        max_score += maximum(v for (k, v) in pwm if k[1] == offset; init=0.01)
     end
     return score / max(max_score, eps(Float64))
 end

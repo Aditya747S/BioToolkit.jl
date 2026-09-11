@@ -431,7 +431,7 @@ function sparse_pls_da(X::AbstractMatrix{<:Real}, y::AbstractVector; n_component
   return _register_proteomics_result!(_ctx, result, "sparse_pls_da"; parents=provenance_parent_ids(X), parameters=(component_count=n_components, sparsity=float(sparsity), feature_count=size(X, 2)))
 end
 
-function stream_mass_spec(producer::Function, consumer::Function; chunk_size::Integer=128)
+function stream_mass_spec(producer::Function, consumer::Function; chunk_size::Integer=128, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
   channel = Channel{Any}(chunk_size)
   task = @async begin
     for item in producer()

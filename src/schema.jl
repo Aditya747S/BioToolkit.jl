@@ -108,7 +108,14 @@ end
 function VcfDocument(records::AbstractVector{<:VariantTextRecord}; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
     metadata = Dict{Symbol,Any}()
     ensure_provenance_id!(metadata)
-    result = VcfDocument(VcfHeader(), Vector{VariantTextRecord}(records), metadata)
+    # Derive the sample columns from the records themselves (the previous
+    # constructor always built an empty header, so the reported sample count
+    # was 0 even for records carrying sample columns).
+    header = VcfHeader()
+    if !isempty(records) && hasproperty(first(records), :samples) && !isempty(first(records).samples)
+        header = VcfHeader(String[], header.columns, String.(first(records).samples))
+    end
+    result = VcfDocument(header, Vector{VariantTextRecord}(records), metadata)
     return _register_schema_result!(_ctx, result, "VcfDocument"; parents=provenance_parent_ids(records), parameters=(record_count=length(records), sample_count=length(result.header.sample_names)))
 end
 

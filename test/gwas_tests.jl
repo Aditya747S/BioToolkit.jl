@@ -520,3 +520,209 @@ end
         @test all(isfinite, transformed_int)
     end
 end
+
+using Random
+
+using Distributions
+
+@testset "Session 1: PLINK .bed follows the published bit-pair spec" begin
+    # Spec codes: 00=hom(A1)=0, 01=het=1, 10=hom(A2)=2, 11=missing.
+    byte = UInt8(0xe4)  # lanes: 00 01 10 11
+    @test BioToolkit.GWAS._decode_plink_code(byte & 0x03) == 0.0
+    @test BioToolkit.GWAS._decode_plink_code((byte >> 2) & 0x03) == 1.0
+    @test BioToolkit.GWAS._decode_plink_code((byte >> 4) & 0x03) == 2.0
+    @test isnan(BioToolkit.GWAS._decode_plink_code((byte >> 6) & 0x03))
+    @test BioToolkit.GWAS.PLINK_DECODE_LUT[1, Int(byte) + 1] == 0.0
+    @test BioToolkit.GWAS.PLINK_DECODE_LUT[2, Int(byte) + 1] == 1.0
+    @test BioToolkit.GWAS.PLINK_DECODE_LUT[3, Int(byte) + 1] == 2.0
+    @test isnan(BioToolkit.GWAS.PLINK_DECODE_LUT[4, Int(byte) + 1])
+
+    @test BioToolkit.GWAS._plink_code(0.0) == 0x00
+    @test BioToolkit.GWAS._plink_code(1.0) == 0x01
+    @test BioToolkit.GWAS._plink_code(2.0) == 0x02
+    @test BioToolkit.GWAS._plink_code(missing) == 0x03
+    @test BioToolkit.GWAS._plink_code(NaN) == 0x03
+
+    # Byte-exact encode of a known column: dosages [0,1,2,0] -> 0x24.
+    payload = BioToolkit.GWAS._encode_bed(reshape(Float64[0, 1, 2, 0], 4, 1))
+    @test payload[1:3] == UInt8[0x6c, 0x1b, 0x01]
+    @test payload[4] == 0x24
+
+    # The shipped fixture must itself be spec-encoded (it was regenerated when
+    # the decoder was fixed: het<->missing were swapped before).
+    fixture_prefix = joinpath(@__DIR__, "..", "Examples", "fixtures", "plink_small", "plink_small")
+    @test read(fixture_prefix * ".bed") == vcat(UInt8[0x6c, 0x1b, 0x01], UInt8[0x24, 0x45, 0x46])
+
+    # Missing calls survive a write/read round trip.
+    genotypes_fixture = BioToolkit.read_plink(fixture_prefix)
+    mktempdir() do dir
+        prefix = joinpath(dir, "missing_ok")
+        dosages = [0.0 1.0; NaN 2.0; 1.0 NaN]
+        BioToolkit.write_plink(prefix, dosages, first(genotypes_fixture.bim, 2), first(genotypes_fixture.fam, 3))
+        @test isequal(Matrix(BioToolkit.read_plink(prefix)), dosages)
+    end
+end
+
+@testset "Session 1: BGEN first-variant offset per spec" begin
+    fixture_prefix = joinpath(@__DIR__, "..", "Examples", "fixtures", "plink_small", "plink_small")
+    genotypes_fixture = BioToolkit.read_plink(fixture_prefix)
+    mktempdir() do dir
+        path = joinpath(dir, "out.bgen")
+        BioToolkit.write_bgen(path, genotypes_fixture)
+        bytes = read(path)
+        offset = UInt32(bytes[1]) | UInt32(bytes[2]) << 8 | UInt32(bytes[3]) << 16 | UInt32(bytes[4]) << 24
+        # The sample-block length field includes its own 4 bytes per the BGEN
+        # spec, so the offset is 24 + sample_block_length (previously 4 too far).
+        sample_ids = genotypes_fixture.fam.sample_id
+        @test offset == 24 + (4 + sum(2 + ncodeunits(id) for id in sample_ids))
+        reader = BioToolkit.read_bgen(path)
+        @test size(reader) == (4, 3)
+        @test Matrix(reader) == Matrix(genotypes_fixture)
+    end
+end
+
+@testset "Session 1: fine_map_susie implements IBSS/SER" begin
+    Random.seed!(2026)
+    p = 20
+    causal = 12
+
+    # Identity LD, one strong causal SNP. Signal strength: mean(z^2)-1 = 64/20
+    # must be substantial for a single-effect SER to concentrate (the IBSS
+    # prior variance is fit by the moment estimator Var(R*r) - 1).
+    z = randn(p)
+    z[causal] = 8.0
+    R = Matrix{Float64}(I, p, p)
+    res = BioToolkit.fine_map_susie(z, ones(p), R; n_effects=5, max_iter=50, tol=1e-6)
+    @test res isa BioToolkit.SuSiEResult
+    @test res.n_effects == 5
+    @test length(res.pip) == p
+    @test argmax(res.pip) == causal
+    @test res.pip[causal] > 0.9
+    @test res.credible_sets[1] == [causal]
+    @test length(res.credible_sets) == 5
+    @test res.heritability > 0.5
+    @test all(isfinite, res.posterior_mean)
+    @test all(>=(0.0), res.posterior_sd)
+
+    # Correlated block: the credible set must cover the LD block, not a point.
+    p2 = 50
+    block_lo, block_hi = 24, 26
+    z2 = randn(p2)
+    z2[block_lo:block_hi] .= 3.0
+    R2 = Matrix{Float64}(I, p2, p2)
+    for i in block_lo:block_hi, j in block_lo:block_hi
+        R2[i, j] = i == j ? 1.0 : 0.95
+    end
+    res2 = BioToolkit.fine_map_susie(z2, ones(p2), R2; n_effects=3)
+    @test block_lo <= argmax(res2.pip) <= block_hi
+    # With three near-identical tags the SER posterior concentrates on one
+    # tag SNP (standard SuSiE behaviour; separating tags requires purity
+    # filtering across effects, which single-credible-set runs do not do).
+    @test maximum(res2.pip[block_lo:block_hi]) > 0.4
+    @test all(i -> block_lo <= i <= block_hi, res2.credible_sets[1])
+
+    # max_iter/tol are respected (terminates; no silent discarding).
+    res3 = BioToolkit.fine_map_susie(z, ones(p), R; n_effects=2, max_iter=1, tol=1.0)
+    @test res3.n_effects == 2
+
+    @test_throws DimensionMismatch BioToolkit.fine_map_susie(z, ones(p), Matrix{Float64}(I, p - 1, p - 1))
+    @test_throws ArgumentError BioToolkit.fine_map_susie(z, -ones(p), R)
+end
+
+@testset "Session 1: calculate_ibd recovers IBD states" begin
+    Random.seed!(7)
+    m = 20000
+    maf = 0.2 .+ 0.6 .* rand(m)
+
+    # Two founders with two alleles each (Bernoulli(maf)), a child and a full
+    # sibling that each draw one allele from every founder, and an unrelated
+    # individual drawn from the population.
+    pa1 = rand(m) .< maf; pa2 = rand(m) .< maf      # founder A (row 1)
+    pb1 = rand(m) .< maf; pb2 = rand(m) .< maf      # founder B (not a row)
+    parent = Float64.(pa1) .+ Float64.(pa2)
+    child = Vector{Float64}(undef, m)
+    sib = Vector{Float64}(undef, m)
+    for k in 1:m
+        child[k] = (rand() < 0.5 ? pa1[k] : pa2[k]) + (rand() < 0.5 ? pb1[k] : pb2[k])
+        sib[k] = (rand() < 0.5 ? pa1[k] : pa2[k]) + (rand() < 0.5 ? pb1[k] : pb2[k])
+    end
+    unrelated = Float64.(rand(m) .< maf) .+ Float64.(rand(m) .< maf)
+
+    # Samples as rows (n x m): row 1 = parent A, 2 = child, 3 = sibling, 4 = unrelated.
+    G = Matrix{Float64}(undef, 4, m)
+    G[1, :] .= parent
+    G[2, :] .= child
+    G[3, :] .= sib
+    G[4, :] .= unrelated
+    res = BioToolkit.calculate_ibd(G)
+    @test res isa BioToolkit.IBDEstimate
+    # Loci monomorphic within the cohort (empirical MAF < min_maf) are excluded.
+    @test 0.8 * m <= res.n_snps_used <= m
+
+    # Parent-offspring: IBD1 = 1, IBD2 = 0, PI_HAT = 0.5.
+    @test res.z0[1, 2] < 0.05
+    @test res.z1[1, 2] > 0.9
+    @test res.z2[1, 2] < 0.1
+    @test 0.4 < res.pi_hat[1, 2] < 0.6
+
+    # Full siblings: Z0 = 0.25, Z1 = 0.5, Z2 = 0.25, PI_HAT = 0.5.
+    @test 0.15 < res.z0[2, 3] < 0.38
+    @test 0.35 < res.z1[2, 3] < 0.65
+    @test 0.10 < res.z2[2, 3] < 0.38
+    @test 0.35 < res.pi_hat[2, 3] < 0.65
+
+    # Unrelated: Z0 ~ 1, PI_HAT ~ 0.
+    @test res.z0[1, 4] > 0.8
+    @test abs(res.pi_hat[1, 4]) < 0.1
+
+    # Symmetry and diagonal conventions.
+    @test res.pi_hat[2, 1] == res.pi_hat[1, 2]
+    @test res.pi_hat[1, 1] == 1.0
+    @test res.z1[1, 1] == 1.0
+    @test res.z0[1, 1] == 0.0
+
+    # IBS matrix (kept under its honest name) sanity.
+    ibs = BioToolkit.calculate_ibs(G)
+    @test ibs[1, 1] == 1.0
+    @test 0.5 < ibs[1, 2] <= 1.0
+    @test ibs[1, 2] > ibs[1, 4]   # parent-offspring more similar than unrelated
+end
+
+@testset "Session 1: ldsc_genetic_correlation is LD-score regression" begin
+    Random.seed!(11)
+    m = 1200
+    snp_ids = ["rs$i" for i in 1:m]
+    causal = rand(m) .< 0.08
+    ld = 0.2 .+ 3.0 .* rand(m) .+ 10.0 .* causal
+
+    function _trait(z)
+        pvals = 2.0 .* ccdf.(Ref(Normal()), abs.(z))
+        BioToolkit.GWASResult(snp_ids, fill("1", m), collect(1:m), fill(("A", "G"), m), String[],
+                              z .* 0.05, fill(0.05, m), z, pvals, 1000, String[], "trait", "synthetic")
+    end
+
+    effects = 4.0 .* Float64.(causal)
+    z1 = effects .+ randn(m)
+    z2_pos = effects .+ randn(m)       # same causal signs -> positive rg
+    z2_neg = -effects .+ randn(m)      # opposite signs -> negative rg
+    z2_none = randn(m)                 # independent -> rg near 0
+
+    rg_pos, se_pos = BioToolkit.ldsc_genetic_correlation([_trait(z1), _trait(z2_pos)]; ld_scores=ld, n_blocks=20)
+    @test isfinite(rg_pos)
+    @test se_pos > 0
+    @test rg_pos > 0.15
+
+    rg_neg, _ = BioToolkit.ldsc_genetic_correlation([_trait(z1), _trait(z2_neg)]; ld_scores=ld, n_blocks=20)
+    @test rg_neg < -0.15
+
+    rg_none, _ = BioToolkit.ldsc_genetic_correlation([_trait(z1), _trait(z2_none)]; ld_scores=ld, n_blocks=20)
+    @test abs(rg_none) < abs(rg_pos)
+
+    # Dict-keyed LD scores give the same estimate.
+    rg_dict, _ = BioToolkit.ldsc_genetic_correlation([_trait(z1), _trait(z2_pos)];
+                                                     ld_scores=Dict(snp_ids[i] => ld[i] for i in 1:m), n_blocks=20)
+    @test isapprox(rg_dict, rg_pos; atol=1e-8)
+
+    # LD scores are now required (the old plain-cor(z1,z2) behaviour is gone).
+    @test_throws ArgumentError BioToolkit.ldsc_genetic_correlation([_trait(z1), _trait(z2_pos)])
+end

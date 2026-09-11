@@ -1,5 +1,6 @@
 using Test
 using BioToolkit
+using DataFrames
 
 @testset "Long-read genomics and SV calling" begin
     @testset "Read wrappers and minimizers" begin
@@ -124,4 +125,15 @@ using BioToolkit
         @test length(del_call.supporting_reads) >= 2
         @test del_call.genotype in ("0/1", "1/1")
     end
+end
+
+# ==========================================================================
+# Session 2 corrections: empty-input paths no longer crash (provenance
+# context now bound before the early-return branches).
+# ==========================================================================
+@testset "Session 2: longread empty inputs" begin
+    @test BioToolkit.read_n50(String[]) == 0
+    @test BioToolkit.overlap_layout_consensus(String[]) === nothing
+    empty_omnic = BioToolkit.omnic_contact_matrix(DataFrames.DataFrame(chrom1=String[], pos1=Int[], chrom2=String[], pos2=Int[]))
+    @test size(empty_omnic.matrix) == (0, 0)
 end

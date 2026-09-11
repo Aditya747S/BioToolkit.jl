@@ -797,6 +797,9 @@ end
 const _STANDARD_SUBSTITUTION_MATRIX_CACHE = let cache = Dict{String,SubstitutionMatrix}()
   for (matrix_name, matrix_spec) in _STANDARD_SUBSTITUTION_MATRIX_TEXT
     normalized_name = replace(uppercase(strip(matrix_name)), r"[\s._-]+" => "")
+    # SCHNEIDER is a 64x64 codon matrix: its alphabet symbols are codons, not
+    # single bytes, so it is parsed by _parse_codon_substitution_matrix below.
+    normalized_name == "SCHNEIDER" && continue
     try
       cache[normalized_name] = _parse_standard_substitution_matrix(matrix_spec; threaded=false)
     catch err

@@ -499,16 +499,21 @@ function gc_content(sequence::BioSequence{DNAAlphabet, BitPackedVector{2}})
     n = length(sequence)
     n == 0 && return 0.0
     v = sequence.data
+    # 2-bit codes: A=00, C=01, G=10, T=11. GC ⟺ the two bits of a lane differ,
+    # so XOR of the low and high bit lanes counts exactly C and G.
+    low_mask = 0x5555555555555555
     full_chunks = n >>> 5
     gc = 0
     @inbounds for i in 1:full_chunks
-        gc += count_ones(v.chunks[i] & 0x5555555555555555)
+        chunk = v.chunks[i]
+        gc += count_ones((chunk & low_mask) ⊻ ((chunk >> 1) & low_mask))
     end
     rem = n & 31
     if rem > 0
         last_chunk = v.chunks[end]
         mask = (UInt64(1) << (rem * 2)) - 1
-        gc += count_ones((last_chunk & mask) & 0x5555555555555555)
+        chunk = last_chunk & mask
+        gc += count_ones((chunk & low_mask) ⊻ ((chunk >> 1) & low_mask))
     end
     gc_val = gc / n
     _ctx = active_provenance_context()
@@ -530,7 +535,8 @@ also accepted and counted as thymine-like bases.
 `method=:basic` uses the longer-oligo approximation
 `64.9 + 41 * (G + C - 16.4) / N` where `N` is the number of canonical bases.
 """
-function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=:wallace) where {A <: BioAlphabet}
+function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=:wallace,
+                      na_conc::Real=0.05, ct::Real=2.5e-7, self_complementary::Bool=false) where {A <: BioAlphabet}
     isempty(sequence) && return 0.0
 
     a = 0
@@ -558,7 +564,11 @@ function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=
         end
     end
 
-    method === :wallace || method === :basic || throw(ArgumentError("unsupported melting temperature method: $method"))
+    method === :wallace || method === :basic || method === :nearest_neighbor ||
+        throw(ArgumentError("unsupported melting temperature method: $method"))
+    rna && method === :nearest_neighbor &&
+        throw(ArgumentError("RNA nearest-neighbor tables are not implemented; method=:nearest_neighbor requires DNA"))
+    method === :nearest_neighbor && return _melting_temp_nn(sequence; na_conc=na_conc, ct=ct, self_complementary=self_complementary)
 
     if method === :wallace
         return 2.0 * (a + t + u) + 4.0 * (g + c)
@@ -569,7 +579,73 @@ function melting_temp(sequence::BioSequence{A}; rna::Bool=false, method::Symbol=
     return 64.9 + 41.0 * ((g + c) - 16.4) / canonical_bases
 end
 
-melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=:wallace) = melting_temp(_sequence_to_dna(sequence); rna=rna, method=method)
+# SantaLucia (1998) unified nearest-neighbor parameters, ΔH (kcal/mol) and
+# ΔS (cal/(mol·K)) for the 10 Watson-Crick NN stacks, initiation, terminal
+# A/T penalty, and self-complementary symmetry correction.
+const _NN_DH = Dict{String,Float64}("AA" => -7.9, "AT" => -7.2, "TA" => -7.2, "CA" => -8.5,
+                                    "GT" => -8.4, "CT" => -7.8, "GA" => -8.2, "CG" => -10.6,
+                                    "GC" => -9.8, "GG" => -8.0)
+const _NN_DS = Dict{String,Float64}("AA" => -22.2, "AT" => -20.4, "TA" => -21.3, "CA" => -22.7,
+                                    "GT" => -22.4, "CT" => -21.0, "GA" => -22.2, "CG" => -27.2,
+                                    "GC" => -24.4, "GG" => -19.9)
+const _NN_INIT_DH = 0.2          # kcal/mol, initiation
+const _NN_INIT_DS = -5.7         # cal/(mol·K)
+const _NN_TERMINAL_AT_DH = 2.2   # kcal/mol, per terminal A/T
+const _NN_TERMINAL_AT_DS = 6.9   # cal/(mol·K), per terminal A/T
+const _NN_SYMMETRY_DH = 1.4      # kcal/mol, self-complementary correction
+const _NN_SYMMETRY_DS = 0.0
+
+"""
+    _melting_temp_nn(sequence; na_conc, ct, self_complementary)
+
+SantaLucia (1998) unified nearest-neighbor Tm for unambiguous DNA:
+`Tm = ΔH / (ΔS + R·ln(Ct/4)) - 273.15 + 16.6·log10([Na⁺])` with initiation,
+terminal A/T, and optional self-complementary symmetry terms.
+"""
+function _melting_temp_nn(sequence::BioSequence{A}; na_conc::Real=0.05, ct::Real=2.5e-7, self_complementary::Bool=false) where {A <: BioAlphabet}
+    na_conc > 0 || throw(ArgumentError("na_conc must be positive"))
+    ct > 0 || throw(ArgumentError("ct must be positive"))
+
+    n = length(sequence)
+    n == 0 && return 0.0
+    n == 1 && throw(ArgumentError("nearest_neighbor Tm requires at least 2 bases"))
+
+    # Canonical uppercase codes; reject anything that is not A/C/G/T so the
+    # NN stacks are always well defined.
+    codes = Vector{UInt8}(undef, n)
+    @inbounds for (i, byte) in enumerate(sequence.data)
+        ch = byte < 0x61 ? byte : (byte <= 0x7a ? byte - 0x20 : byte)
+        ch in (UInt8('A'), UInt8('C'), UInt8('G'), UInt8('T')) ||
+            throw(ArgumentError("method=:nearest_neighbor requires unambiguous A/C/G/T; got '$(Char(byte))' at position $i"))
+        codes[i] = ch
+    end
+
+    dh = _NN_INIT_DH
+    ds = _NN_INIT_DS
+    # Each of the 16 top-strand dinucleotide steps is equivalent (by duplex
+    # reversal) to its reverse complement; the published table lists one
+    # representative per class (AA, AT, TA, CA, GT, CT, GA, CG, GC, GG).
+    complement_of = Dict(UInt8('A') => UInt8('T'), UInt8('T') => UInt8('A'),
+                         UInt8('C') => UInt8('G'), UInt8('G') => UInt8('C'))
+    @inbounds for i in 1:(n - 1)
+        stack = String([codes[i], codes[i + 1]])
+        key = haskey(_NN_DH, stack) ? stack : String([complement_of[codes[i + 1]], complement_of[codes[i]]])
+        dh += _NN_DH[key]
+        ds += _NN_DS[key]
+    end
+    first_base = codes[1] == UInt8('A') || codes[1] == UInt8('T')
+    last_base = codes[n] == UInt8('A') || codes[n] == UInt8('T')
+    first_base && (dh += _NN_TERMINAL_AT_DH; ds += _NN_TERMINAL_AT_DS)
+    last_base && (dh += _NN_TERMINAL_AT_DH; ds += _NN_TERMINAL_AT_DS)
+    self_complementary && (dh += _NN_SYMMETRY_DH; ds += _NN_SYMMETRY_DS)
+
+    dh *= 1000.0   # kcal/mol -> cal/mol to match ΔS units
+    gas_constant = 1.987   # cal/(mol·K)
+    tm_k = dh / (ds + gas_constant * log(ct / 4.0))
+    return tm_k - 273.15 + 16.6 * log10(Float64(na_conc))
+end
+
+melting_temp(sequence::AbstractString; rna::Bool=false, method::Symbol=:wallace, kwargs...) = melting_temp(_sequence_to_dna(sequence); rna=rna, method=method, kwargs...)
 
 """
     dna_molecular_weight(sequence; stranded=:single)
@@ -853,7 +929,7 @@ Translate encoded DNA bytes into an amino-acid byte buffer.
         amino_acid = (code1 > 3 || code2 > 3 || code3 > 3) ? UInt8('X') : codon_table[((Int(code1) << 4) | (Int(code2) << 2) | Int(code3)) + 1]
         if stop_at_stop && amino_acid == UInt8('*')
             break
-        elseif amino_acid != UInt8('*')
+        elseif amino_acid != UInt8('*') || !stop_at_stop
             buffer[out_index] = amino_acid
             out_index += 1
         end
@@ -957,10 +1033,31 @@ end
     ungap!(seq::BioSequence)
 
 In-place removal of gap characters ('-' and '.') from sequence.
+
+For 2-bit packed storage (`PackedDNASeq`) in-place removal is impossible (the
+packed chunk length is immutable); use `ungap(seq)`, which returns a new
+packed sequence without gaps.
 """
 function ungap!(seq::BioSequence{A}) where {A <: BioAlphabet}
+    seq.data isa BitPackedVector &&
+        throw(ArgumentError("in-place gap removal is not possible for 2-bit packed storage; use ungap(seq) which returns a new packed sequence"))
     filter!(b -> b != UInt8('-') && b != UInt8('.'), seq.data)
     return seq
+end
+
+"""
+    ungap(seq::BioSequence{A, BitPackedVector{2}})
+
+Gap removal for 2-bit packed sequences: returns a new packed sequence with
+'-' and '.' removed.
+"""
+function ungap(seq::BioSequence{A, BitPackedVector{2}}) where {A <: BioAlphabet}
+    kept = UInt8[]
+    @inbounds for i in 1:length(seq)
+        b = seq.data[i]
+        (b == UInt8('-') || b == UInt8('.')) || push!(kept, b)
+    end
+    return BioSequence{A}(BitPackedVector{2}(kept); validate=false)
 end
 
 """
@@ -1062,7 +1159,8 @@ end
 
 Find open reading frames in a nucleotide sequence.
 """
-function find_orfs(sequence::BioSequence{DNAAlphabet}; min_aa::Integer=0)
+function find_orfs(sequence::BioSequence{DNAAlphabet}; min_aa::Integer=1, require_start::Bool=true)
+    min_aa >= 0 || throw(ArgumentError("min_aa must be >= 0"))
     bytes = sequence.data
     proteins = AASeq[]
 
@@ -1073,29 +1171,35 @@ function find_orfs(sequence::BioSequence{DNAAlphabet}; min_aa::Integer=0)
         complete_length == 0 && continue
         frame_bytes = bytes[frame:frame + complete_length - 1]
 
-        # Translate and split by stop codons
-        protein_str = String(translate_dna(frame_bytes; stop_at_stop=false))
-        for orf in split(protein_str, '*')
-            if length(orf) >= min_aa
-                push!(proteins, AASeq(orf; validate=false))
+        for strand_bytes in (frame_bytes, reverse_complement(frame_bytes))
+            protein_str = String(translate_dna(strand_bytes; stop_at_stop=false))
+            if !require_start
+                # Stop-to-stop spans (legacy behaviour): every fragment between
+                # stop codons, regardless of a start codon.
+                for orf in split(protein_str, '*')
+                    length(orf) >= min_aa && push!(proteins, AASeq(orf; validate=false))
+                end
+                continue
             end
-        end
-
-        # Reverse complement frame
-        rc_frame_bytes = reverse_complement(frame_bytes)
-        rc_protein_str = String(translate_dna(rc_frame_bytes; stop_at_stop=false))
-        for orf in split(rc_protein_str, '*')
-            if length(orf) >= min_aa
+            # Real ORFs: in-frame ATG -> next stop (or the end of the frame for
+            # an open ORF). Each in-frame start codon seeds one ORF.
+            aa = collect(protein_str)
+            starts = findall(==('M'), aa)
+            for start_idx in starts
+                stop_idx = findnext(==('*'), aa, start_idx)
+                orf_end = (stop_idx === nothing ? length(aa) : stop_idx - 1)
+                orf_end - start_idx + 1 >= min_aa || continue
+                orf = join(aa[start_idx:orf_end])
                 push!(proteins, AASeq(orf; validate=false))
             end
         end
     end
 
     _ctx = active_provenance_context()
-    return _register_sequence_result!(_ctx, proteins, "find_orfs"; parameters=(n_orfs=length(proteins), min_aa=Int(min_aa), sequence_length=length(sequence.data)))
+    return _register_sequence_result!(_ctx, proteins, "find_orfs"; parameters=(n_orfs=length(proteins), min_aa=Int(min_aa), require_start=require_start, sequence_length=length(sequence.data)))
 end
 
-find_orfs(sequence::AbstractString; min_aa::Integer=0) = find_orfs(_sequence_to_dna(sequence); min_aa=min_aa)
+find_orfs(sequence::AbstractString; min_aa::Integer=1, require_start::Bool=true) = find_orfs(_sequence_to_dna(sequence); min_aa=min_aa, require_start=require_start)
 
 """
     protein_search(sequence, motif)
@@ -1792,24 +1896,39 @@ similar to DUST/SEG algorithms.
 Reference: Trifonov (1990) Bull Math Biol 52(1):35-40
 """
 function sequence_complexity(sequence::BioSequence{A}; k::Int=3) where {A <: BioAlphabet}
+    k >= 1 || throw(ArgumentError("k must be >= 1"))
     len = length(sequence)
     len < k && return 0.0
 
-    observed = Set{UInt64}()
     bytes = Vector{UInt8}(sequence.data)
 
-    @inbounds for i in 1:(len - k + 1)
+    # Base-5 rolling code over A/C/G/T/(everything else, incl. ambiguity and
+    # gaps) keeps distinct k-mers distinct for k <= 27 without wrapping; the
+    # old byte-concatenation hash silently collided for k > 8. Pure-ACGT
+    # sequences keep the classical 4^k theoretical maximum.
+    code_of(b) = begin
+        b = b < 0x61 ? b : (b <= 0x7a ? b - 0x20 : b)
+        b == UInt8('A') ? 0x0 : b == UInt8('C') ? 0x1 : b == UInt8('G') ? 0x2 : b == UInt8('T') ? 0x3 : 0x4
+    end
+    alphabet_size = UInt64(any(b -> code_of(b) == 0x4, bytes) ? 5 : 4)
+
+    if k <= 27
+        observed = Set{UInt64}()
         h = UInt64(0)
-        for j in 0:(k-1)
-            b = bytes[i + j]
-            b = b < 0x61 ? b : (b <= 0x7a ? b - 0x20 : b)
-            h = (h << 8) | b
+        top_weight = alphabet_size^(k - 1)
+        @inbounds for i in 1:len
+            h = (h - (i > k ? code_of(bytes[i - k]) * top_weight : UInt64(0))) * alphabet_size + code_of(bytes[i])
+            i >= k && push!(observed, h)
         end
-        push!(observed, h)
+        max_possible = min(alphabet_size^k, UInt64(len - k + 1))
+        return length(observed) / max_possible
     end
 
-    # Theoretical maximum: min(4^k, L-k+1) for DNA
-    max_possible = min(4^k, len - k + 1)
+    observed = Set{String}()
+    @inbounds for i in 1:(len - k + 1)
+        push!(observed, String([b < 0x61 ? b : (b <= 0x7a ? b - 0x20 : b) for b in bytes[i:(i + k - 1)]]))
+    end
+    max_possible = len - k + 1
     return length(observed) / max_possible
 end
 

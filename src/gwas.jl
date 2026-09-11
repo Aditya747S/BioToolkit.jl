@@ -55,7 +55,7 @@ export LDSCResult, ldsc_heritability, estimate_heritability_greml, partitioned_h
 export SuSiEResult, fine_map_susie, calculate_credible_set, posterior_inclusion_probability
 export MRResult, mr_two_sample, mr_egger, mr_pleiotropy_test
 export conditional_analysis, cojo_stepwise, joint_analysis
-export gwas_pca, project_pca, calculate_ibd, calculate_king_kinship, detect_related_pairs
+export gwas_pca, project_pca, calculate_ibd, calculate_ibs, IBDEstimate, calculate_king_kinship, detect_related_pairs
 export coloc_result, coloc_abf
 export ihs_score, xp_ehh_score, fst_outlier_test
 export rank_inverse_normal, rank_inverse_normal!
@@ -578,14 +578,23 @@ function merge_genotype_matrices(gm_list::AbstractVector{<:GenotypeMatrix}; by::
     throw(ArgumentError("by must be :variants or :samples"))
 end
 
-_plink_code(value) = ismissing(value) ? 0x01 : UInt8(clamp(Int(round(Float64(value))), 0, 2)) == 0x00 ? 0x00 : UInt8(clamp(Int(round(Float64(value))), 0, 2)) == 0x01 ? 0x02 : 0x03
+# PLINK .bed bit-pair codes per the PLINK spec:
+#   0b00 = homozygous first allele (dosage 0), 0b01 = heterozygote (dosage 1),
+#   0b10 = homozygous second allele (dosage 2), 0b11 = missing.
+function _plink_code(value)
+    ismissing(value) && return 0x03
+    finite_value = Float64(value)
+    isfinite(finite_value) || return 0x03
+    dosage = clamp(Int(round(finite_value)), 0, 2)
+    return dosage == 0 ? 0x00 : dosage == 1 ? 0x01 : 0x02
+end
 
 function _decode_plink_code(byte::UInt8)
     code = byte & 0x03
     code == 0x00 && return 0.0
-    code == 0x01 && return NaN
-    code == 0x02 && return 1.0
-    return 2.0
+    code == 0x01 && return 1.0
+    code == 0x02 && return 2.0
+    return NaN
 end
 
 const PLINK_DECODE_LUT = let
@@ -593,7 +602,7 @@ const PLINK_DECODE_LUT = let
     for b in 0:255
         for s in 0:3
             code = (b >> (2*s)) & 0x03
-            lut[s+1, b+1] = code == 0x00 ? 0.0 : code == 0x01 ? NaN : code == 0x02 ? 1.0 : 2.0
+            lut[s+1, b+1] = code == 0x00 ? 0.0 : code == 0x01 ? 1.0 : code == 0x02 ? 2.0 : NaN
         end
     end
     lut
@@ -1159,9 +1168,9 @@ function write_bgen(path::String, gm::GenotypeMatrix; bits_per_probability::Int=
     length(sample_ids) == n_samples || throw(DimensionMismatch("sample metadata does not match genotype row count"))
 
     sample_block_length = 4 + sum(2 + ncodeunits(id) for id in sample_ids)
-    # BGEN offset points to the first variant block from file start.
-    # Current layout: 24-byte fixed header + 4-byte sample block length field + sample block payload.
-    first_variant_offset = 24 + 4 + sample_block_length
+    # BGEN spec: the sample-block length field includes its own 4 bytes, so the
+    # first variant block starts at fixed-header (24) + sample_block_length.
+    first_variant_offset = 24 + sample_block_length
 
     open(path, "w") do io
         _write_u32_le(io, first_variant_offset)
@@ -3283,17 +3292,27 @@ function partitioned_heritability(sumstats::GWASResult, ld_scores::AbstractVecto
 end
 
 """
-    ldsc_genetic_correlation(traits)
+    ldsc_genetic_correlation(traits; ld_scores=nothing, m_snps=nothing, min_snps=100, n_blocks=200)
 
-Estimate genetic correlation between two GWAS result sets from matched z-scores.
+Estimate the genetic correlation between two GWAS summary statistics with
+LD-score regression (Bulik-Sullivan et al. 2015): the cross-product
+`z1_j·z2_j` is regressed on the LD score `L2_j` with weights `1/(L2+1)`
+(intercept-free variant, appropriate for well-calibrated statistics). The
+slope converts to `rg = slope · M / sqrt(N1·N2)` where `M` defaults to the
+number of scored SNPs. The standard error comes from a block jackknife over
+`n_blocks` contiguous SNP blocks.
+
+`ld_scores` must either be a vector aligned with `traits[1]`'s SNPs or a
+`Dict{String,Float64}` keyed by SNP ID; SNPs without a score are dropped.
 """
-function ldsc_genetic_correlation(traits::Vector{GWASResult}; min_snps::Int=100)
+function ldsc_genetic_correlation(traits::Vector{GWASResult}; ld_scores::Union{Nothing,AbstractVector{<:Real},AbstractDict{<:AbstractString,<:Real}}=nothing, m_snps::Union{Nothing,Real}=nothing, min_snps::Int=100, n_blocks::Int=200)
     length(traits) == 2 || throw(ArgumentError("genetic correlation requires exactly two traits"))
     t1, t2 = traits
 
     idx2 = Dict{String,Int}(String(snp) => index for (index, snp) in enumerate(t2.snp_ids))
     z1 = Float64[]
     z2 = Float64[]
+    snp_order = String[]
     for index in eachindex(t1.snp_ids)
         snp = String(t1.snp_ids[index])
         haskey(idx2, snp) || continue
@@ -3303,15 +3322,67 @@ function ldsc_genetic_correlation(traits::Vector{GWASResult}; min_snps::Int=100)
         (isfinite(z1_i) && isfinite(z2_i)) || continue
         push!(z1, z1_i)
         push!(z2, z2_i)
+        push!(snp_order, snp)
     end
 
-    n = length(z1)
-    n >= min_snps || return (NaN, NaN)
-    rg = cor(z1, z2)
-    isfinite(rg) || return (NaN, NaN)
-    se = sqrt(max((1.0 - rg^2) / max(n - 2, 1), 0.0))
+    ld_scores === nothing && throw(ArgumentError("ldsc_genetic_correlation requires ld_scores (vector aligned with traits[1], or a SNP-id => score Dict)"))
+    score_lookup = ld_scores isa AbstractDict ? ld_scores : Dict{String,Float64}(String(s) => Float64(l) for (s, l) in zip(t1.snp_ids, ld_scores))
+
+    l2 = Float64[]
+    kept_z1 = Float64[]
+    kept_z2 = Float64[]
+    for (i, snp) in enumerate(snp_order)
+        score = get(score_lookup, snp, nothing)
+        (score !== nothing && isfinite(score) && score >= 0) || continue
+        push!(l2, Float64(score))
+        push!(kept_z1, z1[i])
+        push!(kept_z2, z2[i])
+    end
+
+    n = length(l2)
+    n >= min_snps || return provenance_result!(active_provenance_context(), (NaN, NaN), "ldsc_genetic_correlation";
+                                               parameters=(matched_snps=n, min_snps=min_snps, reason="insufficient matched SNPs"))
+
+    total_m = m_snps === nothing ? Float64(n) : Float64(m_snps)
+    total_m > 0 || throw(ArgumentError("m_snps must be positive"))
+    n1 = Float64(t1.sample_size)
+    n2 = Float64(t2.sample_size)
+    scale = (n1 > 0 && n2 > 0) ? sqrt(n1 * n2) : 1.0
+
+    y = kept_z1 .* kept_z2
+    weights = 1.0 ./ max.(l2 .+ 1.0, 1e-8)
+    weights ./= mean(weights)
+
+    _slope(data_y, data_l) = begin
+        w = 1.0 ./ max.(data_l .+ 1.0, 1e-8)
+        w ./= mean(w)
+        xw = data_l .* sqrt.(w) .- sum(w .* data_l) / sum(w)
+        yw = data_y .* sqrt.(w) .- sum(w .* data_y) / sum(w)
+        sum(xw .* yw) / max(sum(xw .^ 2), eps(Float64))
+    end
+    slope = _slope(y, l2)
+    rg = slope * total_m / scale
+
+    # Block jackknife SE on the slope.
+    n_blocks = max(2, min(Int(n_blocks), n))
+    block_size = cld(n, n_blocks)
+    jk_slopes = Float64[]
+    for b in 1:n_blocks
+        lo = (b - 1) * block_size + 1
+        hi = min(b * block_size, n)
+        lo > n && break
+        keep = trues(n)
+        keep[lo:hi] .= false
+        sum(keep) >= 2 || continue
+        push!(jk_slopes, _slope(y[keep], l2[keep]))
+    end
+    slope_se = isempty(jk_slopes) ? NaN :
+               sqrt(max((length(jk_slopes) - 1) / length(jk_slopes) * sum(abs2, jk_slopes .- mean(jk_slopes)), 0.0))
+    rg_se = slope_se * total_m / scale
+
     _ctx = active_provenance_context()
-    return provenance_result!(_ctx, (rg, se), "ldsc_genetic_correlation")
+    return provenance_result!(_ctx, (rg, rg_se), "ldsc_genetic_correlation";
+                              parameters=(matched_snps=n, total_m=total_m, n1=n1, n2=n2, n_blocks=length(jk_slopes)))
 end
 
 """
@@ -3386,24 +3457,106 @@ end
 """
     fine_map_susie(beta, se, ld_matrix; n_effects=10, coverage=0.95, max_iter=100, tol=1e-6)
 
-Run a lightweight SuSiE-style approximation from summary statistics.
+Fine-map summary statistics with the SuSiE algorithm (Zhu & Stephens 2017),
+z-score interface (`susie_z` flavor): the genotype matrix is summarised by its
+LD matrix `R` and marginal z-scores `z = beta ./ se`.
+
+Each of `n_effects` single-effect regressions is fitted by Iterative Bayesian
+Stepwise Selection (IBSS): the effect's prior variance is fitted once by the
+SER method-of-moments estimator (`Var(R·r) - 1` on the unit-variance z scale,
+clamped to a small positive floor) and then held, the residual is updated
+leave-one-out, and the loop runs until the maximum change in `alpha .* mu`
+falls below `tol` or `max_iter` sweeps complete. Per-effect credible sets are
+the smallest ranked SNP sets whose posterior mass reaches `coverage`. The
+intercept is omitted (z-scores are assumed calibrated); residual variance is
+estimated on the z-scale, so `resid_var` above ~1.1 indicates an uncalibrated
+statistic.
 """
 function fine_map_susie(beta::AbstractVector{<:Real}, se::AbstractVector{<:Real}, ld_matrix::AbstractMatrix{<:Real}; n_effects::Int=10, coverage::Real=0.95, max_iter::Int=100, tol::Real=1e-6)
-    _ = max_iter
-    _ = tol
     p = length(beta)
     p > 0 || throw(ArgumentError("empty summary statistics"))
+    size(ld_matrix) == (p, p) || throw(DimensionMismatch("ld_matrix must be $(p)x$(p) to match beta/se"))
+    all(isfinite.(Float64.(se)) .& (Float64.(se) .> 0)) || throw(ArgumentError("all standard errors must be finite and positive"))
 
-    pip = posterior_inclusion_probability(beta, se, ld_matrix)
-    post_mean = Float64.(beta) .* pip
-    post_sd = sqrt.(max.(Float64.(se) .^ 2 .* pip .* (1.0 .- pip), eps(Float64)))
-    credible = [calculate_credible_set(pip; coverage=coverage)]
-    resid_var = var(Float64.(beta) .- post_mean; corrected=false)
-    h2 = sum(post_mean .^ 2) / max(sum(Float64.(beta) .^ 2), eps(Float64))
-    logbf = log.(pip .+ eps(Float64)) .- log.(1.0 .- pip .+ eps(Float64))
+    z = Float64.(beta) ./ Float64.(se)
+    L = max(1, min(n_effects, p))
+    prior_var_floor = 1e-4
+
+    alphas = [zeros(Float64, p) for _ in 1:L]
+    mus = [zeros(Float64, p) for _ in 1:L]
+    prior_vars = fill(prior_var_floor, L)
+    prior_estimated = falses(L)
+    predicted = [zeros(Float64, p) for _ in 1:L]   # R * (alpha .* mu) per effect
+    r = copy(z)                                     # working residual for the current SER
+
+    for sweep in 1:max(max_iter, 1)
+        max_change = 0.0
+        for l in 1:L
+            # Leave-one-out residual for effect l.
+            for i in 1:p
+                r[i] = z[i] - sum(predicted[k][i] for k in 1:L if k != l; init=0.0)
+            end
+
+            # Single-effect regression on the residual: bhat = R * r, unit
+            # residual variance on the z-scale. The prior variance is fitted
+            # by the SER moment estimator on the effect's first pass and then
+            # held (re-estimating every sweep destabilises IBSS when an
+            # effect already explains most of the signal).
+            bhat = ld_matrix * r
+            if !prior_estimated[l]
+                prior_vars[l] = max(var(bhat; corrected=true) - 1.0, prior_var_floor)
+                prior_estimated[l] = true
+            end
+            sb2 = prior_vars[l]
+
+            posterior_var = sb2 / (1.0 + sb2)
+            mu = posterior_var .* bhat
+            lbf = 0.5 .* (sb2 .* bhat .^ 2 ./ (1.0 + sb2) .- log(1.0 + sb2))
+            lbf_max = maximum(lbf)
+            weights = exp.(lbf .- lbf_max)
+            alpha = weights ./ sum(weights)
+
+            max_change = max(max_change, maximum(abs.(alpha .- alphas[l])), maximum(abs.(mu .- mus[l])))
+            alphas[l] = alpha
+            mus[l] = mu
+            predicted[l] = ld_matrix * (alpha .* mu)
+        end
+        max_change < tol && break
+    end
+
+    pip = ones(Float64, p)
+    for l in 1:L
+        pip .*= (1.0 .- alphas[l])
+    end
+    pip = 1.0 .- pip
+    post_mean = sum(alphas[l] .* mus[l] for l in 1:L; init=zeros(Float64, p))
+    second_moment = sum(alphas[l] .* (mus[l] .^ 2 .+ prior_vars[l] ./ (1.0 .+ prior_vars[l])) for l in 1:L; init=zeros(Float64, p))
+    post_sd = sqrt.(max.(second_moment .- post_mean .^ 2, 0.0))
+
+    total_explained = sum(predicted[l] for l in 1:L; init=zeros(Float64, p))
+    residual = z .- total_explained
+    resid_var = var(residual; corrected=true)
+    total_var = max(var(z; corrected=true), eps(Float64))
+    h2 = clamp(1.0 - resid_var / total_var, 0.0, 1.0)
+
+    credible = Vector{Vector{Int}}(undef, L)
+    for l in 1:L
+        order = sortperm(alphas[l]; rev=true)
+        cumulative = 0.0
+        stop = findfirst(i -> (cumulative += alphas[l][order[i]]; cumulative >= coverage), 1:p)
+        credible[l] = stop === nothing ? order : order[1:stop]
+    end
+
+    logbf = zeros(Float64, p)
+    for l in 1:L
+        bhat_l = ld_matrix * (z .- (total_explained .- predicted[l]))
+        lbf_l = 0.5 .* (prior_vars[l] .* bhat_l .^ 2 ./ (1.0 .+ prior_vars[l]) .- log(1.0 .+ prior_vars[l]))
+        logbf .+= lbf_l .- maximum(lbf_l)
+    end
 
     _ctx = active_provenance_context()
-    return provenance_result!(_ctx, SuSiEResult(pip, post_mean, post_sd, credible, min(n_effects, p), resid_var, h2, logbf), "fine_map_susie")
+    return provenance_result!(_ctx, SuSiEResult(pip, post_mean, post_sd, credible, L, resid_var, h2, logbf),
+                               "fine_map_susie"; parameters=(n_snps=p, n_effects=L, max_iter=max_iter, tol=tol, coverage=coverage))
 end
 
 """
@@ -3716,61 +3869,213 @@ function project_pca(
 end
 
 """
-    calculate_ibd(genotypes)
+    IBDEstimate
 
-Compute pairwise IBS similarity matrix.
+Pairwise identity-by-descent sharing estimated from genotype dosages.
+Fields are symmetric matrices over sample pairs: `z0`/`z1`/`z2` (IBD state
+probabilities), `pi_hat` (= z1/2 + z2, the proportion of genome shared), and
+`ibs2_rate` (observed IBS2 fraction for the pair).
 """
-function calculate_ibd(genotypes::Union{GenotypeMatrix,AbstractMatrix{<:Real}})
+struct IBDEstimate <: AbstractAnalysisResult
+    z0::Matrix{Float64}
+    z1::Matrix{Float64}
+    z2::Matrix{Float64}
+    pi_hat::Matrix{Float64}
+    ibs2_rate::Matrix{Float64}
+    n_snps_used::Int
+    provenance::ResultProvenance
+end
+
+IBDEstimate(z0, z1, z2, pi_hat, ibs2_rate, n_snps_used) =
+    IBDEstimate(z0, z1, z2, pi_hat, ibs2_rate, n_snps_used, provenance_record("IBDEstimate", "gwas/calculate_ibd"))
+
+"""
+    calculate_ibs(genotypes)
+
+Pairwise identity-by-state matrix: the fraction of comparable SNPs at which two
+samples carry the same genotype dosage.
+"""
+function calculate_ibs(genotypes::Union{GenotypeMatrix,AbstractMatrix{<:Real}})
     G = _matrix(genotypes)
     n = size(G, 1)
-    ibd = Matrix{Float64}(I, n, n)
+    ibs = Matrix{Float64}(I, n, n)
 
+    _pair_ibs!(ibs, G)
+
+    _ctx = active_provenance_context()
+    return provenance_result!(_ctx, Symmetric(ibs), "calculate_ibs")
+end
+
+function _pair_ibs!(ibs::AbstractMatrix{Float64}, G::AbstractMatrix{Float64})
+    n = size(G, 1)
     if _thread_enabled(n, true; min_grain=64)
         @threads for i in 1:(n - 1)
-            xi = @view G[i, :]
-            for j in (i + 1):n
-                xj = @view G[j, :]
-                n_valid = 0
-                n_equal = 0
-                @inbounds for k in eachindex(xi)
-                    left = xi[k]
-                    right = xj[k]
-                    if isfinite(left) && isfinite(right)
-                        n_valid += 1
-                        n_equal += (left == right) ? 1 : 0
-                    end
-                end
-                ibd[i, j] = n_valid == 0 ? NaN : n_equal / n_valid
-            end
+            _pair_ibs_row!(ibs, G, i)
         end
     else
         for i in 1:(n - 1)
-            xi = @view G[i, :]
-            for j in (i + 1):n
-                xj = @view G[j, :]
-                n_valid = 0
-                n_equal = 0
-                @inbounds for k in eachindex(xi)
-                    left = xi[k]
-                    right = xj[k]
-                    if isfinite(left) && isfinite(right)
-                        n_valid += 1
-                        n_equal += (left == right) ? 1 : 0
-                    end
-                end
-                ibd[i, j] = n_valid == 0 ? NaN : n_equal / n_valid
-            end
+            _pair_ibs_row!(ibs, G, i)
         end
     end
+    for i in 1:(n - 1), j in (i + 1):n
+        ibs[j, i] = ibs[i, j]
+    end
+    return ibs
+end
 
-    for i in 1:(n - 1)
-        for j in (i + 1):n
-            ibd[j, i] = ibd[i, j]
+function _pair_ibs_row!(ibs::AbstractMatrix{Float64}, G::AbstractMatrix{Float64}, i::Int)
+    xi = @view G[i, :]
+    for j in (i + 1):size(G, 1)
+        xj = @view G[j, :]
+        n_valid = 0
+        n_equal = 0
+        @inbounds for k in eachindex(xi)
+            left = xi[k]
+            right = xj[k]
+            if isfinite(left) && isfinite(right)
+                n_valid += 1
+                n_equal += (left == right) ? 1 : 0
+            end
         end
+        ibs[i, j] = n_valid == 0 ? NaN : n_equal / n_valid
+    end
+    return ibs
+end
+
+"""
+    calculate_ibd(genotypes; min_maf=0.01)
+
+Estimate pairwise IBD sharing (Z0, Z1, Z2, PI_HAT) from genotype dosages with
+the standard IBS-state moment decomposition (PLINK `--genome` style). For each
+pair, the observed IBS0 and IBS2 rates are matched against their expectations
+under each IBD state using allele frequencies:
+
+- `P(IBS0 | IBD0) = 2·p²·(1-p)²` (IBS0 is impossible under IBD1/IBD2), giving
+  `Z0 = n_IBS0 / Σ_l 2·p_l²·(1-p_l)²`;
+- `P(IBS2 | IBD0)` and `P(IBS2 | IBD1) = 1 - 2·p·(1-p)` give `Z2` by solving
+  the two-point mixture, restricted to SNPs with MAF ≥ `min_maf` where the
+  decomposition is stable;
+- `Z1 = 1 - Z0 - Z2`, `PI_HAT = Z1/2 + Z2`.
+
+Estimates are unreliable with few SNPs, close kinship, or strong LD.
+"""
+function calculate_ibd(genotypes::Union{GenotypeMatrix,AbstractMatrix{<:Real}}; min_maf::Real=0.01)
+    G = _matrix(genotypes)
+    n, m = size(G)
+    m > 0 || throw(ArgumentError("no SNPs in genotype matrix"))
+
+    # Allele frequencies (dosage/2) over non-missing calls.
+    p = Vector{Float64}(undef, m)
+    @inbounds for k in 1:m
+        s = 0.0
+        c = 0
+        for i in 1:n
+            v = G[i, k]
+            if isfinite(v)
+                s += v
+                c += 1
+            end
+        end
+        p[k] = c == 0 ? NaN : clamp(s / (2 * c), 0.0, 1.0)
+    end
+
+    informative = [isfinite(p[k]) && min(p[k], 1 - p[k]) >= min_maf for k in 1:m]
+
+    z0 = Matrix{Float64}(I, n, n) .* 0.0
+    z1 = Matrix{Float64}(I, n, n)
+    z2 = zeros(Float64, n, n)
+    pi_hat = Matrix{Float64}(I, n, n)
+    ibs2_rate = Matrix{Float64}(I, n, n)
+    snps_used = count(informative)
+
+    if _thread_enabled(n, true; min_grain=32)
+        @threads for i in 1:(n - 1)
+            _pair_ibd_row!(z0, z1, z2, pi_hat, ibs2_rate, G, p, informative, i)
+        end
+    else
+        for i in 1:(n - 1)
+            _pair_ibd_row!(z0, z1, z2, pi_hat, ibs2_rate, G, p, informative, i)
+        end
+    end
+    for i in 1:(n - 1), j in (i + 1):n
+        z0[j, i] = z0[i, j]
+        z1[j, i] = z1[i, j]
+        z2[j, i] = z2[i, j]
+        pi_hat[j, i] = pi_hat[i, j]
+        ibs2_rate[j, i] = ibs2_rate[i, j]
     end
 
     _ctx = active_provenance_context()
-    return provenance_result!(_ctx, Symmetric(ibd), "calculate_ibd")
+    return provenance_result!(_ctx,
+        IBDEstimate(Symmetric(z0), Symmetric(z1), Symmetric(z2), Symmetric(pi_hat), Symmetric(ibs2_rate), snps_used),
+        "calculate_ibd"; parameters=(n_samples=n, n_snps=m, n_informative=snps_used, min_maf=min_maf))
+end
+
+function _pair_ibd_row!(z0, z1, z2, pi_hat, ibs2_rate, G, p, informative, i)
+    xi = @view G[i, :]
+    q0_sum = 0.0    # Σ P(IBS0 | IBD0) = Σ 2p²(1-p)²
+    r0_sum = 0.0    # Σ P(IBS2 | IBD0)
+    r1_sum = 0.0    # Σ P(IBS2 | IBD1)
+    for j in (i + 1):size(G, 1)
+        xj = @view G[j, :]
+        n_valid = 0
+        n_ibs0 = 0
+        n_ibs2 = 0
+        q0_pair = 0.0
+        r0_pair = 0.0
+        r1_pair = 0.0
+        n_informative = 0
+        @inbounds for k in eachindex(xi)
+            left = xi[k]
+            right = xj[k]
+            (isfinite(left) && isfinite(right)) || continue
+            n_valid += 1
+            diff = abs(left - right)
+            if diff >= 2.0
+                n_ibs0 += 1
+            elseif diff == 0.0
+                n_ibs2 += 1
+            end
+            if informative[k]
+                pk = p[k]
+                q0_pair += 2.0 * pk^2 * (1.0 - pk)^2
+                r0_pair += (1.0 - pk)^4 + pk^4 + (2.0 * pk * (1.0 - pk))^2
+                r1_pair += 1.0 - 2.0 * pk * (1.0 - pk)
+                n_informative += 1
+            end
+        end
+
+        if n_valid == 0 || n_informative == 0 || q0_pair <= 0.0
+            z0[i, j] = NaN; z1[i, j] = NaN; z2[i, j] = NaN; pi_hat[i, j] = NaN; ibs2_rate[i, j] = NaN
+            continue
+        end
+
+        ibs2 = n_ibs2 / n_valid
+        ibs0 = n_ibs0 / n_valid
+        # Z0: IBS0 occurs only under IBD0.
+        Z0 = clamp(ibs0 * n_valid / q0_pair, 0.0, 1.0)
+        # Solve the IBS2 mixture for Z2:
+        #   IBS2 = Z0·r0 + Z1·r1 + Z2·1,  Z1 = 1 - Z0 - Z2
+        #   =>  Z2 = (IBS2 - Z0·r0 - (1 - Z0)·r1) / (1 - r1)
+        denom = 1.0 - r1_pair / n_informative
+        if denom >= 0.05
+            Z2 = clamp((ibs2 - Z0 * r0_pair / n_informative - (1.0 - Z0) * r1_pair / n_informative) / denom, 0.0, 1.0)
+        else
+            Z2 = NaN
+        end
+        Z1 = 1.0 - Z0 - Z2
+        if isfinite(Z2) && Z1 < 0.0
+            # Renormalise the state simplex if clamping pushed it out.
+            total = Z0 + Z2
+            Z0 /= total; Z2 /= total; Z1 = 0.0
+        end
+        z0[i, j] = Z0
+        z2[i, j] = Z2
+        z1[i, j] = isfinite(Z2) ? Z1 : NaN
+        pi_hat[i, j] = isfinite(Z2) ? Z1 / 2.0 + Z2 : NaN
+        ibs2_rate[i, j] = ibs2
+    end
+    return nothing
 end
 
 """

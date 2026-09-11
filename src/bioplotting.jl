@@ -4,6 +4,8 @@ using Statistics
 using LinearAlgebra
 using Distributions
 using DataFrames
+using JSON
+using ..BioToolkit: _escape_html, _json_escape
 
 using ..GWAS: GWASResult, MetaAnalysisResult
 using ..Clinical: OncoprintResult
@@ -411,7 +413,8 @@ end
 
 function _save_plots_figure(path::Union{Nothing,String}, figure)
     path === nothing && return nothing
-    savefig(figure, path)
+    plots_module = getfield(Main, :Plots)
+    plots_module.savefig(figure, path)
     return path
 end
 
@@ -502,7 +505,7 @@ function export_plot(result::AbstractAnalysisResult, save_path::String)
         return export_html(result, save_path)
     end
     if hasproperty(result, :figure) && getproperty(result, :figure) !== nothing
-        savefig(getproperty(result, :figure), save_path)
+        getfield(Main, :Plots).savefig(getproperty(result, :figure), save_path)
     else
         @warn "Cannot export plot: result does not contain a valid figure."
     end

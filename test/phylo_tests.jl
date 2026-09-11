@@ -225,7 +225,7 @@ using BioToolkit
 
     @testset "Split helper" begin
         tree = parse_newick("(A:0.1,B:0.2)X:0.3;")
-        split_tree = BioToolkit.split(tree, "X"; child_names=["A1", "A2"], branch_length=0.05)
+        split_tree = BioToolkit.split_tree(tree, "X"; child_names=["A1", "A2"], branch_length=0.05)
         @test count_terminals(split_tree) >= 4
     end
 

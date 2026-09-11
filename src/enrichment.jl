@@ -13,6 +13,7 @@ export IDMapper, EnrichmentTerm, EnrichmentDatabase, EnrichmentResult
 export load_annotation_database, save_annotation_database, build_annotation_database
 export builtin_annotation_database, builtin_annotation_terms
 export map_id, map_ids, enrichment_test, go_enrichment, kegg_enrichment, dotplot
+export read_gmt, write_gmt, database_from_gmt
 export GSEAResult, fgsea_like, gsea_preranked
 export GSVAResult, gsva_score
 export network_propagation, heat_diffusion_enrichment
@@ -248,6 +249,68 @@ function _effective_gene_sets(database::EnrichmentDatabase, universe::Set{String
     return gene_sets
 end
 
+
+# GO-elim (Alexa et al. 2006, topGO "elim"): process terms bottom-up — most
+# specific first — and after scoring each term remove its remaining genes from
+# every ancestor's set, so a significant leaf does not make all its ancestors
+# significant through the same genes.
+function _elim_gene_sets(database::EnrichmentDatabase, universe::Set{String}, query::Set{String}; alpha::Float64=0.05, min_overlap::Int=1)
+    effective = Dict{String,Set{String}}(term_id => _term_genes(term, universe) for (term_id, term) in database.terms)
+
+    # children map from the parents lists
+    children = Dict{String,Vector{String}}()
+    for (term_id, term) in database.terms
+        for parent in term.parents
+            push!(get!(children, String(parent), String[]), term_id)
+        end
+    end
+
+    # specificity = number of descendants (via memoised DFS); process ascending
+    ndesc = Dict{String,Int}()
+    function count_descendants(id::String, seen::Set{String})
+        haskey(ndesc, id) && return ndesc[id]
+        id in seen && return 0
+        push!(seen, id)
+        n = 0
+        for child in get(children, id, String[])
+            n += 1 + count_descendants(child, seen)
+        end
+        ndesc[id] = n
+        return n
+    end
+    for term_id in keys(database.terms)
+        count_descendants(term_id, Set{String}())
+    end
+    order = sort!(collect(keys(database.terms)); by=id -> get(ndesc, id, 0))
+
+    significant = Set{String}()
+    for term_id in order
+        term = database.terms[term_id]
+        genes = get(effective, term_id, Set{String}())
+        isempty(genes) && continue
+        overlap = length(intersect(query, genes))
+        overlap < min_overlap && continue
+        p = _fisher_right_tail(overlap, length(genes), length(query), length(universe))
+        if p < alpha
+            push!(significant, term_id)
+            # eliminate the term's remaining genes from all ancestors
+            stack = copy(term.parents)
+            visited = Set{String}()
+            while !isempty(stack)
+                anc = String(pop!(stack))
+                anc in visited && continue
+                push!(visited, anc)
+                haskey(effective, anc) || continue
+                setdiff!(effective[anc], genes)
+                for grandparent in database.terms[anc].parents
+                    append!(stack, grandparent)
+                end
+            end
+        end
+    end
+    return effective
+end
+
 function _fisher_right_tail(overlap::Int, term_size::Int, query_size::Int, background_size::Int)
     (term_size <= 0 || query_size <= 0 || background_size <= 0) && return 1.0
     overlap <= 0 && return 1.0
@@ -297,7 +360,7 @@ function enrichment_test(query_genes, database::EnrichmentDatabase; background=n
     query = Set(String.(query_genes))
     universe = background === nothing ? _background_set(database) : Set(String.(background))
     query = intersect(query, universe)
-    gene_sets = _effective_gene_sets(database, universe; elim=elim)
+    gene_sets = elim ? _elim_gene_sets(database, universe, query) : _effective_gene_sets(database, universe)
 
     term_ids = String[]
     for (term_id, term) in database.terms
@@ -537,6 +600,7 @@ function _compute_es(scores::Vector{Float64}, gene_rank::Dict{String,Int}, set_g
     max_es = 0.0
     min_es = 0.0
     last_peak_i = 1
+    last_trough_i = 1
 
     for i in 1:N
         if is_set[i]
@@ -545,11 +609,19 @@ function _compute_es(scores::Vector{Float64}, gene_rank::Dict{String,Int}, set_g
             cum_es -= 1.0 / non_set_k
         end
         cum_es > max_es && (max_es = cum_es; last_peak_i = i)
-        cum_es < min_es && (min_es = cum_es)
+        cum_es < min_es && (min_es = cum_es; last_trough_i = i)
     end
 
-    es = abs(max_es) > abs(min_es) ? max_es : min_es
-    le = [g for g in set_genes if get(gene_rank, g, N + 1) <= last_peak_i]
+    # Signed ES and leading edge up to the extreme (peak for positive ES,
+    # trough for negative ES — fgsea semantics; the previous code only tracked
+    # the maximum, so negatively enriched sets got empty/nonsense leading edges).
+    if abs(max_es) >= abs(min_es)
+        es = max_es
+        le = [g for g in set_genes if get(gene_rank, g, N + 1) <= last_peak_i]
+    else
+        es = min_es
+        le = [g for g in set_genes if get(gene_rank, g, N + 1) <= last_trough_i]
+    end
     return es, le
 end
 
@@ -649,21 +721,35 @@ function _rank_normalise(v::Vector{Float64})
     return rnk
 end
 
+# ssGSEA enrichment score (Barbie et al. 2009): running-sum ES with hit step
+# r^alpha / sum_{g in set} r^alpha and miss step (1-r)^beta / sum_{g not in
+# set} (1-r)^beta, alpha = beta = 1 by default; the ES is the signed maximum
+# deviation of the running difference.
 function _ssgsea_sample_score(ranked::Vector{Float64}, set_idx::Vector{Int}, N::Int)
+    k = length(set_idx)
+    k == 0 && return 0.0
+    k == N && return 0.0
     is_set = falses(N)
     for i in set_idx
         is_set[i] = true
     end
-    kappa = 0.25
+    alpha = 1.0
+    beta = 1.0
+    hit_weight_total = sum(ranked[i]^alpha for i in set_idx; init=0.0)
+    miss_weight_total = sum((1.0 - ranked[i])^beta for i in 1:N if !is_set[i]; init=0.0)
+    (hit_weight_total <= 0 || miss_weight_total <= 0) && return 0.0
+
     cum = 0.0
+    max_dev = 0.0
     for i in 1:N
         if is_set[i]
-            cum += ranked[i]^kappa / sum(ranked[set_idx] .^ kappa)
+            cum += ranked[i]^alpha / hit_weight_total
         else
-            cum -= 1.0 / (N - length(set_idx))
+            cum -= (1.0 - ranked[i])^beta / miss_weight_total
         end
+        abs(cum) > abs(max_dev) && (max_dev = cum)
     end
-    return cum
+    return max_dev
 end
 
 function _gsva_sample_score(ranked::Vector{Float64}, set_idx::Vector{Int}, N::Int)
@@ -684,7 +770,8 @@ function _gsva_sample_score(ranked::Vector{Float64}, set_idx::Vector{Int}, N::In
         cum > max_pos && (max_pos = cum)
         -cum > max_neg && (max_neg = -cum)
     end
-    return max_pos - max_neg
+    # GSVA ES is the signed maximum deviation from zero.
+    return abs(max_pos) >= max_neg ? max_pos : -max_neg
 end
 
 # =============================================================================
@@ -761,16 +848,13 @@ function heat_diffusion_enrichment(
     gene_sets::Dict{String,<:AbstractVector{<:AbstractString}};
     t::Real=0.5, top_k::Int=200, kwargs...
 )
-    prop = network_propagation(seed_genes, adjacency_matrix, gene_names; alpha=t, _ctx=_ctx)
+    prop = network_propagation(seed_genes, adjacency_matrix, gene_names; alpha=t)
     top_genes = prop.gene[1:min(top_k, nrow(prop))]
     # Build a simple enrichment database from the provided gene sets
     terms = [EnrichmentTerm(id, id, "NetProp", collect(String.(genes)), String[])
              for (id, genes) in gene_sets]
-    db = build_annotation_database(terms; _ctx=_ctx)
-    _ctx = active_provenance_context()
-
-
-    return enrichment_test(top_genes, db; _ctx=_ctx, kwargs...)
+    db = build_annotation_database(terms)
+    return enrichment_test(top_genes, db; kwargs...)
 end
 
 # =============================================================================
@@ -782,13 +866,13 @@ end
 
 Enrichment restricted to Reactome-namespace terms.
 """
-reactome_enrichment(query_genes, db::EnrichmentDatabase, kwargs...) =
+reactome_enrichment(query_genes, db::EnrichmentDatabase; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...) =
     enrichment_test(query_genes, db; namespace="Reactome", _ctx=_ctx, kwargs...)
 
 """
     wikipathways_enrichment(query_genes, database; kwargs...) → Vector{EnrichmentResult}
 """
-wikipathways_enrichment(query_genes, db::EnrichmentDatabase, kwargs...) =
+wikipathways_enrichment(query_genes, db::EnrichmentDatabase; prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...) =
     enrichment_test(query_genes, db; namespace="WikiPathways", _ctx=_ctx, kwargs...)
 
 """
@@ -796,14 +880,12 @@ wikipathways_enrichment(query_genes, db::EnrichmentDatabase, kwargs...) =
 
 MSigDB-style enrichment. Filter by namespace collection name (e.g. "H", "C2", "C5").
 """
-function msigdb_enrichment(query_genes, db::EnrichmentDatabase; collection::Union{Nothing,String}=nothing, kwargs...)
-    if collection !== nothing
-        return enrichment_test(query_genes, db; namespace=collection, _ctx=_ctx, kwargs...)
-    end
-    _ctx = active_provenance_context()
-
-
-    return enrichment_test(query_genes, db; _ctx=_ctx, kwargs...)
+function msigdb_enrichment(query_genes, db_or_gmt; collection::Union{Nothing,String}=nothing, prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx), kwargs...)
+    # Accept either a prepared database or the path to a GMT file
+    # (clusterProfiler/fgsea-style). GMT input is converted on the fly.
+    db = db_or_gmt isa AbstractString ? database_from_gmt(db_or_gmt; _ctx=_ctx) : db_or_gmt
+    db isa EnrichmentDatabase || throw(ArgumentError("msigdb_enrichment expects an EnrichmentDatabase or a path to a GMT file"))
+    return enrichment_test(query_genes, db; namespace=collection, _ctx=_ctx, kwargs...)
 end
 
 # =============================================================================
@@ -1013,6 +1095,75 @@ Wang et al. (2007) graph-based method.
 
 Approximated here by depth-weighted information content from the database.
 """
+
+# =============================================================================
+# GMT (Gene Matrix Transposed) file support — MSigDB / clusterProfiler / fgsea
+# =============================================================================
+
+"""
+    read_gmt(path) → Dict{String, Vector{String}}
+
+Parse a GMT (Gene Matrix Transposed) file: one gene set per line, fields are
+`name<TAB>description<TAB>gene1<TAB>gene2…`. Returns `name => genes`.
+"""
+function read_gmt(path::AbstractString)
+    isfile(path) || throw(ArgumentError("GMT file not found: $path"))
+    sets = Dict{String,Vector{String}}()
+    descriptions = Dict{String,String}()
+    open(path, "r") do io
+        for (line_no, line) in enumerate(eachline(io))
+            isempty(strip(line)) && continue
+            fields = split(strip(line), '\t'; keepempty=true)
+            length(fields) >= 2 || throw(ArgumentError("GMT line $line_no needs at least a name and description"))
+            name = String(fields[1])
+            haskey(sets, name) && @warn "duplicate GMT set name; keeping the last occurrence" name line_no
+            descriptions[name] = String(fields[2])
+            sets[name] = String.(strip.(fields[3:end]))
+        end
+    end
+    empty_descriptions = setdiff(keys(sets), keys(descriptions))
+    for name in empty_descriptions
+        descriptions[name] = ""
+    end
+    return (sets=sets, descriptions=descriptions)
+end
+
+"""
+    write_gmt(path, sets; descriptions=Dict{String,String}())
+
+Write gene sets to GMT format: `name<TAB>description<TAB>gene…` per line.
+"""
+function write_gmt(path::AbstractString, sets::AbstractDict{<:AbstractString,<:AbstractVector{<:AbstractString}}; descriptions::AbstractDict=Dict{String,String}())
+    open(path, "w") do io
+        for (name, genes) in sets
+            desc = get(descriptions, String(name), "na")
+            println(io, join(vcat(String(name), desc, String.(genes)), '\t'))
+        end
+    end
+    _ctx = active_provenance_context()
+    if _ctx !== nothing
+        register_provenance!(_ctx, "write_gmt"; parameters=(path=String(path), n_sets=length(sets)))
+    end
+    return path
+end
+
+"""
+    database_from_gmt(path; namespace="GMT") → EnrichmentDatabase
+
+Build an `EnrichmentDatabase` from a GMT file, ready for `enrichment_test`,
+`msigdb_enrichment`, or `fgsea_like`.
+"""
+function database_from_gmt(path::AbstractString; namespace::String="GMT", prov_ctx=nothing, _ctx=active_provenance_context(prov_ctx))
+    parsed = read_gmt(path)
+    terms = EnrichmentTerm[
+        EnrichmentTerm(String(name), get(parsed.descriptions, String(name), ""), namespace,
+                       collect(genes), String[])
+        for (name, genes) in parsed.sets
+    ]
+    isempty(terms) && throw(ArgumentError("GMT file contains no gene sets: $path"))
+    return build_annotation_database(terms; _ctx=_ctx)
+end
+
 function gene_ontology_semantic_similarity(
     term_id1::AbstractString,
     term_id2::AbstractString,
@@ -1022,16 +1173,43 @@ function gene_ontology_semantic_similarity(
     t2 = get(database.terms, String(term_id2), nothing)
     (t1 === nothing || t2 === nothing) && return 0.0
 
-    # Gene overlap-based proxy (Lin semantic similarity)
-    g1 = Set(t1.genes)
-    g2 = Set(t2.genes)
-    inter = length(intersect(g1, g2))
-    total_bg = sum(length(t.genes) for t in values(database.terms))
-    ic1 = inter > 0 ? -log(length(g1) / max(total_bg, 1)) : 0.0
-    ic2 = inter > 0 ? -log(length(g2) / max(total_bg, 1)) : 0.0
-    ic_lcs = inter > 0 ? -log(inter / max(total_bg, 1)) : 0.0
-    denom = ic1 + ic2
-    return denom > 0 ? 2 * ic_lcs / denom : 0.0
+    # Wang et al. (2007) semantic similarity: build the S-value set of each
+    # term over its ancestor graph (S(A) = 1 for the term itself; S(t) =
+    # max over children t' of w(t'->t) * S(t')), then combine the two
+    # S-value sets with the Wang ratio |S1 ^ S2| / (|S1| + |S2| - |S1 ^ S2|).
+    # Edge weight for "is_a" links is the standard 0.8 (GOSemSim default).
+    children = Dict{String,Vector{Tuple{String,Float64}}}()
+    for (term_id, term) in database.terms
+        for parent in term.parents
+            push!(get!(children, String(parent), Vector{Tuple{String,Float64}}()), (term_id, 0.8))
+        end
+    end
+
+    function s_values(term_id::String)
+        sv = Dict{String,Float64}(term_id => 1.0)
+        stack = [term_id]
+        while !isempty(stack)
+            node = pop!(stack)
+            base = sv[node]
+            for (child, w) in get(children, node, Vector{Tuple{String,Float64}}())
+                cand = w * base
+                cand > get(sv, child, 0.0) || continue
+                sv[child] = cand
+                push!(stack, child)
+            end
+        end
+        return sv
+    end
+
+    sv1 = s_values(String(term_id1))
+    sv2 = s_values(String(term_id2))
+    shared_keys = intersect(keys(sv1), keys(sv2))
+    isempty(shared_keys) && return 0.0
+    s1 = sum(min(sv1[k], sv2[k]) for k in shared_keys; init=0.0)   # intersection value
+    total1 = sum(values(sv1))
+    total2 = sum(values(sv2))
+    denom = total1 + total2 - s1
+    denom > 0 ? s1 / denom : 0.0
 end
 
 """
